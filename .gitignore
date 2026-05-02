@@ -1,0 +1,27 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build / temp
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# Local user state never to be committed
+*.local.sh
+*.local.json
+
+# Sensitive files that might end up here by accident if a user runs
+# install.sh from this directory (defensive)
+danmaku-credentials.json
+cred.json
