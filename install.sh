@@ -403,11 +403,20 @@ secondary-sub-pos=0
 # upscaling to a higher-resolution display). Toggle with F8.
 glsl-shader="~~/shaders/FSRCNNX_x2_8-0-4-1.glsl"
 
-# RIFE realtime 2x interpolation, auto-applied at file-load via
-# profile-cond=true. Toggle off with F9. profile-restore=copy-equal makes
-# `apply-profile rife restore` (or undo) revert.
+# RIFE realtime 2x interpolation, auto-applied at file-load when source
+# fps ≤ 30 — anything higher is already smooth enough that interpolating
+# to 2× wastes GPU on frames mpv would just drop at the display refresh.
+# Threshold is also where the GPU cost ramps up: 60 → 120 fps RIFE pegs
+# the GB10 on a 4K HiDPI panel. Toggle manually with F9.
+#
+# `or 999` makes the condition fail before container-fps is known
+# (it's nil at the moment mpv first applies profiles, becomes the real
+# value after the demuxer reads the container). Defaulting to "unknown
+# = don't RIFE" prevents a ~half-second window where the vf gets added
+# and immediately removed when fps turns out to be > 30. profile-cond
+# re-evaluates reactively when container-fps lands.
 [rife]
-profile-cond=true
+profile-cond=(p["container-fps"] or 999)<=30
 profile-restore=copy-equal
 vf=vapoursynth=~~/rife.vpy
 EOF
