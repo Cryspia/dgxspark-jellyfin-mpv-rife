@@ -45,14 +45,24 @@
 
 `install` 完成后请注销并重新登录一次，让 GNOME 重新扫描启动器、自启动条目和图标缓存。第一次播放会现场编译 TensorRT RIFE engine（一次大约 30–60 秒），之后启动会非常快，engine 缓存路径在 `~/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models/`。
 
-## 默认配置（针对 1080p 源 + 4K HiDPI 屏调好）
+## 默认配置
 
-- RIFE 4.26，scale=1.0，2/1 倍率，TRT 混合精度
-- FSRCNNX 8-0-4-1 亮度超分
+RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实测，重型 4.26 模型在 1080p 上做 2× 插帧时和 libplacebo 合成器抢 GPU 严重，所以根据源高度切换：
+
+| 源 | 帧率 | RIFE | FSRCNNX |
+|---|---|---|---|
+| ≤ 720p | ≤ 30 fps | **4.26**（重型，scale=1.0） | 开 |
+| > 720p，≤ 1080p | ≤ 30 fps | **4.6**（轻型，scale=1.0） | 开 |
+| > 1080p | 任何 | 关（GB10 上跑不动） | 关 |
+| 任何 | > 30 fps | 关（已经够流畅，硬补只是浪费 GPU） | 开 |
+
+其他相关设置：
+
 - vo=gpu-next，gpu-context=waylandvk（在 GNOME 下没有窗口装饰，但比 Xwayland 少约 1 ms 的呈现延迟）
 - hidpi-window-scale=yes（4K HiDPI 显示器上 FSRCNNX 才会触发）
+- 两套 RIFE 模型都用 TRT 混合精度（fp16 权重 + fp32 累加器），由安装脚本 patch 上游 vsrife 实现；纯 fp16 在快速运动场景下光流累加器会溢出导致闪烁。
 
-可调项的注释直接写在 `~/.config/mpv/rife.vpy` 和 `~/.config/mpv/mpv.conf` 里。
+可调项的注释直接写在 `~/.config/mpv/rife.vpy`、`~/.config/mpv/rife-light.vpy` 和 `~/.config/mpv/mpv.conf` 里。手动覆盖：F8 切换 FSRCNNX，F9 在三种 RIFE 配置间循环（4.26 → 4.6 → 关 → 循环），不受 profile-cond 自动选择影响。
 
 ## 快捷键
 

@@ -62,16 +62,34 @@ autostart entry, and icons. First playback will JIT-compile a TensorRT
 RIFE engine (~30-60s once); after that, startup is fast and the engine
 is cached at `~/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models/`.
 
-## Default config (tuned for 1080p source on 4K HiDPI display)
+## Default config
 
-- RIFE 4.26, scale=1.0, factor 2/1, TRT mixed precision
-- FSRCNNX 8-0-4-1 luma upscale
+RIFE and FSRCNNX both auto-apply per source resolution + frame rate.
+Empirical testing on the GB10 showed the heavy 4.26 model can't sustain
+2× interpolation at 1080p without contending with the libplacebo
+compositor, so the RIFE band depends on input height:
+
+| Source | Frame rate | RIFE | FSRCNNX |
+|---|---|---|---|
+| ≤ 720p | ≤ 30 fps | **4.26** (heavy, scale=1.0) | on |
+| > 720p, ≤ 1080p | ≤ 30 fps | **4.6** (light, scale=1.0) | on |
+| > 1080p | any | off (would peg the GB10) | off |
+| any | > 30 fps | off (already smooth) | on |
+
+Other relevant settings:
+
 - vo=gpu-next, gpu-context=waylandvk (no decorations on GNOME, but ~1ms
   less frame-presentation latency than Xwayland)
 - hidpi-window-scale=yes (so FSRCNNX activates on 4K HiDPI)
+- Both RIFE models use TRT mixed precision (fp16 weights, fp32
+  accumulators) per a vsrife patch the installer applies; pure fp16
+  flickers on fast motion because flow-vector accumulators overflow.
 
-Tuning knobs are documented inline in `~/.config/mpv/rife.vpy` and
-`~/.config/mpv/mpv.conf`.
+Tuning knobs are inline in `~/.config/mpv/rife.vpy`,
+`~/.config/mpv/rife-light.vpy`, and `~/.config/mpv/mpv.conf`.
+Manual override mid-playback: F8 toggles FSRCNNX, F9 cycles the active
+RIFE config (4.26 → 4.6 → off → loop) regardless of which band the
+profile-cond logic chose.
 
 ## Keybindings
 

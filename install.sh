@@ -185,8 +185,18 @@ create_conda_env() {
     return
   fi
 
+  # When mirrors are enabled, pass the USTC URL explicitly via -c. The
+  # `custom_channels` rewrite in ~/.condarc is unreliable with mamba 2.x
+  # — `-c conda-forge` can bypass it and hit conda.anaconda.org directly,
+  # which the China GFW kills mid-TLS-stream (SSL_read unexpected eof).
+  local fchannel="conda-forge"
+  if (( USE_MIRRORS )); then
+    fchannel="https://mirrors.ustc.edu.cn/anaconda/cloud/conda-forge"
+  fi
+
   log "creating env (will pull ~1GB of conda-forge packages)"
-  mamba create -n "$ENV_NAME" -y -c conda-forge \
+  log "  channel: $fchannel"
+  mamba create -n "$ENV_NAME" -y -c "$fchannel" \
     python=3.12 \
     `# media + filter chain` \
     vapoursynth ffmpeg \
@@ -399,26 +409,47 @@ dither-depth=auto
 secondary-sub-ass-override=no
 secondary-sub-pos=0
 
-# FSRCNNX luma upscale (active only when output > input * 1.3, i.e. when
-# upscaling to a higher-resolution display). Toggle with F8.
-glsl-shader="~~/shaders/FSRCNNX_x2_8-0-4-1.glsl"
+# FSRCNNX luma upscale, loaded globally — the shader self-gates at
+# `//!WHEN OUTPUT/LUMA > 1.3`, so it only kicks in when the display
+# output is meaningfully larger than the source. Toggle with F8.
+# (See [no-fsrcnnx-large] below for the >1080p-source override.)
+glsl-shaders=~~/shaders/FSRCNNX_x2_8-0-4-1.glsl
 
-# RIFE realtime 2x interpolation, auto-applied at file-load when source
-# fps ≤ 30 — anything higher is already smooth enough that interpolating
-# to 2× wastes GPU on frames mpv would just drop at the display refresh.
-# Threshold is also where the GPU cost ramps up: 60 → 120 fps RIFE pegs
-# the GB10 on a 4K HiDPI panel. Toggle manually with F9.
+# RIFE realtime 2x interpolation, applied per resolution band so the
+# GB10 isn't asked to do something it can't sustain:
+#   ≤30fps and h ≤ 720          → 4.26 (heavy quality, small frames cheap)
+#   ≤30fps and 720 < h ≤ 1080   → 4.6  (lighter, balanced for 1080p)
+#   ≤30fps and h > 1080          → no RIFE (4K interpolation pegs SMs;
+#                                  also UHD content is generally HFR
+#                                  natively and clips our 30fps gate)
+#   >30fps                       → no RIFE (already smooth; would only
+#                                  produce frames mpv drops at vsync)
 #
-# `or 999` makes the condition fail before container-fps is known
-# (it's nil at the moment mpv first applies profiles, becomes the real
-# value after the demuxer reads the container). Defaulting to "unknown
-# = don't RIFE" prevents a ~half-second window where the vf gets added
-# and immediately removed when fps turns out to be > 30. profile-cond
-# re-evaluates reactively when container-fps lands.
-[rife]
-profile-cond=(p["container-fps"] or 999)<=30
+# `or 999` / `or 0` sentinels: at the very first profile-cond evaluation
+# (before the demuxer fills container-fps and video-params/h), those
+# properties are nil. Defaulting to values that fail the gate prevents
+# a ~half-second window where the vf gets attached then ripped off
+# when the real numbers land. profile-cond re-evaluates reactively
+# whenever the referenced properties change.
+[rife-heavy]
+profile-cond=(p["container-fps"] or 999)<=30 and 0<(p["video-params/h"] or 0) and (p["video-params/h"] or 0)<=720
 profile-restore=copy-equal
 vf=vapoursynth=~~/rife.vpy
+
+[rife-light]
+profile-cond=(p["container-fps"] or 999)<=30 and (p["video-params/h"] or 0)>720 and (p["video-params/h"] or 0)<=1080
+profile-restore=copy-equal
+vf=vapoursynth=~~/rife-light.vpy
+
+# For >1080p sources, force FSRCNNX off. The shader's own //!WHEN gate
+# at 1.3× wouldn't activate on a 4K source playing on a 4K display
+# (output/luma ≈ 1.0), but a HiDPI-scaled display surface above 4K
+# could push the ratio over the gate at 4K source — and we don't want
+# to pile FSRCNNX shader work on top of an already-large frame.
+[no-fsrcnnx-large]
+profile-cond=(p["video-params/h"] or 0)>1080
+profile-restore=copy-equal
+glsl-shaders=
 EOF
   log "wrote $MPV_CFG_DIR/mpv.conf"
 
