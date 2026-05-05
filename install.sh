@@ -332,7 +332,13 @@ apply_patches() {
     if [[ -f "$f" ]]; then
       if grep -q '"osc"\] = False' "$f"; then
         cp -n "$f" "${f}.bak"
-        sed -i 's|mpv_options\["osc"\] = False|mpv_options["script_opts"] = "osc-visibility=never"  # mpv 0.41+ removed --osc|' "$f"
+        # mpv 0.41 removed the legacy `--osc` flag (and `_player.osc`
+        # property). Replace shim's `mpv_options["osc"] = False` with a
+        # script-opts setting that maps the user's `settings.enable_osc`
+        # config field to the new `osc-visibility=auto|never` property.
+        # Hard-coding "never" (our previous patch) ignored the user's
+        # preference and made the OSC permanently invisible in shim mode.
+        sed -i 's|mpv_options\["osc"\] = False|mpv_options["script_opts"] = "osc-visibility=" + ("auto" if settings.enable_osc else "never")  # mpv 0.41+ removed --osc|' "$f"
         log "patched $f for mpv 0.41 osc-removal"
       else
         log "shim player.py already patched (or different version)"
@@ -960,8 +966,10 @@ PY
     [[ -d "$pydir" ]] || continue
     local f="$pydir/site-packages/jellyfin_mpv_shim/player.py"
     if [[ -f "$f" ]]; then
-      if grep -q 'osc-visibility=never' "$f" 2>/dev/null; then
-        echo "  shim/player.py : osc-removal patch applied"
+      if grep -q 'osc-visibility=" + (' "$f" 2>/dev/null; then
+        echo "  shim/player.py : osc-removal patch applied (honors settings.enable_osc)"
+      elif grep -q 'osc-visibility=never' "$f" 2>/dev/null; then
+        echo "  shim/player.py : older osc-removal patch (always-off — re-run install to upgrade)"
       else
         echo "  shim/player.py : NOT patched (would break mpv 0.41 playback)"
       fi
