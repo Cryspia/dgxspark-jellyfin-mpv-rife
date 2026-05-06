@@ -68,12 +68,9 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 
 - **F8** —— FSRCNNX 着色器开关
 - **F9** —— RIFE 切换：4.26（默认）→ 4.6（轻量 fallback）→ 关
-- **F10** —— 弹幕开关（也可以点画面右上角的「弹」图标）
-- **Shift+F10** —— 弹幕设置面板（透明度、字号、速度、密度、显示区域、渲染模式、防重叠、来源过滤、每集时间偏移、去重、繁简转换 等等）
-- **Ctrl+F10** —— 弹幕手动模糊搜索（输入关键词 → 选番剧 → 选剧集）
-- **i** / **Shift+I** —— mpv 自带的统计信息浮层
-- **Ctrl+S** —— mpv 自带的截图
-- 其他 mpv 默认快捷键全部保留
+- mpv 自带快捷键全部保留（`i` 看统计信息、`s` 截图等）
+
+弹幕的快捷键见下方[弹幕](#弹幕bullet-chat)章节。
 
 ## 弹幕（bullet-chat）
 
@@ -119,7 +116,7 @@ dgxspark-jellyfin-mpv-rife/
     └── mpv/{16,32,64,128}.png + scalable.svg
 ```
 
-弹幕插件原本是这个仓库的一个子目录（`danmaku/`），现在已经独立到 [Cryspia/mpv-dandanplay-danmaku](https://github.com/Cryspia/mpv-dandanplay-danmaku) 仓库。本脚本会自动 fetch 它（默认追 `main` 分支；如果想锁定到具体版本，把 `install.sh` 里的 `DANMAKU_REF` 改成 tag 即可）然后调用它的 install.py，你不需要手动 clone。
+弹幕插件在独立仓库 [Cryspia/mpv-dandanplay-danmaku](https://github.com/Cryspia/mpv-dandanplay-danmaku) 维护。本脚本会自动 fetch 它（默认追 `main` 分支；如果想锁定到具体版本，把 `install.sh` 里的 `DANMAKU_REF` 改成 tag 即可）然后调用它的 install.py，你不需要手动 clone。
 
 把这个仓库 clone 到一台干净的 DGX Spark，运行 `./install.sh install` 就能完整复现整个安装。
 
@@ -131,4 +128,3 @@ dgxspark-jellyfin-mpv-rife/
 - **hidpi-window-scale=yes** 是 FSRCNNX 在 4K HiDPI 屏上能触发的关键 —— 否则 mpv 按逻辑 1080p 渲染，着色器里的 `//!WHEN OUTPUT/LUMA > 1.3` 永远不成立。
 - **GB10 上 RIFE 推理会和 libplacebo 合成器抢 GPU**。纯 RIFE 4.26 在 24fps 源上能稳稳跑 ~48 fps（用 `--vo=null` 测，没合成器干扰）。但一旦 FSRCNNX 着色器在 mpv 的 gpu-next 合成器里跑起来，同一段视频就掉到 ~41 fps —— GPU 计算单元在 TRT 推理和着色器之间被切分。分辨率分档就是为了绕开这个：1080p 用更轻的 4.6 模型，让 RIFE 占的算力更小，给合成器留够空间。
 - **Vulkan 后端的 RIFE 在这台机器上不可行**。我们试过 ncnn-Vulkan（想用同一个 GPU API 避免 CUDA↔Vulkan 跨切换）；同样的管线下只有 ~14 fps，因为 ncnn 的 Vulkan kernels 在 Blackwell 上比 TRT 的 tensor-core kernels 慢得多，而且同一 Vulkan 上下文里的争抢比跨 API 更糟。最后还是 TRT 胜出。
-- **NVENC 串流（Sunshine / Moonlight）会在本地管线之上再吃约 20% GPU**。如果你串流里掉帧但本地不掉，瓶颈在编码器，不是 RIFE。

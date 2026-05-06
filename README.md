@@ -101,15 +101,10 @@ profile-cond logic chose.
 
 - **F8** — toggle FSRCNNX shader
 - **F9** — cycle RIFE: 4.26 (default) → 4.6 (light) → off
-- **F10** — toggle danmaku visibility (also: click the 弹 icon top-right)
-- **Shift+F10** — danmaku settings panel (opacity / font size / speed /
-  density / area / render mode / anti-overlap / source filter /
-  per-episode time offset / dedup / 繁简转换 / etc.)
-- **Ctrl+F10** — danmaku manual fuzzy search (text input → anime picker
-  → episode picker)
-- **i** / **Shift+I** — mpv default stats overlay
-- **Ctrl+S** — mpv default screenshot
-- All other mpv defaults intact
+- All mpv defaults intact (`i` for stats, `s` for screenshot, etc.)
+
+Danmaku has its own bindings — see the [Danmaku](#danmaku-bullet-chat)
+section below.
 
 ## Danmaku (bullet chat)
 
@@ -167,8 +162,8 @@ dgxspark-jellyfin-mpv-rife/
     └── mpv/{16,32,64,128}.png + scalable.svg
 ```
 
-The danmaku plugin formerly lived inline (`danmaku/`) but has graduated
-into its own repo at [Cryspia/mpv-dandanplay-danmaku](https://github.com/Cryspia/mpv-dandanplay-danmaku).
+The danmaku plugin lives in its own repo at
+[Cryspia/mpv-dandanplay-danmaku](https://github.com/Cryspia/mpv-dandanplay-danmaku).
 This installer fetches it (pinned to the `main` branch — bump
 `DANMAKU_REF` in `install.sh` to a tag for reproducible builds) and
 runs its installer; you don't need to clone the danmaku repo manually.
@@ -203,6 +198,3 @@ Cloning this dgxspark repo onto a fresh DGX Spark and running
   ncnn's Vulkan kernels are far slower than TRT's tensor-core kernels
   on Blackwell, and same-Vulkan contention turned out to be worse
   than cross-API contention. Sticking with TRT.
-- **NVENC streaming (e.g. Sunshine/Moonlight) costs ~20% GPU on top of
-  the local pipeline.** If frames drop under streaming that aren't
-  there locally, the streaming encoder is the culprit, not RIFE.
