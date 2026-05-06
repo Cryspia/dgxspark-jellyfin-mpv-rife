@@ -7,9 +7,9 @@
 整条链路里包含的组件：
 
 - **mpv** —— 从源码编译（mpv 0.41），同时启用 vapoursynth + vulkan + wayland + x11 + lua。conda-forge 上 aarch64 的 mpv 是没有显示后端的 headless 库构建，没法直接当播放器用，所以脚本自己重新编译。
-- **vsrife + TensorRT** —— RIFE 4.26 模型，TRT 混合精度（fp16 权重 + fp32 累加器）。脚本会 patch 上游 vsrife，把 `use_explicit_typing=True` 换成 `enabled_precisions={fp16, fp32}`，否则光流向量在快速运动场景下会溢出导致闪烁。
-- **FSRCNNX** glsl 着色器 —— 2x 亮度超分，仅在渲染目标 > 源 × 1.3 时才生效（例如 1080p 源播到 4K HiDPI 屏）。
-- **jellyfin-mpv-shim** —— 连接 Jellyfin 服务器、通过 IPC 控制 mpv 的 Python 客户端。脚本会 patch 它去掉 `--osc=no` 这个 mpv 0.41 已经移除的命令行参数，否则启动就会报错。
+- **vsrife + TensorRT** —— 按源分辨率挑两套 RIFE 模型：≤720p 用 4.26（重型，画质最好），720p<h≤1080p 用 4.6（轻型），>1080p 关闭。两套都跑 TRT 混合精度（fp16 权重 + fp32 累加器）。脚本会 patch 上游 vsrife，把 `use_explicit_typing=True` 换成 `enabled_precisions={fp16, fp32}`，否则光流向量在快速运动场景下会溢出导致闪烁。具体规则见下文「默认配置」。
+- **FSRCNNX** glsl 着色器 —— 2x 亮度超分。≤1080p 默认加载；>1080p 显式清空，避免在已经很大的画面上再叠一层着色器开销。着色器自带的 `//!WHEN OUTPUT/LUMA > 1.3` 门控会在源分辨率接近显示分辨率时自动关掉。
+- **jellyfin-mpv-shim** —— 连接 Jellyfin 服务器、通过 IPC 控制 mpv 的 Python 客户端。脚本会 patch 它适配 mpv 0.41（旧版 `osc=False` 选项已被移除，patch 把它翻译成 `script-opts=osc-visibility=auto|never`，再交给 shim 自己的 `enable_osc` 配置项决定显隐）。
 
 ## 系统要求
 
@@ -92,9 +92,9 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 | 路径 | 用途 |
 |------|------|
 | `~/miniforge3/envs/vsmpv/` | conda 环境：python、mpv、vapoursynth、vsrife、shim、tensorrt |
-| `~/.config/mpv/{mpv,input}.conf, rife.vpy, shaders/` | mpv 用户配置（shim 通过 symlink 共用同一份） |
+| `~/.config/mpv/{mpv,input}.conf, rife.vpy, rife-light.vpy, shaders/` | mpv 用户配置（shim 通过 symlink 共用同一份） |
 | `~/.config/jellyfin-mpv-shim/conf.json` | shim 自己的配置（服务器凭证等） |
-| `~/.config/jellyfin-mpv-shim/{mpv.conf,input.conf,rife.vpy,shaders,scripts}` | symlink 到 `~/.config/mpv/` |
+| `~/.config/jellyfin-mpv-shim/{mpv.conf,input.conf,rife.vpy,rife-light.vpy,shaders,scripts}` | symlink 到 `~/.config/mpv/` |
 | `~/.local/bin/{mpv-conda,jellyfin-mpv-shim}` | 启动 wrapper（设置 PYTHONHOME / GI_TYPELIB_PATH） |
 | `~/.local/share/applications/*.desktop` | 桌面环境启动器条目 |
 | `~/.config/autostart/jellyfin-mpv-shim.desktop` | 登录后 shim 自启动 |
@@ -129,4 +129,6 @@ dgxspark-jellyfin-mpv-rife/
 - **PYTHONHOME 是关键**。如果 mpv 不通过 conda activate 启动，找不到内嵌 Python 的标准库，vapoursynth filter 初始化失败，画面立刻 EOF 只剩声音。
 - **gpu-context=waylandvk** 比 `x11vk` 延迟低，但失去 GNOME 绘制的窗口装饰（mpv 0.41 不支持 libdecor）。
 - **hidpi-window-scale=yes** 是 FSRCNNX 在 4K HiDPI 屏上能触发的关键 —— 否则 mpv 按逻辑 1080p 渲染，着色器里的 `//!WHEN OUTPUT/LUMA > 1.3` 永远不成立。
-- **NVENC 串流（Sunshine / Moonlight）大约要吃 20% GPU**。如果你这套配置在串流里掉帧，瓶颈大概率是串流管线，不是 RIFE。本地 4K 屏上 RIFE 4.26 + scale=1.0 + FSRCNNX 完全跑得动，零掉帧。
+- **GB10 上 RIFE 推理会和 libplacebo 合成器抢 GPU**。纯 RIFE 4.26 在 24fps 源上能稳稳跑 ~48 fps（用 `--vo=null` 测，没合成器干扰）。但一旦 FSRCNNX 着色器在 mpv 的 gpu-next 合成器里跑起来，同一段视频就掉到 ~41 fps —— GPU 计算单元在 TRT 推理和着色器之间被切分。分辨率分档就是为了绕开这个：1080p 用更轻的 4.6 模型，让 RIFE 占的算力更小，给合成器留够空间。
+- **Vulkan 后端的 RIFE 在这台机器上不可行**。我们试过 ncnn-Vulkan（想用同一个 GPU API 避免 CUDA↔Vulkan 跨切换）；同样的管线下只有 ~14 fps，因为 ncnn 的 Vulkan kernels 在 Blackwell 上比 TRT 的 tensor-core kernels 慢得多，而且同一 Vulkan 上下文里的争抢比跨 API 更糟。最后还是 TRT 胜出。
+- **NVENC 串流（Sunshine / Moonlight）会在本地管线之上再吃约 20% GPU**。如果你串流里掉帧但本地不掉，瓶颈在编码器，不是 RIFE。

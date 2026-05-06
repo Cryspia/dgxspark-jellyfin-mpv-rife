@@ -12,16 +12,22 @@ The whole pipeline runs in a single Miniforge conda environment:
   wayland + x11 + lua all enabled. The conda-forge aarch64 mpv is a
   headless library build with no display backends, so the installer
   builds its own.
-- **vsrife + TensorRT** — RIFE 4.26 model running on TRT mixed precision
-  (fp16 weights, fp32 accumulators). The installer patches vsrife to use
+- **vsrife + TensorRT** — two RIFE models picked per source resolution:
+  4.26 (heavy, best quality) for ≤720p, 4.6 (light) for 720p<h≤1080p,
+  off above that. Both run TRT mixed precision (fp16 weights, fp32
+  accumulators). The installer patches vsrife to use
   `enabled_precisions={fp16, fp32}` instead of `use_explicit_typing=True`,
   which would otherwise cause flow-vector overflow → flicker on fast
-  motion.
-- **FSRCNNX** glsl shader — 2x luma upscale, only activates when render
-  target is >1.3x source (e.g. 1080p source on a 4K HiDPI monitor).
+  motion. See [Default config](#default-config) for the per-band rules.
+- **FSRCNNX** glsl shader — 2x luma upscale. Loaded by default for
+  ≤1080p sources; explicitly cleared for >1080p so mpv doesn't pile
+  shader work onto already-large frames. The shader's own
+  `//!WHEN OUTPUT/LUMA > 1.3` gate self-disables when source ≈ display.
 - **jellyfin-mpv-shim** — Python client that connects to a Jellyfin
   server and drives mpv via IPC. Installer patches it for mpv 0.41
-  compatibility (`--osc=no` cmdline removal).
+  compatibility (the legacy `osc=False` mpv option is gone — translated
+  to `script-opts=osc-visibility=auto|never` driven by shim's own
+  `enable_osc` config field).
 
 ## Requirements
 
@@ -135,9 +141,9 @@ Quick summary of what you get:
 | Path | Purpose |
 |------|---------|
 | `~/miniforge3/envs/vsmpv/` | Conda env: python, mpv, vapoursynth, vsrife, shim, tensorrt |
-| `~/.config/mpv/{mpv,input}.conf, rife.vpy, shaders/` | User mpv config (also used by shim via symlinks) |
-| `~/.config/jellyfin-mpv-shim/conf.json` | Shim's own config (server creds, etc.) |
-| `~/.config/jellyfin-mpv-shim/{mpv.conf,input.conf,rife.vpy,shaders,scripts}` | Symlinks to `~/.config/mpv/` |
+| `~/.config/mpv/{mpv,input}.conf, rife.vpy, rife-light.vpy, shaders/` | User mpv config (also used by shim via symlinks) |
+| `~/.config/jellyfin-mpv-shim/conf.json` | Shim's own config (server creds, OSC visibility, etc.) |
+| `~/.config/jellyfin-mpv-shim/{mpv.conf,input.conf,rife.vpy,rife-light.vpy,shaders,scripts}` | Symlinks to `~/.config/mpv/` |
 | `~/.local/bin/{mpv-conda,jellyfin-mpv-shim}` | Wrappers that set PYTHONHOME / GI_TYPELIB_PATH |
 | `~/.local/share/applications/*.desktop` | App-launcher entries |
 | `~/.config/autostart/jellyfin-mpv-shim.desktop` | Auto-start shim on login |
@@ -183,7 +189,20 @@ Cloning this dgxspark repo onto a fresh DGX Spark and running
 - **hidpi-window-scale=yes** is what makes FSRCNNX activate on a 4K
   HiDPI display — without it, mpv renders at logical 1080p and the
   shader's `//!WHEN OUTPUT/LUMA > 1.3` gate stays false.
-- **NVENC streaming (e.g. Sunshine/Moonlight) costs ~20% GPU.** If you
-  see drops with this config, the streaming pipeline is most likely
-  the culprit, not RIFE itself. Local 4K display has plenty of headroom
-  for RIFE 4.26 + scale=1.0 + FSRCNNX with zero drops.
+- **RIFE inference contends with libplacebo's compositor on the GB10.**
+  Pure RIFE 4.26 throughput is ~48 fps on a 24fps source (verified
+  with `--vo=null` so no compositor in the loop). Once the FSRCNNX
+  shader starts running in mpv's gpu-next compositor, the same source
+  drops to ~41 fps — the GPU's compute units split between TRT
+  inference and the shader pass. The per-resolution band is the
+  workaround: 1080p sources get the lighter 4.6 model so RIFE's
+  compute share is smaller and the compositor doesn't starve.
+- **A Vulkan-backend RIFE is not viable on this hardware.** We tried
+  ncnn-Vulkan to share the GPU API with libplacebo (avoiding
+  CUDA↔Vulkan handoffs); it ran ~14 fps in the same pipeline because
+  ncnn's Vulkan kernels are far slower than TRT's tensor-core kernels
+  on Blackwell, and same-Vulkan contention turned out to be worse
+  than cross-API contention. Sticking with TRT.
+- **NVENC streaming (e.g. Sunshine/Moonlight) costs ~20% GPU on top of
+  the local pipeline.** If frames drop under streaming that aren't
+  there locally, the streaming encoder is the culprit, not RIFE.
