@@ -324,20 +324,24 @@ apply_patches() {
     [[ -L "$pydir" ]] && continue
     [[ -d "$pydir" ]] || continue
 
-    # Patch jellyfin-mpv-shim 2.9.0 for mpv 0.41 compatibility:
-    # mpv 0.41 removed the `osc` cmdline option; shim still passes
-    # --osc=no which makes mpv exit "Fatal error" before the IPC
-    # handshake. Replace with `script-opts=osc-visibility=never`.
+    # Patch jellyfin-mpv-shim for mpv 0.41 compatibility. Verified
+    # against shim 2.9.0 and 2.10.0; both ship `mpv_options["osc"] =
+    # False` which mpv 0.41 rejects (the legacy --osc flag and the
+    # _player.osc property are both gone). Replace with a script-opts
+    # setting that maps the user's `settings.enable_osc` config field
+    # to the new `osc-visibility=auto|never` property. Hard-coding
+    # "never" (our previous patch) ignored the user's preference and
+    # made the OSC permanently invisible in shim mode.
+    #
+    # Note: shim 2.10.0's enable_osc() method internally uses the
+    # property-based path on mpv 0.41, but it's gated behind
+    # `if hasattr(self._player, "osc")` (False on 0.41), so the call
+    # never reaches it at runtime. The construction-time arg below is
+    # therefore the only thing that actually controls visibility.
     f="$pydir/site-packages/jellyfin_mpv_shim/player.py"
     if [[ -f "$f" ]]; then
       if grep -q '"osc"\] = False' "$f"; then
         cp -n "$f" "${f}.bak"
-        # mpv 0.41 removed the legacy `--osc` flag (and `_player.osc`
-        # property). Replace shim's `mpv_options["osc"] = False` with a
-        # script-opts setting that maps the user's `settings.enable_osc`
-        # config field to the new `osc-visibility=auto|never` property.
-        # Hard-coding "never" (our previous patch) ignored the user's
-        # preference and made the OSC permanently invisible in shim mode.
         sed -i 's|mpv_options\["osc"\] = False|mpv_options["script_opts"] = "osc-visibility=" + ("auto" if settings.enable_osc else "never")  # mpv 0.41+ removed --osc|' "$f"
         log "patched $f for mpv 0.41 osc-removal"
       else
