@@ -83,8 +83,16 @@ compositor, so the RIFE band depends on input height:
 |---|---|---|---|
 | ≤ 720p | ≤ 30 fps | **4.26** (heavy, scale=1.0) | on |
 | > 720p, ≤ 1080p | ≤ 30 fps | **4.6** (light, scale=1.0) | on |
-| > 1080p | any | off (would peg the GB10) | off |
-| any | > 30 fps | off (already smooth) | on |
+| > 1080p, ≤ 2160p | ≤ 30 fps | **4.6** at **scale=0.5** (half-flow, ~1080p compute) | off |
+| > 2160p | any | off (above 4K is unreasonable for realtime) | off |
+| any | > 30 fps | off (already smooth) | on (≤1080p) / off (>1080p) |
+
+Half-flow (`scale=0.5`) for the 4K band runs flow estimation at half
+resolution internally — total compute drops to roughly the same as
+full-resolution 1080p, so the GB10 keeps up. Quality is noticeably
+softer on fast motion than full-res 4.6 (less detail in the flow
+field) but RIFE still does *something*, which beats a stuttering 4K
+source with no interpolation at all.
 
 Other relevant settings:
 
@@ -96,10 +104,11 @@ Other relevant settings:
   flickers on fast motion because flow-vector accumulators overflow.
 
 Tuning knobs are inline in `~/.config/mpv/rife.vpy`,
-`~/.config/mpv/rife-light.vpy`, and `~/.config/mpv/mpv.conf`.
-Manual override mid-playback: F8 toggles FSRCNNX, F9 cycles the active
-RIFE config (4.26 → 4.6 → off → loop) regardless of which band the
-profile-cond logic chose.
+`~/.config/mpv/rife-light.vpy`, `~/.config/mpv/rife-half.vpy`, and
+`~/.config/mpv/mpv.conf`. Manual override mid-playback: F8 toggles
+FSRCNNX, F9 cycles the active RIFE config (4.26 → 4.6 → 4.6 @
+scale=0.5 → off → loop) regardless of which band the profile-cond
+logic chose.
 
 ### TRT engine cache
 
@@ -170,9 +179,9 @@ Quick summary of what you get:
 | Path | Purpose |
 |------|---------|
 | `~/miniforge3/envs/vsmpv/` | Conda env: python, mpv, vapoursynth, vsrife, shim, tensorrt |
-| `~/.config/mpv/{mpv,input}.conf, rife.vpy, rife-light.vpy, shaders/` | User mpv config (also used by shim via symlinks) |
+| `~/.config/mpv/{mpv,input}.conf, rife.vpy, rife-light.vpy, rife-half.vpy, shaders/` | User mpv config (also used by shim via symlinks) |
 | `~/.config/jellyfin-mpv-shim/conf.json` | Shim's own config (server creds, OSC visibility, etc.) |
-| `~/.config/jellyfin-mpv-shim/{mpv.conf,input.conf,rife.vpy,rife-light.vpy,shaders,scripts}` | Symlinks to `~/.config/mpv/` |
+| `~/.config/jellyfin-mpv-shim/{mpv.conf,input.conf,rife.vpy,rife-light.vpy,rife-half.vpy,shaders,scripts}` | Symlinks to `~/.config/mpv/` |
 | `~/.local/bin/{mpv-conda,jellyfin-mpv-shim}` | Wrappers that set PYTHONHOME / GI_TYPELIB_PATH |
 | `~/.local/share/applications/*.desktop` | App-launcher entries |
 | `~/.config/autostart/jellyfin-mpv-shim.desktop` | Auto-start shim on login |

@@ -57,8 +57,11 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 |---|---|---|---|
 | ≤ 720p | ≤ 30 fps | **4.26**（重型，scale=1.0） | 开 |
 | > 720p，≤ 1080p | ≤ 30 fps | **4.6**（轻型，scale=1.0） | 开 |
-| > 1080p | 任何 | 关（GB10 上跑不动） | 关 |
-| 任何 | > 30 fps | 关（已经够流畅，硬补只是浪费 GPU） | 开 |
+| > 1080p，≤ 2160p | ≤ 30 fps | **4.6 @ scale=0.5**（半分辨率光流，4K 算力 ≈ 1080p） | 关 |
+| > 2160p | 任何 | 关（超过 4K 不现实做实时插帧） | 关 |
+| 任何 | > 30 fps | 关（已经够流畅，硬补只是浪费 GPU） | 开（≤1080p）/关（>1080p） |
+
+4K 段用半分辨率光流（`scale=0.5`）：光流估计内部按一半分辨率算，总算力大约和 1080p 全分辨率持平，GB10 跑得动。代价是快速运动时插帧画面会比全分辨率 4.6 更糊（光流细节少了），但是「虽然糊，但是至少有插帧」总比「4K 卡顿不补帧」要好。
 
 其他相关设置：
 
@@ -66,7 +69,7 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 - hidpi-window-scale=yes（4K HiDPI 显示器上 FSRCNNX 才会触发）
 - 两套 RIFE 模型都用 TRT 混合精度（fp16 权重 + fp32 累加器），由安装脚本 patch 上游 vsrife 实现；纯 fp16 在快速运动场景下光流累加器会溢出导致闪烁。
 
-可调项的注释直接写在 `~/.config/mpv/rife.vpy`、`~/.config/mpv/rife-light.vpy` 和 `~/.config/mpv/mpv.conf` 里。手动覆盖：F8 切换 FSRCNNX，F9 在三种 RIFE 配置间循环（4.26 → 4.6 → 关 → 循环），不受 profile-cond 自动选择影响。
+可调项的注释直接写在 `~/.config/mpv/rife.vpy`、`~/.config/mpv/rife-light.vpy`、`~/.config/mpv/rife-half.vpy` 和 `~/.config/mpv/mpv.conf` 里。手动覆盖：F8 切换 FSRCNNX，F9 在四种 RIFE 配置间循环（4.26 → 4.6 → 4.6 @ scale=0.5 → 关 → 循环），不受 profile-cond 自动选择影响。
 
 ### TRT engine 缓存
 
@@ -107,9 +110,9 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 | 路径 | 用途 |
 |------|------|
 | `~/miniforge3/envs/vsmpv/` | conda 环境：python、mpv、vapoursynth、vsrife、shim、tensorrt |
-| `~/.config/mpv/{mpv,input}.conf, rife.vpy, rife-light.vpy, shaders/` | mpv 用户配置（shim 通过 symlink 共用同一份） |
+| `~/.config/mpv/{mpv,input}.conf, rife.vpy, rife-light.vpy, rife-half.vpy, shaders/` | mpv 用户配置（shim 通过 symlink 共用同一份） |
 | `~/.config/jellyfin-mpv-shim/conf.json` | shim 自己的配置（服务器凭证等） |
-| `~/.config/jellyfin-mpv-shim/{mpv.conf,input.conf,rife.vpy,rife-light.vpy,shaders,scripts}` | symlink 到 `~/.config/mpv/` |
+| `~/.config/jellyfin-mpv-shim/{mpv.conf,input.conf,rife.vpy,rife-light.vpy,rife-half.vpy,shaders,scripts}` | symlink 到 `~/.config/mpv/` |
 | `~/.local/bin/{mpv-conda,jellyfin-mpv-shim}` | 启动 wrapper（设置 PYTHONHOME / GI_TYPELIB_PATH） |
 | `~/.local/share/applications/*.desktop` | 桌面环境启动器条目 |
 | `~/.config/autostart/jellyfin-mpv-shim.desktop` | 登录后 shim 自启动 |

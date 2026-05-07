@@ -430,9 +430,13 @@ glsl-shaders=~~/shaders/FSRCNNX_x2_8-0-4-1.glsl
 # GB10 isn't asked to do something it can't sustain:
 #   ≤30fps and h ≤ 720          → 4.26 (heavy quality, small frames cheap)
 #   ≤30fps and 720 < h ≤ 1080   → 4.6  (lighter, balanced for 1080p)
-#   ≤30fps and h > 1080          → no RIFE (4K interpolation pegs SMs;
-#                                  also UHD content is generally HFR
-#                                  natively and clips our 30fps gate)
+#   ≤30fps and 1080 < h ≤ 2160  → 4.6 @ scale=0.5 (flow runs at half
+#                                  resolution → 4K compute ≈ 1080p
+#                                  compute. Quality lower than full-
+#                                  res but at least there's still
+#                                  interpolation; full-res 4.6 at 4K
+#                                  pegs the GB10 and drops frames.)
+#   ≤30fps and h > 2160          → no RIFE (above 4K is unreasonable)
 #   >30fps                       → no RIFE (already smooth; would only
 #                                  produce frames mpv drops at vsync)
 #
@@ -452,6 +456,11 @@ profile-cond=(p["container-fps"] or 999)<=30 and (p["video-params/h"] or 0)>720 
 profile-restore=copy-equal
 vf=vapoursynth=~~/rife-light.vpy
 
+[rife-half]
+profile-cond=(p["container-fps"] or 999)<=30 and (p["video-params/h"] or 0)>1080 and (p["video-params/h"] or 0)<=2160
+profile-restore=copy-equal
+vf=vapoursynth=~~/rife-half.vpy
+
 # For >1080p sources, force FSRCNNX off. The shader's own //!WHEN gate
 # at 1.3× wouldn't activate on a 4K source playing on a 4K display
 # (output/luma ≈ 1.0), but a HiDPI-scaled display surface above 4K
@@ -470,11 +479,13 @@ EOF
 # see immediately whether the binding fired.
 F8 cycle-values glsl-shaders "~~/shaders/FSRCNNX_x2_8-0-4-1.glsl" ""; show-text "FSRCNNX: ${glsl-shaders}" 2000
 
-# F9: cycle RIFE between three states:
-#   4.26 (default, best quality) → 4.6 (lighter fallback) → off → loop
-# Useful when an extreme scene briefly pushes 4.26 over budget; F9 once
-# to drop down to 4.6, F9 again to disable, F9 again to come back.
-F9 cycle-values vf "vapoursynth=~~/rife.vpy" "vapoursynth=~~/rife-light.vpy" ""; show-text "RIFE: ${vf}" 2500
+# F9: cycle RIFE through four states:
+#   4.26 (best quality)  → 4.6 (lighter)  → 4.6 @ scale=0.5 (half-flow,
+#   for >1080p sources)  → off  → loop
+# Useful for manually overriding the auto-band selection — e.g. force
+# 4.26 quality on a 1080p source even though the band default is 4.6,
+# or fall back to half-flow on a heavy 1080p scene.
+F9 cycle-values vf "vapoursynth=~~/rife.vpy" "vapoursynth=~~/rife-light.vpy" "vapoursynth=~~/rife-half.vpy" ""; show-text "RIFE: ${vf}" 2500
 EOF
   log "wrote $MPV_CFG_DIR/input.conf"
 
@@ -565,6 +576,46 @@ clip.set_output()
 EOF
   log "wrote $MPV_CFG_DIR/rife-light.vpy"
 
+  # rife-half.vpy — model 4.6 at scale=0.5. Used by [rife-half] profile
+  # for sources between 1080p and 4K. Flow estimation runs at half-res
+  # internally, so 4K compute drops to ~1080p compute. Quality is
+  # noticeably worse than full-res 4.6 (less detail in the flow field
+  # → softer interpolated frames on fast motion) but RIFE still works
+  # at all, which beats a stuttering 4K source with no interpolation.
+  cat > "$MPV_CFG_DIR/rife-half.vpy" <<'EOF'
+# RIFE realtime interpolation — HALF-FLOW for >1080p sources.
+# Model 4.6 with scale=0.5: flow at half resolution, output at source
+# resolution. Used by mpv's [rife-half] profile (1080p < h ≤ 2160).
+
+import vapoursynth as vs
+from vsrife import rife
+
+core = vs.core
+clip = video_in
+
+_MATRIX_NAME = {1: "709", 6: "170m", 7: "240m", 9: "2020ncl"}
+try:
+    _m = int(clip.get_frame(0).props.get("_Matrix", 1))
+except Exception:
+    _m = 1
+_mtx = _MATRIX_NAME.get(_m, "709")
+
+clip = core.resize.Bicubic(clip, format=vs.RGBH, matrix_in_s=_mtx)
+clip = rife(
+    clip,
+    model="4.6",
+    scale=0.5,
+    factor_num=2,
+    factor_den=1,
+    auto_download=True,
+    trt=True,
+)
+clip = core.resize.Bicubic(clip, format=vs.YUV420P10, matrix_s=_mtx)
+
+clip.set_output()
+EOF
+  log "wrote $MPV_CFG_DIR/rife-half.vpy"
+
   # FSRCNNX shader from project assets
   cp -f "$PROJECT_DIR/shaders/FSRCNNX_x2_8-0-4-1.glsl" "$MPV_CFG_DIR/shaders/"
   log "copied FSRCNNX shader to $MPV_CFG_DIR/shaders/"
@@ -603,34 +654,37 @@ warm_trt_cache() {
   # padded shape (e.g. 1920x1088, 3840x2176) so 1080p and 4K engines
   # coexist independently.
   #
-  # Total disk: ~150 MB for all 4 engines. Total time on a clean install:
-  # ~2-4 minutes (each engine ~30-60s); cache hits return in <1s.
+  # Total disk: ~250 MB for all 5 engines. Total time on a clean install:
+  # ~3-5 minutes (each engine ~30-60s); cache hits return in <1s.
   python - <<'PY'
 import time, vapoursynth as vs
 from vsrife import rife
 
 core = vs.core
 
-def warm(label, model, width, height):
+def warm(label, model, width, height, scale=1.0):
     dummy = core.std.BlankClip(width=width, height=height,
                                format=vs.YUV420P8,
                                length=2, fpsnum=30, fpsden=1)
     dummy = core.resize.Bicubic(dummy, format=vs.RGBH, matrix_in_s="709")
     t0 = time.time()
-    clip = rife(dummy, model=model, scale=1.0,
+    clip = rife(dummy, model=model, scale=scale,
                 factor_num=2, factor_den=1,
                 auto_download=True, trt=True)
     # Force frame request so vsrife actually compiles or loads the engine
     clip.get_frame(0)
     print(f"  {label}: ready in {time.time()-t0:.1f}s")
 
-# 1080p (the common case — most Jellyfin libraries)
-warm("RIFE 4.26 @ 1080p (default)",       "4.26", 1920, 1080)
-warm("RIFE 4.6  @ 1080p (light fallback)", "4.6",  1920, 1080)
+# 720p — heavy band uses 4.26 here (and F9 cycle starts at 4.26 → 4.6).
+warm("RIFE 4.26 @ 720p   (heavy band default)",  "4.26", 1280,  720)
+warm("RIFE 4.6  @ 720p   (F9 fallback)",         "4.6",  1280,  720)
 
-# 4K (modern streaming releases — UHD Blu-rays, HDR remuxes)
-warm("RIFE 4.26 @ 4K    (default)",       "4.26", 3840, 2160)
-warm("RIFE 4.6  @ 4K    (light fallback)", "4.6",  3840, 2160)
+# 1080p — light band auto-uses 4.6, but pre-warm 4.26 too for F9 cycle.
+warm("RIFE 4.26 @ 1080p  (F9 manual override)",  "4.26", 1920, 1080)
+warm("RIFE 4.6  @ 1080p  (light band default)",  "4.6",  1920, 1080)
+
+# 4K — half-flow band uses 4.6 at scale=0.5 (flow runs at 1080p res).
+warm("RIFE 4.6  @ 4K     (half-flow band, scale=0.5)", "4.6", 3840, 2160, scale=0.5)
 PY
 }
 
@@ -699,7 +753,7 @@ PY
   # shim insists on its own --config-dir, isolating mpv from ~/.config/mpv/.
   # Symlink the user-facing files back so one set of config rules both.
   local name src dst
-  for name in mpv.conf input.conf rife.vpy rife-light.vpy \
+  for name in mpv.conf input.conf rife.vpy rife-light.vpy rife-half.vpy \
               danmaku-config.json danmaku-credentials.json danmaku-settings.json; do
     src="$MPV_CFG_DIR/$name"
     dst="$SHIM_CFG_DIR/$name"
@@ -1013,6 +1067,7 @@ PY
   section "config files"
   for f in "$MPV_CFG_DIR/mpv.conf" "$MPV_CFG_DIR/input.conf" \
            "$MPV_CFG_DIR/rife.vpy" "$MPV_CFG_DIR/rife-light.vpy" \
+           "$MPV_CFG_DIR/rife-half.vpy" \
            "$MPV_CFG_DIR/shaders/FSRCNNX_x2_8-0-4-1.glsl" \
            "$MPV_CFG_DIR/scripts/dandanplay/main.lua" \
            "$MPV_CFG_DIR/scripts/dandanplay/danmaku_helper.py" \
@@ -1104,7 +1159,7 @@ cmd_uninstall() {
   # Specifically keep dandanplay AppId (registration takes 1-3 days) and
   # Jellyfin server credentials (so the user doesn't have to re-pair).
   log "removing files we created in $MPV_CFG_DIR (preserving user creds)"
-  for f in mpv.conf input.conf rife.vpy rife-light.vpy \
+  for f in mpv.conf input.conf rife.vpy rife-light.vpy rife-half.vpy \
            danmaku-config.json danmaku-credentials.json.example; do
     rm -f "$MPV_CFG_DIR/$f"
   done
@@ -1117,7 +1172,7 @@ cmd_uninstall() {
       log "  preserved: $(ls "$MPV_CFG_DIR" 2>/dev/null | tr '\n' ' ')"
 
   log "removing our symlinks in $SHIM_CFG_DIR (preserving cred.json + user prefs)"
-  for f in mpv.conf input.conf rife.vpy rife-light.vpy \
+  for f in mpv.conf input.conf rife.vpy rife-light.vpy rife-half.vpy \
            danmaku-config.json danmaku-credentials.json danmaku-settings.json \
            shaders scripts; do
     if [[ -L "$SHIM_CFG_DIR/$f" ]]; then
