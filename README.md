@@ -113,9 +113,10 @@ logic chose.
 
 ### TRT engine cache
 
-The installer pre-compiles RIFE engines for the common shapes (720p +
-1080p × RIFE 4.26 + 4.6) so the first playback at those resolutions is
-instant. Cache lives at
+The installer pre-compiles RIFE engines for the common shapes —
+720p × {4.26, 4.6}, 1080p × {4.26, 4.6}, and 4K × 4.6 @ scale=0.5
+(the half-flow band) — so the first playback at those resolutions
+is instant. Cache lives at
 `~/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models/`,
 ~250 MB total. **Engines are keyed on (model, padded_shape, fp16,
 scale, GPU model, TRT version)**, where padded_shape rounds the source
@@ -144,7 +145,8 @@ stack. Adds ~2–3 minutes to install vs the normal idempotent path.
 ## Keybindings
 
 - **F8** — toggle FSRCNNX shader
-- **F9** — cycle RIFE: 4.26 (default) → 4.6 (light) → off
+- **F9** — cycle RIFE: 4.26 (heavy) → 4.6 (light) → 4.6 @ scale=0.5
+  (half-flow) → off → loop
 - All mpv defaults intact (`i` for stats, `s` for screenshot, etc.)
 
 Danmaku has its own bindings — see the [Danmaku](#danmaku-bullet-chat)
@@ -192,6 +194,15 @@ Quick summary of what you get:
 | `~/.cache/mpv-danmaku/{matches,offsets,aliases}.json` | Danmaku match cache, time offsets, smart-match aliases |
 | `~/src/mpv/` | mpv source checkout for re-builds |
 | `~/src/mpv-dandanplay-danmaku/` | Danmaku project clone (re-pulled on each install) |
+
+The `~/src/` entries above are kept around so re-running `install.sh
+install` can fast-forward instead of re-cloning. They're **safe to
+delete** if you want the disk back — nothing at runtime references
+them. Next install just re-clones, costing one extra fetch (a few
+MB for the danmaku repo, a fresh shallow `git clone --depth 1` for
+mpv source). The mpv binary already lives inside the conda env, the
+danmaku bundle lives in `~/.config/mpv/scripts/dandanplay/` — both
+are independent of `~/src/`.
 
 ## Project layout
 

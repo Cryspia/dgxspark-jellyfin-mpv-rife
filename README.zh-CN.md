@@ -73,7 +73,7 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 
 ### TRT engine 缓存
 
-安装脚本会预编译常见分辨率的 RIFE engine（720p + 1080p × 4.26 + 4.6），所以这些常见尺寸的视频首次播放都是瞬间的。缓存路径在 `~/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models/`，总共约 250 MB。**engine 的 cache key 为 (model, padded_shape, fp16, scale, GPU 型号, TRT 版本)**，其中 padded_shape 把源高度向上取整到 32（4.6）或 64（4.26）的倍数。
+安装脚本会预编译常见分辨率的 RIFE engine —— 720p × {4.26, 4.6}、1080p × {4.26, 4.6}、4K × 4.6 @ scale=0.5（半分辨率光流档），所以这些常见尺寸的视频首次播放都是瞬间的。缓存路径在 `~/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models/`，总共约 250 MB。**engine 的 cache key 为 (model, padded_shape, fp16, scale, GPU 型号, TRT 版本)**，其中 padded_shape 把源高度向上取整到 32（4.6）或 64（4.26）的倍数。
 
 如果你播放的视频是非常见分辨率（很多电影是 1920×800、1920×816、1920×1036 之类的非标准画幅），首次播放该尺寸会现场编译一个新 engine —— **播放器窗口会卡住大约 30–60 秒**，分辨率越高卡得越久。第二次播放同尺寸就秒开了。这是正常现象。
 
@@ -88,7 +88,7 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 ## 快捷键
 
 - **F8** —— FSRCNNX 着色器开关
-- **F9** —— RIFE 切换：4.26（默认）→ 4.6（轻量 fallback）→ 关
+- **F9** —— RIFE 切换：4.26（重型）→ 4.6（轻型）→ 4.6 @ scale=0.5（半分辨率光流）→ 关 → 循环
 - mpv 自带快捷键全部保留（`i` 看统计信息、`s` 截图等）
 
 弹幕的快捷键见下方[弹幕](#弹幕bullet-chat)章节。
@@ -122,6 +122,8 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 | `~/.cache/mpv-danmaku/{matches,offsets,aliases}.json` | 弹幕匹配缓存、时间偏移、智能别名 |
 | `~/src/mpv/` | mpv 源码 checkout（再次构建用） |
 | `~/src/mpv-dandanplay-danmaku/` | 弹幕项目的 clone（每次 install 时 fetch 更新） |
+
+上面 `~/src/` 下的两个目录留着只是为了下次跑 `install.sh install` 时能 fast-forward 而不用重新 clone，**可以放心删除**，运行时不会用到。下次安装会重新 clone 一份，代价是多一次 fetch（弹幕项目几 MB，mpv 源码也是 `git clone --depth 1` 浅克隆）。mpv 二进制本身在 conda 环境里，弹幕脚本包在 `~/.config/mpv/scripts/dandanplay/`，都和 `~/src/` 无关。
 
 ## 项目结构
 
