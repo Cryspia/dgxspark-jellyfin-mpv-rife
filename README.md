@@ -12,13 +12,14 @@ The whole pipeline runs in a single Miniforge conda environment:
   wayland + x11 + lua all enabled. The conda-forge aarch64 mpv is a
   headless library build with no display backends, so the installer
   builds its own.
-- **vsrife + TensorRT** — two RIFE models picked per source resolution:
-  4.26 (heavy, best quality) for ≤720p, 4.6 (light) for 720p<h≤1080p,
-  off above that. Both run TRT mixed precision (fp16 weights, fp32
-  accumulators). The installer patches vsrife to use
-  `enabled_precisions={fp16, fp32}` instead of `use_explicit_typing=True`,
-  which would otherwise cause flow-vector overflow → flicker on fast
-  motion. See [Default config](#default-config) for the per-band rules.
+- **vsrife + TensorRT** — RIFE picked per source resolution: 4.26
+  (heavy, best quality) for ≤720p, 4.6 (light) for 720p<h≤1080p,
+  4.6 @ scale=0.5 (half-flow) for 1080p<h≤2160p, off above that.
+  All run TRT mixed precision (fp16 weights, fp32 accumulators). The
+  installer patches vsrife to use `enabled_precisions={fp16, fp32}`
+  instead of `use_explicit_typing=True`, which would otherwise cause
+  flow-vector overflow → flicker on fast motion. See
+  [Default config](#default-config) for the per-band rules.
 - **FSRCNNX** glsl shader — 2x luma upscale. Loaded by default for
   ≤1080p sources; explicitly cleared for >1080p so mpv doesn't pile
   shader work onto already-large frames. The shader's own
