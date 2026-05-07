@@ -34,6 +34,10 @@
 # 两者都关
 ./install.sh install --no-mirrors --no-danmaku
 
+# 清空并重建 TRT engine cache（驱动 / CUDA / TensorRT 更新后，旧缓
+# 存可能导致画面异常时使用）
+./install.sh install --rebuild-trt
+
 # 查看当前安装状态
 ./install.sh status
 
@@ -63,6 +67,20 @@ RIFE 和 FSRCNNX 都按「源分辨率 + 帧率」自动启用。在 GB10 上实
 - 两套 RIFE 模型都用 TRT 混合精度（fp16 权重 + fp32 累加器），由安装脚本 patch 上游 vsrife 实现；纯 fp16 在快速运动场景下光流累加器会溢出导致闪烁。
 
 可调项的注释直接写在 `~/.config/mpv/rife.vpy`、`~/.config/mpv/rife-light.vpy` 和 `~/.config/mpv/mpv.conf` 里。手动覆盖：F8 切换 FSRCNNX，F9 在三种 RIFE 配置间循环（4.26 → 4.6 → 关 → 循环），不受 profile-cond 自动选择影响。
+
+### TRT engine 缓存
+
+安装脚本会预编译常见分辨率的 RIFE engine（720p + 1080p × 4.26 + 4.6），所以这些常见尺寸的视频首次播放都是瞬间的。缓存路径在 `~/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models/`，总共约 250 MB。**engine 的 cache key 为 (model, padded_shape, fp16, scale, GPU 型号, TRT 版本)**，其中 padded_shape 把源高度向上取整到 32（4.6）或 64（4.26）的倍数。
+
+如果你播放的视频是非常见分辨率（很多电影是 1920×800、1920×816、1920×1036 之类的非标准画幅），首次播放该尺寸会现场编译一个新 engine —— **播放器窗口会卡住大约 30–60 秒**，分辨率越高卡得越久。第二次播放同尺寸就秒开了。这是正常现象。
+
+**如果你发现现有缓存导致画面异常**（花屏、颜色错乱等），通常是因为 NVIDIA 驱动 / CUDA / TensorRT 在原地升级了 —— vsrife 的 cache 文件名只包含 GPU 型号和 TRT 版本，**不包含**驱动 build 号，所以驱动升级后看似匹配的缓存文件可能在运行时已经不兼容。修复方法：
+
+```bash
+./install.sh install --rebuild-trt
+```
+
+它会先把缓存目录里所有 `*.ts` 文件清空，再重新预热常见尺寸，强制 TRT 在新的驱动 / runtime 栈上重新编译。比正常的幂等安装多花 ~2–3 分钟。
 
 ## 快捷键
 

@@ -54,6 +54,10 @@ The whole pipeline runs in a single Miniforge conda environment:
 # Both
 ./install.sh install --no-mirrors --no-danmaku
 
+# Wipe + rebuild the TRT engine cache (after a driver/CUDA/TRT
+# upgrade caused stale cached engines to produce broken video)
+./install.sh install --rebuild-trt
+
 # Show what's currently installed
 ./install.sh status
 
@@ -96,6 +100,36 @@ Tuning knobs are inline in `~/.config/mpv/rife.vpy`,
 Manual override mid-playback: F8 toggles FSRCNNX, F9 cycles the active
 RIFE config (4.26 → 4.6 → off → loop) regardless of which band the
 profile-cond logic chose.
+
+### TRT engine cache
+
+The installer pre-compiles RIFE engines for the common shapes (720p +
+1080p × RIFE 4.26 + 4.6) so the first playback at those resolutions is
+instant. Cache lives at
+`~/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models/`,
+~250 MB total. **Engines are keyed on (model, padded_shape, fp16,
+scale, GPU model, TRT version)**, where padded_shape rounds the source
+height up to a multiple of 32 (RIFE 4.6) or 64 (RIFE 4.26).
+
+If you play a video at an unusual resolution (a lot of films are
+1920×800, 1920×816, 1920×1036, …), the first play of that exact shape
+will JIT-compile a new engine — **the player window will appear to
+freeze for ~30–60 s while it does**. Bigger resolution = longer freeze.
+Subsequent plays of the same shape are instant. This is normal.
+
+**If a cached engine starts producing broken video** (corrupt frames,
+wrong colors, etc.) it usually means the NVIDIA driver / CUDA / TensorRT
+was updated in place — vsrife keys cache files on GPU model and TRT
+version but **not** driver build, so cached engines that match by name
+can be incompatible at runtime after a driver upgrade. Fix:
+
+```bash
+./install.sh install --rebuild-trt
+```
+
+That wipes every `*.ts` file in the cache dir before re-warming the
+common shapes, forcing TRT to recompile against the new driver/runtime
+stack. Adds ~2–3 minutes to install vs the normal idempotent path.
 
 ## Keybindings
 

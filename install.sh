@@ -55,6 +55,7 @@ AUTOSTART_DIR="$HOME/.config/autostart"
 # and most users want danmaku.
 USE_MIRRORS=1
 INSTALL_DANMAKU=1
+REBUILD_TRT=0
 
 # Mirrors (USTC for China)
 USTC_CONDA_FORGE="https://mirrors.ustc.edu.cn/anaconda/cloud"
@@ -583,6 +584,19 @@ warm_trt_cache() {
   source "$FORGE_DIR/etc/profile.d/conda.sh"
   conda activate "$ENV_NAME"
 
+  # If --rebuild-trt was passed, wipe every cached engine first so the
+  # warm step rebuilds from scratch. Use case: NVIDIA driver / CUDA /
+  # TensorRT was upgraded in place and the existing engines (which
+  # match by GPU model + TRT version but not driver build) now produce
+  # corrupt frames. vsrife happily uses them anyway because the cache
+  # filename matches; only a forced rebuild fixes it.
+  local cache_dir
+  cache_dir=$(ls -d "$ENV_PREFIX"/lib/python*/site-packages/vsrife/models 2>/dev/null | head -1)
+  if (( REBUILD_TRT )) && [[ -d "$cache_dir" ]]; then
+    log "wiping existing TRT engine cache (--rebuild-trt)"
+    find "$cache_dir" -maxdepth 1 -name "*.ts" -print -delete | sed 's/^/  removed: /'
+  fi
+
   # vsrife's TRT static-shape mode uses the input clip's actual dimensions
   # to build the engine, so feeding it a dummy at the right resolution
   # produces an engine matching real playback. Cache filenames embed the
@@ -861,16 +875,24 @@ cmd_install() {
     case "$1" in
       --no-mirrors|--no-mirror|--no-ustc) USE_MIRRORS=0; shift ;;
       --no-danmaku|--skip-danmaku)        INSTALL_DANMAKU=0; shift ;;
+      --rebuild-trt)                      REBUILD_TRT=1; shift ;;
       -h|--help)
         cat <<EOF
-Usage: $0 install [--no-mirrors] [--no-danmaku]
+Usage: $0 install [--no-mirrors] [--no-danmaku] [--rebuild-trt]
 
-  --no-mirrors   Don't write USTC mirrors into ~/.condarc and
-                 ~/.config/pip/pip.conf. Use this outside China where
-                 the USTC endpoints are slow / unreachable.
-  --no-danmaku   Skip the danmaku (bullet-chat) plugin step. The rest
-                 of the stack (mpv + RIFE + FSRCNNX + shim) installs
-                 normally.
+  --no-mirrors    Don't write USTC mirrors into ~/.condarc and
+                  ~/.config/pip/pip.conf. Use this outside China
+                  where the USTC endpoints are slow / unreachable.
+  --no-danmaku    Skip the danmaku (bullet-chat) plugin step. The
+                  rest of the stack (mpv + RIFE + FSRCNNX + shim)
+                  installs normally.
+  --rebuild-trt   Wipe the TRT engine cache before re-warming. Use
+                  this if you've upgraded the NVIDIA driver / CUDA
+                  / TensorRT and your existing cached engines now
+                  produce broken video — vsrife keys engines on GPU
+                  model + TRT version but not driver build, so an
+                  in-place driver upgrade can leave stale-but-
+                  matching cache files. Adds ~2-3 min to install.
 EOF
         return 0
         ;;
@@ -878,7 +900,7 @@ EOF
     esac
   done
 
-  log "install flags: USE_MIRRORS=$USE_MIRRORS  INSTALL_DANMAKU=$INSTALL_DANMAKU"
+  log "install flags: USE_MIRRORS=$USE_MIRRORS  INSTALL_DANMAKU=$INSTALL_DANMAKU  REBUILD_TRT=$REBUILD_TRT"
 
   detect_environment
   install_apt_packages
@@ -1202,9 +1224,12 @@ Usage:
   $0 uninstall         remove everything we installed except apt + miniforge
 
 Install flags (all optional, defaults preserve original behavior):
-  --no-mirrors   Don't write USTC mirrors to ~/.condarc + pip.conf
-                 (use outside China)
-  --no-danmaku   Skip the danmaku (bullet-chat) plugin step
+  --no-mirrors    Don't write USTC mirrors to ~/.condarc + pip.conf
+                  (use outside China)
+  --no-danmaku    Skip the danmaku (bullet-chat) plugin step
+  --rebuild-trt   Wipe + recompile the TRT engine cache (use after
+                  driver/CUDA/TensorRT upgrade if cached engines
+                  produce broken video)
 
 See README.md for details.
 EOF
