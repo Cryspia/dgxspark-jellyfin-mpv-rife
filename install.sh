@@ -10,11 +10,16 @@
 # https://github.com/Cryspia/mpv-dandanplay-danmaku.
 #
 # Usage:
-#   ./install.sh install [--no-mirrors] [--no-danmaku]
+#   ./install.sh install [--no-mirrors] [--no-danmaku] [--rebuild-trt]
+#                        [--set-default-video]
 #                          full install on a clean system
 #                          --no-mirrors: skip USTC mirror config
 #                                        (use outside China)
 #                          --no-danmaku: skip the danmaku plugin step
+#                          --rebuild-trt: wipe TRT engine cache before warm
+#                          --set-default-video: register mpv-conda as the
+#                                        GNOME default video player for the
+#                                        common video MIME types
 #   ./install.sh status     show what's currently installed and where
 #   ./install.sh uninstall  remove everything we installed except apt
 #                           packages and miniforge itself (so re-install
@@ -56,6 +61,32 @@ AUTOSTART_DIR="$HOME/.config/autostart"
 USE_MIRRORS=1
 INSTALL_DANMAKU=1
 REBUILD_TRT=0
+SET_DEFAULT_VIDEO=0
+
+# Common video MIME types we promote mpv-conda to default for, when
+# --set-default-video is passed. Subset of the full MimeType list in
+# mpv-conda.desktop — these are the ones GNOME Files / nautilus-open
+# consults when the user double-clicks a video. Setting all of them
+# means mpv-conda owns the obvious cases (mp4, mkv, webm, etc.) and
+# the long tail (ms-asf, vivo, divx, …) inherits via the desktop
+# file's MimeType= registration without us having to enumerate.
+DEFAULT_VIDEO_MIMES=(
+  video/mp4
+  video/x-matroska
+  video/webm
+  video/quicktime
+  video/x-msvideo
+  video/mpeg
+  video/x-m4v
+  video/x-flv
+  video/3gpp
+  video/x-ms-wmv
+  video/ogg
+  video/x-ms-asf
+  application/x-matroska
+  application/vnd.apple.mpegurl
+  application/x-mpegURL
+)
 
 # Mirrors (USTC for China)
 USTC_CONDA_FORGE="https://mirrors.ustc.edu.cn/anaconda/cloud"
@@ -835,6 +866,10 @@ EOF
   log "icons installed under $ICON_ROOT"
 
   # ---------- .desktop entries ----------
+  # MimeType list mirrors GNOME Videos (totem) so GNOME's Settings →
+  # Default Applications surfaces mpv-conda as a video-player option for
+  # every format totem handles. Without a wide list, GNOME's heuristic
+  # for "is this a video player?" doesn't classify mpv as one.
   cat > "$APPS_DIR/mpv-conda.desktop" <<EOF
 [Desktop Entry]
 Name=mpv
@@ -844,7 +879,7 @@ Exec=$WRAPPER_DIR/mpv-conda --player-operation-mode=pseudo-gui -- %U
 Icon=mpv-conda
 Type=Application
 Categories=AudioVideo;Audio;Video;Player;TV;
-MimeType=video/mp4;video/x-matroska;video/webm;application/x-mpegURL;
+MimeType=application/mxf;application/ram;application/sdp;application/vnd.apple.mpegurl;application/vnd.ms-asf;application/vnd.ms-wpl;application/vnd.rn-realmedia;application/vnd.rn-realmedia-vbr;application/x-extension-m4a;application/x-extension-mp4;application/x-flash-video;application/x-matroska;application/x-mpegURL;application/x-netshow-channel;application/x-quicktimeplayer;application/x-shorten;application/smil;application/smil+xml;application/x-quicktime-media-link;application/x-smil;image/vnd.rn-realpix;image/x-pict;misc/ultravox;text/google-video-pointer;text/x-google-video-pointer;video/3gp;video/3gpp;video/3gpp2;video/dv;video/divx;video/fli;video/flv;video/mp2t;video/mp4;video/mp4v-es;video/mpeg;video/mpeg-system;video/msvideo;video/ogg;video/quicktime;video/vivo;video/vnd.divx;video/vnd.mpegurl;video/vnd.rn-realvideo;video/vnd.vivo;video/webm;video/x-anim;video/x-avi;video/x-flc;video/x-fli;video/x-flic;video/x-flv;video/x-m4v;video/x-matroska;video/x-mjpeg;video/x-mpeg;video/x-mpeg2;video/x-ms-asf;video/x-ms-asf-plugin;video/x-ms-asx;video/x-msvideo;video/x-ms-wm;video/x-ms-wmv;video/x-ms-wmx;video/x-ms-wvx;video/x-nsv;video/x-ogm+ogg;video/x-theora;video/x-theora+ogg;x-content/video-dvd;x-scheme-handler/pnm;x-scheme-handler/mms;x-scheme-handler/net;x-scheme-handler/rtp;x-scheme-handler/rtmp;x-scheme-handler/rtsp;x-scheme-handler/mmsh;x-scheme-handler/uvox;x-scheme-handler/icy;x-scheme-handler/icyx;
 Terminal=false
 StartupWMClass=mpv
 EOF
@@ -878,6 +913,24 @@ EOF
 
   update-desktop-database "$APPS_DIR" 2>/dev/null || true
   gtk-update-icon-cache "$ICON_ROOT" 2>/dev/null || true
+
+  # ---------- promote to default video player (opt-in) ----------
+  # Only runs with --set-default-video. The desktop file's MimeType=
+  # list already registers mpv-conda as a candidate ("Open With…"
+  # entry) for every video format totem handles, so users who don't
+  # pass this flag still get the option in nautilus' submenu — they
+  # just don't get mpv-conda auto-promoted over totem.
+  if (( SET_DEFAULT_VIDEO )); then
+    if command -v xdg-mime >/dev/null 2>&1; then
+      local m
+      for m in "${DEFAULT_VIDEO_MIMES[@]}"; do
+        xdg-mime default mpv-conda.desktop "$m" 2>/dev/null || true
+      done
+      log "set mpv-conda as default video player for ${#DEFAULT_VIDEO_MIMES[@]} MIME types"
+    else
+      warn "xdg-mime not found; --set-default-video skipped"
+    fi
+  fi
 }
 
 # ============================================================================
@@ -930,9 +983,11 @@ cmd_install() {
       --no-mirrors|--no-mirror|--no-ustc) USE_MIRRORS=0; shift ;;
       --no-danmaku|--skip-danmaku)        INSTALL_DANMAKU=0; shift ;;
       --rebuild-trt)                      REBUILD_TRT=1; shift ;;
+      --set-default-video|--default-video) SET_DEFAULT_VIDEO=1; shift ;;
       -h|--help)
         cat <<EOF
 Usage: $0 install [--no-mirrors] [--no-danmaku] [--rebuild-trt]
+                  [--set-default-video]
 
   --no-mirrors    Don't write USTC mirrors into ~/.condarc and
                   ~/.config/pip/pip.conf. Use this outside China
@@ -947,6 +1002,13 @@ Usage: $0 install [--no-mirrors] [--no-danmaku] [--rebuild-trt]
                   model + TRT version but not driver build, so an
                   in-place driver upgrade can leave stale-but-
                   matching cache files. Adds ~2-3 min to install.
+  --set-default-video
+                  Promote mpv-conda to the GNOME default video
+                  player (xdg-mime default for mp4/mkv/webm/mov/
+                  avi/mpeg/m4v/flv/3gp/wmv/ogg/asf/hls). Without
+                  this flag mpv-conda is still registered as a
+                  candidate (shows up in "Open With…") but totem
+                  remains the default.
 EOF
         return 0
         ;;
@@ -954,7 +1016,7 @@ EOF
     esac
   done
 
-  log "install flags: USE_MIRRORS=$USE_MIRRORS  INSTALL_DANMAKU=$INSTALL_DANMAKU  REBUILD_TRT=$REBUILD_TRT"
+  log "install flags: USE_MIRRORS=$USE_MIRRORS  INSTALL_DANMAKU=$INSTALL_DANMAKU  REBUILD_TRT=$REBUILD_TRT  SET_DEFAULT_VIDEO=$SET_DEFAULT_VIDEO"
 
   detect_environment
   install_apt_packages
@@ -1285,6 +1347,9 @@ Install flags (all optional, defaults preserve original behavior):
   --rebuild-trt   Wipe + recompile the TRT engine cache (use after
                   driver/CUDA/TensorRT upgrade if cached engines
                   produce broken video)
+  --set-default-video
+                  Make mpv-conda the GNOME default video player
+                  (xdg-mime default for mp4/mkv/webm/...)
 
 See README.md for details.
 EOF

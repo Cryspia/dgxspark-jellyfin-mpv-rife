@@ -38,6 +38,11 @@
 # 存可能导致画面异常时使用）
 ./install.sh install --rebuild-trt
 
+# 把 mpv-conda 设为 GNOME 的默认视频播放器。不加这个 flag 的话
+# mpv-conda 仍然会注册（在 nautilus 的「打开方式…」里能看到），
+# 只是双击视频时还是会走 totem。
+./install.sh install --set-default-video
+
 # 查看当前安装状态
 ./install.sh status
 

@@ -59,6 +59,11 @@ The whole pipeline runs in a single Miniforge conda environment:
 # upgrade caused stale cached engines to produce broken video)
 ./install.sh install --rebuild-trt
 
+# Promote mpv-conda to the GNOME default video player. Without
+# this flag mpv-conda is still registered (shows up in nautilus'
+# "Open With…") but totem stays the default for double-click.
+./install.sh install --set-default-video
+
 # Show what's currently installed
 ./install.sh status
 
