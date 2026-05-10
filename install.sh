@@ -88,6 +88,11 @@ DEFAULT_VIDEO_MIMES=(
   application/x-mpegURL
 )
 
+# fsrcnnx-cudnn release tag pulled by install_configs. Bumping this
+# fetches a different bundle from
+# https://github.com/Cryspia/fsrcnnx-cudnn/releases/download/<tag>/fsrcnnx-cudnn-bundle.tar.gz
+FSRCNNX_CUDNN_VERSION="v0.1"
+
 # Mirrors (USTC for China)
 USTC_CONDA_FORGE="https://mirrors.ustc.edu.cn/anaconda/cloud"
 USTC_PYPI="https://pypi.mirrors.ustc.edu.cn/simple/"
@@ -402,12 +407,13 @@ apply_patches() {
 }
 
 # ============================================================================
-# Step 7: write user-facing config files (mpv.conf, input.conf, rife.vpy)
-#         and copy the FSRCNNX shader from project assets
+# Step 7: write user-facing config files (mpv.conf, input.conf, rife.vpy,
+#         sr_keys.lua, sr_keys_helper.py) and fetch the upstream
+#         fsrcnnx-cudnn release bundle (Python pkg + .npz weights).
 # ============================================================================
 install_configs() {
-  section "step 7/10: configs + shader"
-  mkdir -p "$MPV_CFG_DIR/shaders" "$MPV_CFG_DIR/scripts"
+  section "step 7/10: configs + fsrcnnx-cudnn bundle"
+  mkdir -p "$MPV_CFG_DIR/scripts"
 
   # mpv.conf — overwrite (we own it)
   cat > "$MPV_CFG_DIR/mpv.conf" <<'EOF'
@@ -451,205 +457,270 @@ dither-depth=auto
 secondary-sub-ass-override=no
 secondary-sub-pos=0
 
-# FSRCNNX luma upscale, loaded globally — the shader self-gates at
-# `//!WHEN OUTPUT/LUMA > 1.3`, so it only kicks in when the display
-# output is meaningfully larger than the source. Toggle with F8.
-# (See [no-fsrcnnx-large] below for the >1080p-source override.)
-glsl-shaders=~~/shaders/FSRCNNX_x2_8-0-4-1.glsl
+# FSRCNNX SR is now done inside vapoursynth (chained after rife_yuv
+# in each rife*.vpy via fsrcnnx_cudnn.vsfunc.fsrcnnx_yuv_auto). The
+# old GLSL shader path is disabled here to avoid double-upscale.
+# Restore by removing the leading `#` if you want to A/B test.
+#glsl-shaders=~~/shaders/FSRCNNX_x2_8-0-4-1.glsl
 
-# RIFE realtime 2x interpolation, applied per resolution band so the
-# GB10 isn't asked to do something it can't sustain:
-#   ≤30fps and h ≤ 720          → 4.26 (heavy quality, small frames cheap)
-#   ≤30fps and 720 < h ≤ 1080   → 4.6  (lighter, balanced for 1080p)
-#   ≤30fps and 1080 < h ≤ 2160  → 4.6 @ scale=0.5 (flow runs at half
-#                                  resolution → 4K compute ≈ 1080p
-#                                  compute. Quality lower than full-
-#                                  res but at least there's still
-#                                  interpolation; full-res 4.6 at 4K
-#                                  pegs the GB10 and drops frames.)
-#   ≤30fps and h > 2160          → no RIFE (above 4K is unreasonable)
-#   >30fps                       → no RIFE (already smooth; would only
-#                                  produce frames mpv drops at vsync)
+# RIFE + FSRCNNX. Single .vpy. F8 cycles FSRCNNX variant, F9 toggles RIFE.
+# See scripts/sr_keys.lua for the keybinds.
 #
-# `or 999` / `or 0` sentinels: at the very first profile-cond evaluation
-# (before the demuxer fills container-fps and video-params/h), those
-# properties are nil. Defaulting to values that fail the gate prevents
-# a ~half-second window where the vf gets attached then ripped off
-# when the real numbers land. profile-cond re-evaluates reactively
-# whenever the referenced properties change.
-[rife-heavy]
-profile-cond=(p["container-fps"] or 999)<=30 and 0<(p["video-params/h"] or 0) and (p["video-params/h"] or 0)<=720
+#   h ≤ 720         RIFE 4.26 + FSRCNNX family=16-layer (auto x3/x4)
+#   720 < h ≤ 1080  RIFE 4.6  + FSRCNNX family=8-layer  (auto x2_8)
+#   fps > 30        RIFE skipped, FSRCNNX still runs
+#   h > 1080        no vf — GB10 doesn't have headroom for RIFE at 4K
+#
+# `or 0` sentinel: at the first profile-cond evaluation (before the
+# demuxer fills video-params/h) the property is nil; defaulting to 0
+# fails the gate so the vf isn't briefly attached then ripped off.
+# `buffered-frames=12 / concurrent-frames=4` — deeper than vapoursynth's
+# defaults so the vs scheduler can overlap encode → infer → SR work.
+[rife]
+profile-cond=0<(p["video-params/h"] or 0) and (p["video-params/h"] or 0)<=1080
 profile-restore=copy-equal
-vf=vapoursynth=~~/rife.vpy
-
-[rife-light]
-profile-cond=(p["container-fps"] or 999)<=30 and (p["video-params/h"] or 0)>720 and (p["video-params/h"] or 0)<=1080
-profile-restore=copy-equal
-vf=vapoursynth=~~/rife-light.vpy
-
-[rife-half]
-profile-cond=(p["container-fps"] or 999)<=30 and (p["video-params/h"] or 0)>1080 and (p["video-params/h"] or 0)<=2160
-profile-restore=copy-equal
-vf=vapoursynth=~~/rife-half.vpy
-
-# For >1080p sources, force FSRCNNX off. The shader's own //!WHEN gate
-# at 1.3× wouldn't activate on a 4K source playing on a 4K display
-# (output/luma ≈ 1.0), but a HiDPI-scaled display surface above 4K
-# could push the ratio over the gate at 4K source — and we don't want
-# to pile FSRCNNX shader work on top of an already-large frame.
-[no-fsrcnnx-large]
-profile-cond=(p["video-params/h"] or 0)>1080
-profile-restore=copy-equal
-glsl-shaders=
+vf=vapoursynth=~~/rife.vpy:buffered-frames=12:concurrent-frames=4
 EOF
   log "wrote $MPV_CFG_DIR/mpv.conf"
 
-  # input.conf — F8 / F9 toggles with on-screen feedback
+  # input.conf — F8 / F9 are bound by scripts/sr_keys.lua (cycle FSRCNNX
+  # variant / toggle RIFE). Header here is just documentation; the keys
+  # themselves come from the lua script.
   cat > "$MPV_CFG_DIR/input.conf" <<'EOF'
-# F8: toggle FSRCNNX shader on/off, with on-screen feedback so you can
-# see immediately whether the binding fired.
-F8 cycle-values glsl-shaders "~~/shaders/FSRCNNX_x2_8-0-4-1.glsl" ""; show-text "FSRCNNX: ${glsl-shaders}" 2000
-
-# F9: cycle RIFE through four states:
-#   4.26 (best quality)  → 4.6 (lighter)  → 4.6 @ scale=0.5 (half-flow,
-#   for >1080p sources)  → off  → loop
-# Useful for manually overriding the auto-band selection — e.g. force
-# 4.26 quality on a 1080p source even though the band default is 4.6,
-# or fall back to half-flow on a heavy 1080p scene.
-F9 cycle-values vf "vapoursynth=~~/rife.vpy" "vapoursynth=~~/rife-light.vpy" "vapoursynth=~~/rife-half.vpy" ""; show-text "RIFE: ${vf}" 2500
+# F8 / F9 — bound by scripts/sr_keys.lua:
+#   F8: cycle FSRCNNX variant (16x4 → 16x3 → 16x2 → 8x2 → loop). Default
+#       starting point is whatever fsrcnnx_yuv_auto picks for the current
+#       source on this display (4K by default; override via env vars
+#       FSRCNNX_TARGET_W / FSRCNNX_TARGET_H). Per-file, returns to auto
+#       on the next file-load.
+#   F9: toggle RIFE on/off independent of FSRCNNX. Persists across files.
+#
+# Both keys force a vapoursynth filter reload (~1–3 s freeze) — there's
+# no runtime parameter switch inside the cuDNN runner.
 EOF
   log "wrote $MPV_CFG_DIR/input.conf"
 
-  # rife.vpy — RIFE 4.26 + scale=1.0 + TRT mixed-precision (RGBH triggers
-  # vsrife's fp16 path, the patch above makes TRT use mixed precision).
+  # sr_keys.lua — F8 cycles FSRCNNX variant via /tmp/fsrcnnx_variant
+  # override file, F9 toggles RIFE on/off via /tmp/rife_disabled. Both
+  # force a vf reload so the .vpy re-reads the side-channel files.
+  cat > "$MPV_CFG_DIR/scripts/sr_keys.lua" <<'EOF'
+-- F8 — cycle FSRCNNX variant.        F9 — toggle RIFE on/off.
+--
+-- Both keys force a vapoursynth filter reload (~1–3 s freeze) because
+-- there's no runtime parameter switch inside our chain — we re-build it.
+--
+-- Communication with the .vpy chain (file-based, so any vf reload picks
+-- up the new state):
+--   /tmp/fsrcnnx_variant         — override variant. Empty/missing =
+--                                  auto. Otherwise "x2_8" / "x2_16" /
+--                                  "x3_16" / "x4_16". Written by F8.
+--                                  Cleared on file-loaded (return to
+--                                  auto for each new video).
+--   /tmp/fsrcnnx_active_variant  — what the .vpy is currently running
+--                                  (auto-resolved). Written by the
+--                                  .vpy. Read by F8 to know the cycle's
+--                                  current position.
+--   /tmp/rife_disabled           — touch-file. If present, .vpy skips
+--                                  rife_yuv. Toggled by F9. Persists
+--                                  across files.
+--
+-- Default state on first file load: F8 = auto, F9 = enabled.
+
+local mp = require "mp"
+
+local OVERRIDE_FILE = "/tmp/fsrcnnx_variant"
+local ACTIVE_FILE   = "/tmp/fsrcnnx_active_variant"
+local RIFE_OFF_FILE = "/tmp/rife_disabled"
+
+-- Cycle includes "off" as the final stop so F8 can fully bypass FSRCNNX.
+-- When the .vpy reads /tmp/fsrcnnx_variant == "off", it skips the SR pass
+-- entirely and outputs the post-RIFE clip (or the source if F9 is also
+-- off). Pressing F8 from "off" wraps back to "x4_16".
+local CYCLE = { "x4_16", "x3_16", "x2_16", "x2_8", "off" }
+
+local function cycle_index(variant)
+  for i, v in ipairs(CYCLE) do
+    if v == variant then return i end
+  end
+  return nil
+end
+
+local function read_file(path)
+  local fh = io.open(path, "r")
+  if not fh then return nil end
+  local s = fh:read("*all")
+  fh:close()
+  return s and s:match("^%s*(.-)%s*$") or nil
+end
+
+local function write_file(path, s)
+  local fh = io.open(path, "w")
+  if not fh then return false end
+  fh:write(s); fh:close()
+  return true
+end
+
+local function file_exists(path)
+  local fh = io.open(path, "r")
+  if fh then fh:close(); return true end
+  return false
+end
+
+local function reload_vf()
+  -- Clear-then-restore is the most reliable way to force a re-exec
+  -- of the .vpy. `vf-command` doesn't reach inside vapoursynth.
+  local current = mp.get_property("vf")
+  if not current or current == "" then return end
+  mp.set_property("vf", "")
+  mp.set_property("vf", current)
+end
+
+local function cycle_fsrcnnx()
+  local active = read_file(ACTIVE_FILE)
+  if not active or active == "" or active == "none" then
+    -- Chain is currently bypassing FSRCNNX (e.g. 4K → 4K, ratio < 1.3).
+    -- Start the cycle from the front rather than refusing.
+    active = CYCLE[#CYCLE]   -- so next = CYCLE[1] = x4_16
+  end
+  local idx = cycle_index(active)
+  local next_idx = (idx and (idx % #CYCLE) + 1) or 1
+  local next_variant = CYCLE[next_idx]
+
+  write_file(OVERRIDE_FILE, next_variant)
+  local label = (next_variant == "off") and "OFF" or next_variant
+  mp.osd_message(string.format("FSRCNNX → %s (reloading…)", label), 2)
+  reload_vf()
+end
+
+local function toggle_rife()
+  if file_exists(RIFE_OFF_FILE) then
+    os.remove(RIFE_OFF_FILE)
+    mp.osd_message("RIFE: ON (reloading…)", 2)
+  else
+    write_file(RIFE_OFF_FILE, "")
+    mp.osd_message("RIFE: OFF (reloading…)", 2)
+  end
+  reload_vf()
+end
+
+local function reset_on_file_load()
+  -- F8 (FSRCNNX variant) resets per file — each video gets its own
+  -- auto-pick starting point. F9 (RIFE on/off) persists, since it's
+  -- a global preference rather than per-source tuning.
+  os.remove(OVERRIDE_FILE)
+  os.remove(ACTIVE_FILE)
+end
+
+mp.add_key_binding("F8", "fsrcnnx-cycle", cycle_fsrcnnx)
+mp.add_key_binding("F9", "rife-toggle",   toggle_rife)
+mp.register_event("file-loaded", reset_on_file_load)
+EOF
+  log "wrote $MPV_CFG_DIR/scripts/sr_keys.lua"
+
+  # sr_keys_helper.py — Python helper imported by the rife*.vpy files.
+  # Reads the side-channel files written by sr_keys.lua and applies
+  # the corresponding override (FSRCNNX variant or RIFE skip). Also
+  # writes /tmp/fsrcnnx_active_variant so the lua F8 cycle knows
+  # where it is.
+  cp -f "$PROJECT_DIR/sr_keys_helper.py" "$MPV_CFG_DIR/"
+  log "copied sr_keys_helper.py to $MPV_CFG_DIR/"
+
+  # vs_gpu_helpers.py — provides rife_yuv() that takes YUV420P10 directly
+  # and runs YUV↔RGB on GPU instead of the CPU bicubic round-trip. On 4K
+  # this saves ~30 ms / frame, turning [rife-half] from "stutters" into
+  # "smooth" since the per-frame budget shrinks below 60 fps display.
+  cp -f "$PROJECT_DIR/vs_gpu_helpers.py" "$MPV_CFG_DIR/"
+  log "copied vs_gpu_helpers.py to $MPV_CFG_DIR/"
+
+  # rife.vpy — unified RIFE + FSRCNNX pipeline. Internal branch on
+  # clip.height picks the right RIFE model and FSRCNNX family.
+  # F8 / F9 keybinds (scripts/sr_keys.lua) override variant / RIFE-on
+  # at runtime via /tmp/fsrcnnx_variant and /tmp/rife_disabled.
   cat > "$MPV_CFG_DIR/rife.vpy" <<'EOF'
-# RIFE realtime frame interpolation — vapoursynth + vsrife (TRT mixed precision).
+# Unified RIFE + FSRCNNX pipeline.
 #
-# vsrife internally branches on input bit-depth: bits_per_sample==16 → fp16
-# weights/inputs. With the project's vsrife patch (use_explicit_typing=False
-# + enabled_precisions={fp16,fp32}), TRT auto-promotes overflow-prone ops
-# (grid_sampler, reductions) to fp32 → no flicker, ~30% faster than fp32.
+# F8 cycles FSRCNNX variant (16x4 → 16x3 → 16x2 → 8x2 → OFF → loop).
+# F9 toggles RIFE on/off independently. Both bound by scripts/sr_keys.lua.
 #
-# === tuning knobs (light → heavy) ===
-#   model: "4.6" (fastest) / "4.25.lite" / "4.25" / "4.26" (heaviest, current)
-#   scale: 1.0 (full-res flow, current) / 0.5 / 0.25 (lower res, faster)
-#   trt=True: TensorRT engine; first run JIT-compiles ~30-60s, cached.
+#   h ≤ 720         RIFE 4.26 + scale=1.0  + FSRCNNX family=16-layer
+#   720 < h ≤ 1080  RIFE 4.6  + scale=1.0  + FSRCNNX family=8-layer
+#   fps > 30        RIFE skipped, FSRCNNX still runs if ratio merits
 #
-# Default is tuned for 1080p source on a 4K HiDPI display, no streaming.
+# 4K source path was removed: empirically GB10 doesn't have the headroom
+# for any RIFE config at native 4K (even scale=0.5), and the chain ends
+# up dropping more than it adds. mpv profile-cond gates h > 1080 out, so
+# 4K sources play through unmodified — same as if no vf were attached.
+
+import os, sys
+from pathlib import Path
+
+try:
+    HERE = Path(__file__).resolve().parent
+except NameError:
+    HERE = Path(os.environ.get("MPV_HOME") or
+                 os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+                 + "/mpv").resolve()
+sys.path.insert(0, str(HERE))
 
 import vapoursynth as vs
-from vsrife import rife
+from vs_gpu_helpers import rife_yuv
+from sr_keys_helper import apply_fsrcnnx, rife_disabled
 
 core = vs.core
-clip = video_in  # supplied by mpv
+clip = video_in
+h = clip.height
 
-## Auto-detect source color matrix from frame metadata so HDR (bt.2020)
-## content doesn't get its colors mangled when going through RIFE. mpv
-## populates _Matrix from the container: 1=bt.709 (SDR HD), 9=bt.2020nc
-## (HDR/UHD wide gamut), 6=bt.601 (SD). Hardcoding "709" was wrong on HDR.
-_MATRIX_NAME = {1: "709", 6: "170m", 7: "240m", 9: "2020ncl"}
-try:
-    _m = int(clip.get_frame(0).props.get("_Matrix", 1))
-except Exception:
-    _m = 1
-_mtx = _MATRIX_NAME.get(_m, "709")
+# Skip RIFE on >30 fps content (already smooth, doubling would just
+# produce frames mpv drops at vsync). Variable-fps sources report
+# fps_den=0 — fall back to 24 (treat as low-fps).
+fps = (clip.fps_num / clip.fps_den) if clip.fps_den else 24.0
 
-clip = core.resize.Bicubic(clip, format=vs.RGBH, matrix_in_s=_mtx)
-clip = rife(
-    clip,
-    model="4.26",
-    scale=1.0,
-    factor_num=2,
-    factor_den=1,
-    auto_download=True,
-    trt=True,
-)
-clip = core.resize.Bicubic(clip, format=vs.YUV420P10, matrix_s=_mtx)
+if clip.format.bits_per_sample != 10:
+    clip = core.resize.Point(clip, format=vs.YUV420P10)
+
+if not rife_disabled() and fps <= 30:
+    if h <= 720:
+        clip = rife_yuv(clip, model="4.26", scale=1.0, factor_num=2, factor_den=1)
+    else:  # 720 < h ≤ 1080 (mpv profile-cond gates h > 1080 out)
+        clip = rife_yuv(clip, model="4.6",  scale=1.0, factor_num=2, factor_den=1)
+
+# ≤720 sources hit ratio ≥ 2.5 on a 4K target, where select_variant
+# refuses 8-layer. 1080p works with 8-layer (faster on the GB10).
+family = "16-layer" if h <= 720 else "8-layer"
+
+clip = apply_fsrcnnx(clip, family=family)
 
 clip.set_output()
 EOF
   log "wrote $MPV_CFG_DIR/rife.vpy"
 
-  # rife-light.vpy — fallback config the F9 cycle drops to when 4.26 is
-  # briefly too heavy (rare, but useful safety net). Same color-matrix
-  # auto-detect as rife.vpy. Engine for 4.6+scale=1.0 JIT-compiles on
-  # first F9 cycle into it.
-  cat > "$MPV_CFG_DIR/rife-light.vpy" <<'EOF'
-# RIFE realtime interpolation — LIGHT FALLBACK (model 4.6).
-# Cycled to via F9 when 4.26 is too heavy. ~30% less GPU than 4.26.
+  # Old per-band .vpy files / shader dir / in-tree weights have been
+  # superseded — clean up stale copies from previous installs.
+  rm -f  "$MPV_CFG_DIR/rife-light.vpy" "$MPV_CFG_DIR/rife-half.vpy"
+  rm -rf "$MPV_CFG_DIR/shaders" "$MPV_CFG_DIR/weights" "$MPV_CFG_DIR/fsrcnnx_cudnn"
 
-import vapoursynth as vs
-from vsrife import rife
-
-core = vs.core
-clip = video_in
-
-_MATRIX_NAME = {1: "709", 6: "170m", 7: "240m", 9: "2020ncl"}
-try:
-    _m = int(clip.get_frame(0).props.get("_Matrix", 1))
-except Exception:
-    _m = 1
-_mtx = _MATRIX_NAME.get(_m, "709")
-
-clip = core.resize.Bicubic(clip, format=vs.RGBH, matrix_in_s=_mtx)
-clip = rife(
-    clip,
-    model="4.6",
-    scale=1.0,
-    factor_num=2,
-    factor_den=1,
-    auto_download=True,
-    trt=True,
-)
-clip = core.resize.Bicubic(clip, format=vs.YUV420P10, matrix_s=_mtx)
-
-clip.set_output()
-EOF
-  log "wrote $MPV_CFG_DIR/rife-light.vpy"
-
-  # rife-half.vpy — model 4.6 at scale=0.5. Used by [rife-half] profile
-  # for sources between 1080p and 4K. Flow estimation runs at half-res
-  # internally, so 4K compute drops to ~1080p compute. Quality is
-  # noticeably worse than full-res 4.6 (less detail in the flow field
-  # → softer interpolated frames on fast motion) but RIFE still works
-  # at all, which beats a stuttering 4K source with no interpolation.
-  cat > "$MPV_CFG_DIR/rife-half.vpy" <<'EOF'
-# RIFE realtime interpolation — HALF-FLOW for >1080p sources.
-# Model 4.6 with scale=0.5: flow at half resolution, output at source
-# resolution. Used by mpv's [rife-half] profile (1080p < h ≤ 2160).
-
-import vapoursynth as vs
-from vsrife import rife
-
-core = vs.core
-clip = video_in
-
-_MATRIX_NAME = {1: "709", 6: "170m", 7: "240m", 9: "2020ncl"}
-try:
-    _m = int(clip.get_frame(0).props.get("_Matrix", 1))
-except Exception:
-    _m = 1
-_mtx = _MATRIX_NAME.get(_m, "709")
-
-clip = core.resize.Bicubic(clip, format=vs.RGBH, matrix_in_s=_mtx)
-clip = rife(
-    clip,
-    model="4.6",
-    scale=0.5,
-    factor_num=2,
-    factor_den=1,
-    auto_download=True,
-    trt=True,
-)
-clip = core.resize.Bicubic(clip, format=vs.YUV420P10, matrix_s=_mtx)
-
-clip.set_output()
-EOF
-  log "wrote $MPV_CFG_DIR/rife-half.vpy"
-
-  # FSRCNNX shader from project assets
-  cp -f "$PROJECT_DIR/shaders/FSRCNNX_x2_8-0-4-1.glsl" "$MPV_CFG_DIR/shaders/"
-  log "copied FSRCNNX shader to $MPV_CFG_DIR/shaders/"
+  # FSRCNNX cuDNN super-resolution: pull the upstream release bundle
+  # (Python pkg + .npz weights) and extract under scripts/. Pinned by
+  # tag so re-installing reproduces a known-good version. See
+  # https://github.com/Cryspia/fsrcnnx-cudnn for the source / weights /
+  # benchmarks — fsrcnnx_yuv_auto, family, ratio gating etc. all live
+  # there.
+  local fsrcnnx_bundle_url="https://github.com/Cryspia/fsrcnnx-cudnn/releases/download/${FSRCNNX_CUDNN_VERSION}/fsrcnnx-cudnn-bundle.tar.gz"
+  local fsrcnnx_dir="$MPV_CFG_DIR/scripts/fsrcnnx-cudnn"
+  if [[ -f "$fsrcnnx_dir/.installed-version" ]] && \
+     [[ "$(cat "$fsrcnnx_dir/.installed-version" 2>/dev/null)" == "$FSRCNNX_CUDNN_VERSION" ]]; then
+    log "fsrcnnx-cudnn $FSRCNNX_CUDNN_VERSION already installed at $fsrcnnx_dir/"
+  else
+    log "fetching fsrcnnx-cudnn $FSRCNNX_CUDNN_VERSION bundle from GitHub releases"
+    local tmp_bundle="/tmp/fsrcnnx-cudnn-bundle-$$.tar.gz"
+    curl -fsSL -o "$tmp_bundle" "$fsrcnnx_bundle_url" || \
+      fatal "failed to download $fsrcnnx_bundle_url"
+    rm -rf "$fsrcnnx_dir"
+    tar -xzf "$tmp_bundle" -C "$MPV_CFG_DIR/scripts/"
+    rm -f "$tmp_bundle"
+    echo "$FSRCNNX_CUDNN_VERSION" > "$fsrcnnx_dir/.installed-version"
+    log "installed fsrcnnx-cudnn → $fsrcnnx_dir/"
+  fi
 }
 
 # ============================================================================
@@ -661,7 +732,7 @@ EOF
 # detects existing cache files and skips re-compile.
 # ============================================================================
 warm_trt_cache() {
-  section "step 8/10: warm TRT engine cache (4.26 + 4.6, 1080p + 4K)"
+  section "step 8/10: warm TRT engine cache (4.26 + 4.6 @ 720p / 1080p)"
   # shellcheck disable=SC1091
   source "$FORGE_DIR/etc/profile.d/conda.sh"
   conda activate "$ENV_NAME"
@@ -706,16 +777,11 @@ def warm(label, model, width, height, scale=1.0):
     clip.get_frame(0)
     print(f"  {label}: ready in {time.time()-t0:.1f}s")
 
-# 720p — heavy band uses 4.26 here (and F9 cycle starts at 4.26 → 4.6).
-warm("RIFE 4.26 @ 720p   (heavy band default)",  "4.26", 1280,  720)
-warm("RIFE 4.6  @ 720p   (F9 fallback)",         "4.6",  1280,  720)
+# 720p / 540p sources — auto-band uses 4.26 (rife.vpy heavy branch).
+warm("RIFE 4.26 @ 720p", "4.26", 1280,  720)
 
-# 1080p — light band auto-uses 4.6, but pre-warm 4.26 too for F9 cycle.
-warm("RIFE 4.26 @ 1080p  (F9 manual override)",  "4.26", 1920, 1080)
-warm("RIFE 4.6  @ 1080p  (light band default)",  "4.6",  1920, 1080)
-
-# 4K — half-flow band uses 4.6 at scale=0.5 (flow runs at 1080p res).
-warm("RIFE 4.6  @ 4K     (half-flow band, scale=0.5)", "4.6", 3840, 2160, scale=0.5)
+# 1080p sources — auto-band uses 4.6.
+warm("RIFE 4.6  @ 1080p", "4.6", 1920, 1080)
 PY
 }
 
@@ -784,7 +850,16 @@ PY
   # shim insists on its own --config-dir, isolating mpv from ~/.config/mpv/.
   # Symlink the user-facing files back so one set of config rules both.
   local name src dst
-  for name in mpv.conf input.conf rife.vpy rife-light.vpy rife-half.vpy \
+  # Clean up symlinks for files that previous installs created but the
+  # current layout no longer ships (rife-light.vpy / rife-half.vpy
+  # were folded into rife.vpy).
+  for name in rife-light.vpy rife-half.vpy; do
+    [[ -L "$SHIM_CFG_DIR/$name" ]] && { rm -f "$SHIM_CFG_DIR/$name"; \
+      log "removed stale symlink $SHIM_CFG_DIR/$name"; }
+  done
+
+  for name in mpv.conf input.conf rife.vpy \
+              vs_gpu_helpers.py sr_keys_helper.py \
               danmaku-config.json danmaku-credentials.json danmaku-settings.json; do
     src="$MPV_CFG_DIR/$name"
     dst="$SHIM_CFG_DIR/$name"
@@ -794,7 +869,7 @@ PY
     ln -s "$src" "$dst"
     log "linked $dst → $src"
   done
-  for name in shaders scripts; do
+  for name in scripts; do
     src="$MPV_CFG_DIR/$name"
     dst="$SHIM_CFG_DIR/$name"
     [[ -L "$dst" ]] && continue
@@ -1128,9 +1203,10 @@ PY
 
   section "config files"
   for f in "$MPV_CFG_DIR/mpv.conf" "$MPV_CFG_DIR/input.conf" \
-           "$MPV_CFG_DIR/rife.vpy" "$MPV_CFG_DIR/rife-light.vpy" \
-           "$MPV_CFG_DIR/rife-half.vpy" \
-           "$MPV_CFG_DIR/shaders/FSRCNNX_x2_8-0-4-1.glsl" \
+           "$MPV_CFG_DIR/rife.vpy" "$MPV_CFG_DIR/sr_keys_helper.py" \
+           "$MPV_CFG_DIR/vs_gpu_helpers.py" \
+           "$MPV_CFG_DIR/scripts/sr_keys.lua" \
+           "$MPV_CFG_DIR/scripts/fsrcnnx-cudnn/.installed-version" \
            "$MPV_CFG_DIR/scripts/dandanplay/main.lua" \
            "$MPV_CFG_DIR/scripts/dandanplay/danmaku_helper.py" \
            "$MPV_CFG_DIR/danmaku-config.json" \
@@ -1222,10 +1298,12 @@ cmd_uninstall() {
   # Jellyfin server credentials (so the user doesn't have to re-pair).
   log "removing files we created in $MPV_CFG_DIR (preserving user creds)"
   for f in mpv.conf input.conf rife.vpy rife-light.vpy rife-half.vpy \
+           sr_keys_helper.py vs_gpu_helpers.py \
            danmaku-config.json danmaku-credentials.json.example; do
     rm -f "$MPV_CFG_DIR/$f"
   done
-  rm -rf "$MPV_CFG_DIR/scripts" "$MPV_CFG_DIR/shaders"
+  rm -rf "$MPV_CFG_DIR/scripts" "$MPV_CFG_DIR/shaders" \
+         "$MPV_CFG_DIR/weights" "$MPV_CFG_DIR/fsrcnnx_cudnn"
   # Preserved (not deleted):
   #   $MPV_CFG_DIR/danmaku-credentials.json   ← dandanplay AppId/Secret
   #   $MPV_CFG_DIR/danmaku-settings.json      ← user's panel choices

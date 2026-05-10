@@ -25,3 +25,7 @@ desktop.ini
 # install.sh from this directory (defensive)
 danmaku-credentials.json
 cred.json
+
+# Python
+__pycache__/
+*.pyc
