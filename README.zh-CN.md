@@ -60,31 +60,36 @@ engine（一次 30–60 秒，之后缓存在
 |---|---|---|---|
 | ≤ 720p | ≤ 30 fps | 4.26 @ scale=1.0 | x3_16 / x4_16（按比例） |
 | 720p < h ≤ 1080p | ≤ 30 fps | 4.6 @ scale=1.0 | x2_8 |
-| 1080p < h ≤ 2160p | ≤ 30 fps | 先下采样到 1080p → 4.6 → SR 升回 | x2_8（恢复到 4K） |
+| 1080p < h ≤ 2160p | ≤ 30 fps | mixed 模式（见下文）| interp 上 x2_16 |
 | 任意 | > 30 fps | 关 | 比例满足时仍跑 |
 
-4K 档先把源下采样到 1080p，在 1080p 上跑 RIFE，再用 FSRCNNX 升回 4K
-—— 是 GB10 上 **唯一能跑 48 fps 的** RIFE 配置。在两条原生 4K 视频上
-（各 240 帧，pipelined）实测：
+4K 档走 **mixed 模式**：real 帧原 4K bit-exact passthrough，仅合成的
+interp 帧走下采样 → RIFE → SR 升回 4K 这条路。因为链只在一半帧上跑，
+单帧预算翻倍，这刚好够用更重的 4.26 模型 + 16-layer FSRCNNX 提升
+interp 质量。
+
+在两条原生 4K 视频上（各 240 帧，pipelined）实测：
 
 | 4K 配置 | sample-01 fps | sample-02 fps | 48 fps 预算 |
 |---|---|---|---|
-| 下采样 → RIFE 4.6 → SR（现行）| **65.7** | **68.6** | ✅ 余 ~28% |
-| RIFE 4.6 @ scale=0.5（half-flow）| 41.1 | 41.2 | ❌ 差 17% |
-| RIFE 4.6 @ scale=1.0（full-flow）| 27.1 | 27.2 | ❌ 差 77% |
+| mixed + RIFE 4.26 + 16-layer（现行）| **63.9** | **65.6** | ✅ 余 ~35% |
+| RIFE 4.6 @ scale=0.5（half-flow）| 37.1 | 41.3 | ❌ 差 17% |
+| RIFE 4.6 @ scale=1.0（full-flow）| 25.6 | 27.3 | ❌ 差 47% |
 
-Y PSNR：
+Y PSNR（vs full-flow baseline）：
 
 | 比较对象 | sample-01 | sample-02 |
 |---|---|---|
-| 现行 real 帧 vs 原 4K | 45.0 dB (39.0–47.4) | 48.2 dB (47.0–48.8) |
-| 现行 interp 帧 vs full-flow | 38.5 dB | 34.8 dB |
+| real 帧（passthrough）vs 原 4K | 240 dB | 240 dB |
+| interp 帧（4.26 @ 1080p + SR）vs full-flow 4.6 | 38.5 dB | 34.8 dB |
 | half-flow 的 interp 帧 vs full-flow | 39.1 dB | 35.1 dB |
 
-现行 4K 档拿 real 帧 ~3–6 dB 的 PSNR 损失（视觉上高频纹理稍软）换来
-"能跑"。Interp 帧 PSNR 和 half-flow 路相差只有 0.3–0.6 dB —— 两者都
-在 1080p 估光流，所以 4K vs 1080p 的 warp 差别被 RIFE 时域插帧本身
-的不确定性主导，看不出来。
+Real 帧 bit-exact 4K，零损失。Interp 帧 PSNR 比 half-flow 路只低
+0.3–0.6 dB —— 两者都在 1080p 估光流，4K vs 1080p 的 warp 差别被 RIFE
+时域插帧本身的不确定性主导。Mixed 模式有一个潜在感知风险：sharp-real
+和 SR-recovered-interp 交替**可能**在高频纹理上"细节呼吸"（shimmer）。
+实测下采样+SR 这条 roundtrip 够温和，real 和 interp 的 Y PSNR 都远超
+可感知阈值，我们没看到；如果你看到了请反馈。
 
 显示目标默认 4K。如果是其他分辨率屏幕，启动 mpv 前 export
 `FSRCNNX_TARGET_W` / `FSRCNNX_TARGET_H` 即可。

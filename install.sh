@@ -468,8 +468,9 @@ secondary-sub-pos=0
 #
 #   h ≤ 720         RIFE 4.26 + FSRCNNX family=16-layer (auto x3/x4)
 #   720 < h ≤ 1080  RIFE 4.6  + FSRCNNX family=8-layer  (auto x2_8)
-#   1080 < h ≤ 2160 downsample to 1080p → RIFE 4.6 → FSRCNNX upsample
-#                   back to 4K. Only RIFE config GB10 can sustain at 4K.
+#   1080 < h ≤ 2160 mixed mode: original 4K real frames passthrough,
+#                   interp frames go through downsample → RIFE 4.26 →
+#                   FSRCNNX 16-layer → upsample back to 4K
 #   fps > 30        RIFE skipped, FSRCNNX still runs
 #
 # `or 0` sentinel: at the first profile-cond evaluation (before the
@@ -645,8 +646,9 @@ EOF
 #
 #   h ≤ 720         RIFE 4.26 + scale=1.0  + FSRCNNX family=16-layer
 #   720 < h ≤ 1080  RIFE 4.6  + scale=1.0  + FSRCNNX family=8-layer
-#   1080 < h ≤ 2160 downsample to 1080p → RIFE 4.6 → FSRCNNX upsample
-#                   back to 4K
+#   1080 < h ≤ 2160 mixed mode — original 4K real frames passthrough;
+#                   interp frames go through downsample → RIFE 4.26 →
+#                   FSRCNNX 16-layer → upsample back to 4K
 #   fps > 30        RIFE skipped, FSRCNNX still runs if ratio merits
 
 import os, sys
@@ -676,29 +678,47 @@ fps = (clip.fps_num / clip.fps_den) if clip.fps_den else 24.0
 if clip.format.bits_per_sample != 10:
     clip = core.resize.Point(clip, format=vs.YUV420P10)
 
+fsrcnnx_applied = False
 if not rife_disabled() and fps <= 30:
     if h <= 720:
         clip = rife_yuv(clip, model="4.26", scale=1.0, factor_num=2, factor_den=1)
     elif h <= 1080:
         clip = rife_yuv(clip, model="4.6",  scale=1.0, factor_num=2, factor_den=1)
-    else:  # 1080 < h ≤ 2160 — 4K. Downsample to 1080p, RIFE there,
-           # let FSRCNNX upsample back to 4K. RIFE @ scale=0.5 (flow at
-           # 1080p, warp at 4K) is too heavy on GB10 (~38 fps pipelined);
-           # full-flow 4K RIFE is way too heavy (~25 fps). Downsample-
-           # RIFE-SR holds 48 fps comfortably (~70 fps pipelined). Cost:
-           # real frames lose ~42 dB Y PSNR to downsample+SR roundtrip;
-           # interp frames are ~2 dB softer vs full-flow.
+    else:  # 1080 < h ≤ 2160 — 4K mixed mode.
+           # Full 4K RIFE is too heavy on GB10 (~25 fps pipelined); even
+           # scale=0.5 half-flow can't sustain 48fps (~38 fps). So we
+           # downsample to 1080p, run RIFE there, take ONLY the interp
+           # frames, SR them back to 4K, and Interleave with the
+           # original 4K source. Real frames stay bit-exact; only the
+           # synthesized in-between frames pay the downsample+SR cost.
+           #
+           # Because the chain runs on half the frames (N interp, not 2N),
+           # there's room for the HEAVIER model + family on the interp
+           # path: RIFE 4.26 (better motion estimation than 4.6) and
+           # 16-layer FSRCNNX (better high-freq recovery than 8-layer).
+           # Bench: ~65 fps pipelined → +35% over the 48 fps target.
+        src_4k = clip
         target_h = 1080
         target_w = ((clip.width * target_h) // clip.height) & ~1
-        clip = core.resize.Bicubic(clip, width=target_w, height=target_h)
-        clip = rife_yuv(clip, model="4.6",  scale=1.0, factor_num=2, factor_den=1)
+        down = core.resize.Bicubic(clip, width=target_w, height=target_h)
+        rife_low = rife_yuv(down, model="4.26", scale=1.0, factor_num=2, factor_den=1)
+        rife_interp_1080p = rife_low.std.SelectEvery(2, [1])
+        interp_4k = apply_fsrcnnx(rife_interp_1080p, family="16-layer")
+        if interp_4k.width == src_4k.width and interp_4k.height == src_4k.height:
+            clip = core.std.Interleave([src_4k, interp_4k])
+        else:
+            # F8 forced FSRCNNX off / x3 / x4 — interp_4k isn't at 4K so we
+            # can't Interleave. Fall back to the SR chain directly (no
+            # original-frame preservation; mpv display path handles fit).
+            clip = interp_4k
+        fsrcnnx_applied = True
 
-# 4K sources are 1080p after the downsample above, so family logic uses
-# the ORIGINAL h: ≤720 needs 16-layer (select_variant refuses 8-layer
-# at ratio ≥ 2.5). 1080p and downsampled 4K both work with 8-layer.
-family = "16-layer" if h <= 720 else "8-layer"
-
-clip = apply_fsrcnnx(clip, family=family)
+# h ≤ 720 needs 16-layer family (select_variant refuses 8-layer at
+# ratio ≥ 2.5); 1080p works with 8-layer (faster on the GB10). 4K
+# mixed-mode handled its own FSRCNNX call above.
+if not fsrcnnx_applied:
+    family = "16-layer" if h <= 720 else "8-layer"
+    clip = apply_fsrcnnx(clip, family=family)
 
 clip.set_output()
 
@@ -802,10 +822,13 @@ def warm(label, model, width, height, scale=1.0):
     print(f"  {label}: ready in {time.time()-t0:.1f}s")
 
 # 720p / 540p sources — auto-band uses 4.26 (rife.vpy heavy branch).
-warm("RIFE 4.26 @ 720p", "4.26", 1280,  720)
+warm("RIFE 4.26 @ 720p",  "4.26", 1280,  720)
 
 # 1080p sources — auto-band uses 4.6.
-warm("RIFE 4.6  @ 1080p", "4.6", 1920, 1080)
+warm("RIFE 4.6  @ 1080p", "4.6",  1920, 1080)
+
+# 4K sources — mixed mode downsamples to 1080p then runs 4.26.
+warm("RIFE 4.26 @ 1080p (for 4K mixed-mode interp)", "4.26", 1920, 1080)
 PY
 }
 
