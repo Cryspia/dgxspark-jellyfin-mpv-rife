@@ -701,8 +701,14 @@ try:
     # past 16.7 ms — fall back to lighter (4.6 + 8-layer) above 24 fps.
     heavy_fps = fps < 25
 
-    if clip.format.bits_per_sample != 10:
-        clip = core.resize.Point(clip, format=vs.YUV420P10)
+    # Normalise to YUV420P10 — handles bit-depth (8/12/16 → 10) and
+    # chroma subsampling (4:2:2 / 4:4:4 → 4:2:0) in one shot via zimg.
+    # Bicubic is the right resampler when subsampling changes (Point
+    # aliases hard); for the already-4:2:0 case zimg internally short-
+    # circuits the chroma path to a bit-depth shift, so the cost stays
+    # sub-ms at 1080p.
+    if clip.format.id != int(vs.YUV420P10):
+        clip = core.resize.Bicubic(clip, format=vs.YUV420P10)
 
     fsrcnnx_applied = False
     if not rife_disabled() and fps <= 30:
