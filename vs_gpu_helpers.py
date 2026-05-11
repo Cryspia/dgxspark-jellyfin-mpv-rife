@@ -88,6 +88,22 @@ _YUV2RGB_MATRIX = {
 _RGB2YUV_MATRIX = {k: torch.linalg.inv(v) for k, v in _YUV2RGB_MATRIX.items()}
 
 
+# 10-bit YUV scale/offset constants by `_ColorRange` semantics.
+# Tuple layout: (y_scale, y_offset, uv_scale, uv_offset).
+#   limited (TV): Y in [64, 940], U/V in [64, 960] centred at 512
+#   full (PC) : Y in [0, 1023], U/V in [0, 1023]            centred at 512
+# Game streaming (Moonlight, NVENC etc.) and many screen recordings encode
+# full-range YUV; container metadata sets _ColorRange=0 for those.
+_RANGE_CONSTS_10 = {
+    "limited": (876.0, 64.0, 896.0, 512.0),
+    "full":    (1023.0, 0.0, 1023.0, 512.0),
+}
+
+# `_ColorRange` prop → constants key. Missing prop on YUV defaults to
+# limited (BT.709/2020 spec); explicit 0 means full (PC).
+_RANGE_FROM_PROP = {0: "full", 1: "limited"}
+
+
 # Map vapoursynth `_Matrix` integer values → matrix name. mpv
 # populates this from the container; defaults vary by source.
 _MATRIX_FROM_PROP = {
@@ -107,23 +123,23 @@ def yuv420p10_to_rgb(
     v_plane: torch.Tensor,          # (H/2, W/2) uint16
     matrix: str,
     *,
+    color_range: str = "limited",
     out_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    """Convert YUV420P10 limited-range to RGB float16/float32 in [0, 1].
+    """Convert YUV420P10 to RGB float16/float32 in [0, 1].
 
     Returns (1, 3, H, W) tensor on the same device as the inputs.
+    `color_range` is "limited" (TV; default — matches streaming /
+    Blu-ray) or "full" (PC; game streaming / screen recordings).
     Uses bilinear chroma upsampling (4:2:0 → 4:4:4); a slight
     softening vs. zimg's bicubic, but at 4K the difference is below
     the typical noise floor of streaming sources.
     """
     device = y_plane.device
-
-    # Limited-range constants for 10-bit:
-    #   Y:  [64, 940]   range 876
-    #   Cb,Cr: [64, 960]  range 896, midpoint 512
-    y = (y_plane.to(torch.float32) - 64.0) / 876.0
-    u = (u_plane.to(torch.float32) - 512.0) / 896.0
-    v = (v_plane.to(torch.float32) - 512.0) / 896.0
+    y_scale, y_offset, uv_scale, uv_offset = _RANGE_CONSTS_10[color_range]
+    y = (y_plane.to(torch.float32) - y_offset)  / y_scale
+    u = (u_plane.to(torch.float32) - uv_offset) / uv_scale
+    v = (v_plane.to(torch.float32) - uv_offset) / uv_scale
 
     # Chroma upsample 4:2:0 → 4:4:4. F.interpolate operates on (N, C, H, W).
     h, w = y.shape
@@ -152,13 +168,18 @@ def yuv420p10_to_rgb(
 def rgb_to_yuv420p10(
     rgb: torch.Tensor,           # (1, 3, H, W) float16/float32 in [0, 1]
     matrix: str,
+    *,
+    color_range: str = "limited",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert RGB to YUV420P10 limited-range planes (uint16).
+    """Convert RGB to YUV420P10 planes (int16, bit-equivalent to uint16
+    for 10-bit values in [0, 1023]).
 
     Returns (y, u, v) tensors on the same device as `rgb`. Chroma
     downsample is a 2×2 average pool (matches center-aligned chroma
     siting closely enough — same approximation vapoursynth's bicubic
-    is making in the other direction)."""
+    is making in the other direction). `color_range` should match
+    whatever the source had — limited stays limited, full stays full —
+    so mpv's downstream display path interprets it correctly."""
     device = rgb.device
     rgb_f = rgb[0].permute(1, 2, 0).to(torch.float32)  # (H, W, 3)
     m = _RGB2YUV_MATRIX[matrix].to(device)             # (3, 3) [Y,U,V] x [R,G,B]
@@ -169,13 +190,15 @@ def rgb_to_yuv420p10(
     u = F.avg_pool2d(u[None, None], kernel_size=2, stride=2)[0, 0]
     v = F.avg_pool2d(v[None, None], kernel_size=2, stride=2)[0, 0]
 
-    # Quantize to limited-range 10-bit. Output dtype is int16, not
-    # uint16: 10-bit YUV values [0, 1023] fit comfortably under int16's
-    # 32767 ceiling, and int16 is what the int16-reinterpret trick in
-    # _planes_to_frame_yuv420p10 expects on the GPU side.
-    y_q = (y * 876.0 + 64.0).round_().clamp_(0, 1023).to(torch.int16)
-    u_q = (u * 896.0 + 512.0).round_().clamp_(0, 1023).to(torch.int16)
-    v_q = (v * 896.0 + 512.0).round_().clamp_(0, 1023).to(torch.int16)
+    # Quantize to 10-bit using the matching range's constants. Output
+    # dtype is int16, not uint16: 10-bit YUV values [0, 1023] fit
+    # comfortably under int16's 32767 ceiling, and int16 is what the
+    # int16-reinterpret trick in _planes_to_frame_yuv420p10 expects on
+    # the GPU side.
+    y_scale, y_offset, uv_scale, uv_offset = _RANGE_CONSTS_10[color_range]
+    y_q = (y * y_scale  + y_offset ).round_().clamp_(0, 1023).to(torch.int16)
+    u_q = (u * uv_scale + uv_offset).round_().clamp_(0, 1023).to(torch.int16)
+    v_q = (v * uv_scale + uv_offset).round_().clamp_(0, 1023).to(torch.int16)
     return y_q, u_q, v_q
 
 
@@ -365,6 +388,7 @@ def rife_yuv(
     factor_num: int = 2,
     factor_den: int = 1,
     device_index: int = 0,
+    color_range: str = "limited",
 ) -> vs.VideoNode:
     """Frame-doubling RIFE with GPU color conversion. Drop-in for the
     sequence
@@ -491,6 +515,7 @@ def rife_yuv(
             with lock_io, torch.cuda.stream(stream_io):
                 yp, up, vp = _frame_yuv420p10_to_planes(src_frame, device)
                 rgb = yuv420p10_to_rgb(yp, up, vp, matrix,
+                                       color_range=color_range,
                                        out_dtype=torch.float16)
                 if need_pad:
                     rgb = F.pad(rgb, padding)
@@ -567,7 +592,7 @@ def rife_yuv(
             # Use the matrix the source frame came in with — videos with
             # mid-stream matrix changes are extremely rare; for the common
             # case both source frames share a matrix.
-            yq, uq, vq = rgb_to_yuv420p10(out, matrix)
+            yq, uq, vq = rgb_to_yuv420p10(out, matrix, color_range=color_range)
             stream_inf.synchronize()
 
         # Write GPU result directly into the BlankClip dst frame (no

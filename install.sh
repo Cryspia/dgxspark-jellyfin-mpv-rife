@@ -678,20 +678,23 @@ clip = video_in
 # wouldn't have kept up at vsync anyway, so the trade is fine.
 try:
     # Whitelist the colour properties we actually support. The chain's
-    # YUV↔RGB math hard-codes BT.709/601/2020 matrices and limited-range
-    # quantisation; anything else (Dolby Vision ICtCp, full-range YUV,
-    # weird HDR variants) would silently produce wrong colours rather
-    # than crash. Catch those at init and bail to passthrough.
+    # YUV↔RGB math hard-codes BT.709/601/2020 matrices; anything else
+    # (Dolby Vision ICtCp, niche HDR variants) would silently produce
+    # wrong colours rather than crash. Catch those at init and bail to
+    # passthrough. Both limited (TV, default for streaming/Blu-ray)
+    # and full (PC, common for game streaming / screen recordings)
+    # ranges are supported via the color_range parameter to rife_yuv.
     _KNOWN_MATRICES = {1, 5, 6, 7, 9, 10}    # 709, 170m, 240m, 2020ncl
     _src_props = clip.get_frame(0).props
     _matrix = int(_src_props.get("_Matrix", 1))
-    _color_range = int(_src_props.get("_ColorRange", 1))
+    _color_range_int = int(_src_props.get("_ColorRange", 1))
     if _matrix not in _KNOWN_MATRICES:
         raise RuntimeError(f"unsupported _Matrix={_matrix} "
                              f"(known: {sorted(_KNOWN_MATRICES)})")
-    if _color_range != 1:
-        raise RuntimeError(f"unsupported _ColorRange={_color_range} "
-                             f"(need 1 = limited / TV range)")
+    if _color_range_int not in (0, 1):
+        raise RuntimeError(f"unsupported _ColorRange={_color_range_int} "
+                             f"(need 0=full or 1=limited)")
+    color_range = "full" if _color_range_int == 0 else "limited"
 
     h = clip.height
     fps = (clip.fps_num / clip.fps_den) if clip.fps_den else 24.0
@@ -713,10 +716,12 @@ try:
     fsrcnnx_applied = False
     if not rife_disabled() and fps <= 30:
         if h <= 720:
-            clip = rife_yuv(clip, model="4.26", scale=1.0, factor_num=2, factor_den=1)
+            clip = rife_yuv(clip, model="4.26", scale=1.0, factor_num=2, factor_den=1,
+                            color_range=color_range)
         elif h <= 1080:
             model = "4.26" if heavy_fps else "4.6"
-            clip = rife_yuv(clip, model=model, scale=1.0, factor_num=2, factor_den=1)
+            clip = rife_yuv(clip, model=model, scale=1.0, factor_num=2, factor_den=1,
+                            color_range=color_range)
         else:  # 1080 < h ≤ 2160 — 4K mixed mode.
                # Full 4K RIFE is too heavy on GB10 (~25 fps pipelined); even
                # scale=0.5 half-flow can't sustain 48fps (~38 fps). So we
@@ -735,7 +740,8 @@ try:
             down = core.resize.Bicubic(clip, width=target_w, height=target_h)
             rife_model  = "4.26" if heavy_fps else "4.6"
             sr_family_4k = "16-layer" if heavy_fps else "8-layer"
-            rife_low = rife_yuv(down, model=rife_model, scale=1.0, factor_num=2, factor_den=1)
+            rife_low = rife_yuv(down, model=rife_model, scale=1.0, factor_num=2, factor_den=1,
+                                color_range=color_range)
             rife_interp_1080p = rife_low.std.SelectEvery(2, [1])
             interp_4k = apply_fsrcnnx(rife_interp_1080p, family=sr_family_4k)
             if interp_4k.width == src_4k.width and interp_4k.height == src_4k.height:
