@@ -59,7 +59,7 @@ def apply_fsrcnnx(
     weights_dir=None,
     target_w: int | None = None,
     target_h: int | None = None,
-    chroma_kernel: str = "Bicubic",
+    chroma_kernel: str = "Lanczos",
 ):
     """Run FSRCNNX with F8 override support.
 
