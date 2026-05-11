@@ -11,11 +11,19 @@ FSRCNNX 亮度超分**，全部跑在一个 Miniforge conda 环境里。
 - **mpv 0.41**，从源码编译 —— 启用 vapoursynth + vulkan + wayland +
   x11 + lua。conda-forge aarch64 上的 mpv 是 headless 库构建，没显示
   后端，所以本地重编。
-- **vsrife + TensorRT** RIFE 按源分辨率自动选档：≤720p 用 4.26，
-  720p<h≤1080p 用 4.6；1080p 以上不开（GB10 在 4K 撑不住），>30fps
-  也不开（已经够流畅）。混合精度（fp16 权重 + fp32 累加器）；纯 fp16
-  会在快速运动时溢出闪烁，安装脚本 patch 上游 vsrife 固定
-  `enabled_precisions={fp16, fp32}`。
+- **vsrife + TensorRT** RIFE 按"源分辨率 + 帧率"二维分档，每档刚好
+  压在 GB10 的单帧预算里。完整表见
+  [默认配置](#默认配置)，简而言之：
+  - ≤720p：4.26。
+  - 1080p 电影帧率（<25 fps）：4.26；1080p 25–30 fps：4.6（60 fps
+    输出预算更紧）。
+  - 4K：原生满分辨率 RIFE 在 GB10 上撑不住。**Mixed 模式**保留 4K
+    real 帧 bit-exact，仅在 interp 帧上跑 RIFE —— 单帧预算翻倍，同样
+    的"电影帧率 vs 广播帧率"切换适用于这条链。
+  - \>30 fps：RIFE 关（本来就够流畅；FSRCNNX 比例满足时仍跑）。
+
+  混合精度（fp16 权重 + fp32 累加器）；纯 fp16 会在快速运动时溢出闪
+  烁，安装脚本 patch 上游 vsrife 固定 `enabled_precisions={fp16, fp32}`。
 - **GPU YUV↔RGB 色转**（`vs_gpu_helpers.rife_yuv`）—— CPU 上
   `core.resize.Bicubic(format=vs.RGBH)` 在 4K 下 ~30 ms/帧，是 20 核
   Grace CPU 真正的瓶颈。我们把矩阵乘 + chroma 重采样放 GPU；

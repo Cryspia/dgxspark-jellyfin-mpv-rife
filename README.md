@@ -11,11 +11,22 @@ interpolation + FSRCNNX luma upscaling** stack on **NVIDIA DGX Spark**
 - **mpv 0.41** built from source — vapoursynth + vulkan + wayland + x11
   + lua. The conda-forge aarch64 mpv is a headless library build with
   no display backends, so the installer builds its own.
-- **vsrife + TensorRT** RIFE picked per source resolution: 4.26 for
-  ≤720p, 4.6 for 720p<h≤1080p; off above 1080p (GB10 doesn't have the
-  headroom for 4K RIFE) and off above 30fps (already smooth). Mixed
-  precision (fp16 weights, fp32 accumulators); pure fp16 flickers on
-  fast motion. The installer patches vsrife to pin
+- **vsrife + TensorRT** RIFE picked per source resolution **and** fps,
+  with the budget split engineered so each combination just fits the
+  GB10's per-frame envelope. Full table in [Default config](#default-config);
+  TL;DR:
+  - ≤720p: 4.26.
+  - 1080p, cinema rates (<25 fps): 4.26. 1080p, 25–30 fps: 4.6
+    (60 fps output budget is tighter).
+  - 4K: full-rate RIFE doesn't fit GB10. *Mixed mode* keeps real frames
+    bit-exact at 4K and runs RIFE only on the synthesized in-between
+    frames — at half the per-frame budget, same cinema-vs-broadcast
+    split applies.
+  - \>30 fps: RIFE off (already smooth; FSRCNNX still runs if it has
+    a useful ratio).
+
+  Mixed precision (fp16 weights, fp32 accumulators); pure fp16 flickers
+  on fast motion. The installer patches vsrife to pin
   `enabled_precisions={fp16, fp32}`.
 - **GPU YUV↔RGB color conversion** (`vs_gpu_helpers.rife_yuv`) — the
   CPU `core.resize.Bicubic(format=vs.RGBH)` round-trip costs ~30 ms /
