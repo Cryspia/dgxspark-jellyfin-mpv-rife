@@ -677,6 +677,22 @@ clip = video_in
 # user's playback uninterrupted. For exotic formats the interpolation
 # wouldn't have kept up at vsync anyway, so the trade is fine.
 try:
+    # Whitelist the colour properties we actually support. The chain's
+    # YUV↔RGB math hard-codes BT.709/601/2020 matrices and limited-range
+    # quantisation; anything else (Dolby Vision ICtCp, full-range YUV,
+    # weird HDR variants) would silently produce wrong colours rather
+    # than crash. Catch those at init and bail to passthrough.
+    _KNOWN_MATRICES = {1, 5, 6, 7, 9, 10}    # 709, 170m, 240m, 2020ncl
+    _src_props = clip.get_frame(0).props
+    _matrix = int(_src_props.get("_Matrix", 1))
+    _color_range = int(_src_props.get("_ColorRange", 1))
+    if _matrix not in _KNOWN_MATRICES:
+        raise RuntimeError(f"unsupported _Matrix={_matrix} "
+                             f"(known: {sorted(_KNOWN_MATRICES)})")
+    if _color_range != 1:
+        raise RuntimeError(f"unsupported _ColorRange={_color_range} "
+                             f"(need 1 = limited / TV range)")
+
     h = clip.height
     fps = (clip.fps_num / clip.fps_den) if clip.fps_den else 24.0
     # Cinema-rate (≤24 fps) sources have a 20.8 ms/frame budget at 2×
