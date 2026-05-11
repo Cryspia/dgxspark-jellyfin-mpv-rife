@@ -28,6 +28,18 @@ FSRCNNX 亮度超分**，全部跑在一个 Miniforge conda 环境里。
   `core.resize.Bicubic(format=vs.RGBH)` 在 4K 下 ~30 ms/帧，是 20 核
   Grace CPU 真正的瓶颈。我们把矩阵乘 + chroma 重采样放 GPU；
   Grace+Blackwell 一致内存下没有 PCIe 上传开销。
+
+  支持的源格式：YUV 4:2:0 / 4:2:2 / 4:4:4，8 / 10 / 12 / 16 位，
+  BT.709 / BT.601 / BT.2020 NCL，limited (TV) 或 full (PC) range
+  —— 覆盖所有主流流媒体、Blu-ray 和游戏串流 / 屏幕录制片源。范围以外
+  的（Dolby Vision ICtCp matrix、RGB 输入、float YUV 等）会触发
+  guarded fallback，把源原样 passthrough 出去。
+
+  色彩精度：在实际内容上 YUV → RGB → YUV 的 roundtrip Y 通道
+  **bit-exact**，U/V 通道平均 1 LSB 内，比 zimg 的 CPU 路径还略高
+  （zimg 的 RGB48 中转有约 5 LSB 的 Y 整数舍入损失，我们 RGB 中间态
+  保持 fp32）。Real 帧走 passthrough 不变，只有合成的 interp 帧经过
+  色转，所以播放色彩保真度和不挂 vf 的 mpv 一致。
 - **FSRCNNX cuDNN 超分** —— 安装时从上游
   [`Cryspia/fsrcnnx-cudnn`](https://github.com/Cryspia/fsrcnnx-cudnn)
   的 release bundle 拉（包含 x2_8 / x2_16 / x3_16 / x4_16 四档）。链

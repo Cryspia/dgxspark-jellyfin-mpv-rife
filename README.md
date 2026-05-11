@@ -33,6 +33,21 @@ interpolation + FSRCNNX luma upscaling** stack on **NVIDIA DGX Spark**
   frame at 4K and was the actual bottleneck on the 20-core Grace CPU.
   We do the matrix multiply + chroma resample on GPU instead. With
   Grace+Blackwell unified memory there's no PCIe upload cost.
+
+  Supported source formats: YUV 4:2:0 / 4:2:2 / 4:4:4 at 8 / 10 / 12 /
+  16 bit, BT.709 / BT.601 / BT.2020 NCL, limited (TV) or full (PC)
+  range — covers all mainstream streaming, Blu-ray, and game-streaming
+  / screen-recording feeds. Anything outside that envelope (Dolby
+  Vision ICtCp matrix, RGB input, float YUV, etc.) hits a guarded
+  fallback that passes the source through unmodified.
+
+  Color accuracy: the YUV → RGB → YUV roundtrip on real content is
+  bit-exact on Y and within 1 LSB on average for U/V, slightly more
+  precise than zimg's CPU path (zimg's RGB48 intermediate has ~5 LSB
+  of integer rounding loss on Y; we keep RGB at fp32). Real frames
+  pass through unmodified — only the synthesized interp frames go
+  through the conversion, so playback color faithfulness matches mpv
+  with no filter.
 - **FSRCNNX cuDNN super-resolution** — installed from the upstream
   [`Cryspia/fsrcnnx-cudnn`](https://github.com/Cryspia/fsrcnnx-cudnn)
   release bundle (variants x2_8 / x2_16 / x3_16 / x4_16). The chain
