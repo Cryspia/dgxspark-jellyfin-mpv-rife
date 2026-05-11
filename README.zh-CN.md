@@ -143,7 +143,7 @@ Real 帧 bit-exact 4K，零损失。Interp 帧 PSNR 比 half-flow 路只低
 | `~/miniforge3/envs/vsmpv/` | conda 环境：python, mpv, vapoursynth, vsrife, shim, tensorrt |
 | `~/.config/mpv/{mpv,input}.conf, rife.vpy, vs_gpu_helpers.py, sr_keys_helper.py` | 本项目的配置 + 辅助模块 |
 | `~/.config/mpv/scripts/sr_keys.lua` | F8 / F9 keybind 逻辑 |
-| `~/.config/mpv/scripts/fsrcnnx-cudnn/` | 上游 fsrcnnx-cudnn bundle（Python 包 + .npz 权重） |
+| `~/.config/mpv/fsrcnnx-cudnn/` | 上游 fsrcnnx-cudnn bundle（Python 包 + .npz 权重） |
 | `~/.config/mpv/scripts/dandanplay/` | 弹幕脚本 |
 | `~/.config/jellyfin-mpv-shim/conf.json` | shim 自己的配置（服务器凭据等） |
 | `~/.config/jellyfin-mpv-shim/{mpv,input}.conf, rife.vpy, …` | 指向 `~/.config/mpv/` 的软链 |
