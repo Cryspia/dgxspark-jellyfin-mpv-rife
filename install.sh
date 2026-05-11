@@ -691,6 +691,20 @@ family = "16-layer" if h <= 720 else "8-layer"
 clip = apply_fsrcnnx(clip, family=family)
 
 clip.set_output()
+
+# Pre-warm: kick frame 0 off on a background thread so the FSRCNNX
+# cuDNN graph build + RIFE TRT engine load overlap with the rest of
+# mpv's startup (audio init, OSD layout, seek-to-start). vapoursynth
+# caches the computed frame, so mpv's own first-frame fetch is usually
+# an instant hit. daemon=True so we don't keep the process alive if
+# the filter is replaced (F8/F9 reload) before frame 0 finishes.
+import threading as _t
+def _prewarm(_clip=clip):
+    try:
+        _clip.get_frame(0)
+    except Exception:
+        pass
+_t.Thread(target=_prewarm, daemon=True, name="rife-prewarm").start()
 EOF
   log "wrote $MPV_CFG_DIR/rife.vpy"
 
