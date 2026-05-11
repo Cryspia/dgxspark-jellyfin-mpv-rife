@@ -1069,16 +1069,26 @@ EOF
   log "wrote .desktop entries to $APPS_DIR"
 
   # ---------- autostart shim on login ----------
+  # Wait for the network to come up before launching shim — without
+  # this, shim races NetworkManager and fails to reach the Jellyfin
+  # server on the first try (visible as "no server configured" or a
+  # connection-refused error). `nm-online -q -t 30` blocks until NM
+  # reports a connection is up, or gives up after 30 s. The extra
+  # `sleep 3` covers DNS / mDNS / route-table settling after that.
+  # `X-GNOME-Autostart-Delay=10` is a belt-and-braces — GNOME defers
+  # the autostart trigger 10 s into the user session, giving the
+  # desktop time to settle before we even start waiting for the NIC.
   cat > "$AUTOSTART_DIR/jellyfin-mpv-shim.desktop" <<EOF
 [Desktop Entry]
 Name=Jellyfin MPV Shim
 Comment=Cast Jellyfin media to mpv (with RIFE + FSRCNNX)
-Exec=$WRAPPER_DIR/jellyfin-mpv-shim
+Exec=sh -c 'nm-online -q -t 30 2>/dev/null; sleep 3; exec $WRAPPER_DIR/jellyfin-mpv-shim'
 Icon=jellyfin-mpv-shim
 Type=Application
 Categories=AudioVideo;Player;
 Terminal=false
 X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=10
 StartupWMClass=jellyfin-mpv-shim
 EOF
   log "wrote autostart entry to $AUTOSTART_DIR"
