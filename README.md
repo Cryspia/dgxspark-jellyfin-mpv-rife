@@ -63,15 +63,36 @@ First playback at a new resolution JIT-compiles a TensorRT engine
 
 | Source | Frame rate | RIFE | FSRCNNX (auto) |
 |---|---|---|---|
-| ≤ 720p | ≤ 30 fps | 4.26 | x3_16 / x4_16 (ratio-dependent) |
-| 720p < h ≤ 1080p | ≤ 30 fps | 4.6 | x2_8 |
-| > 1080p | any | off | bypass (ratio < 1.3) |
+| ≤ 720p | ≤ 30 fps | 4.26 @ scale=1.0 | x3_16 / x4_16 (ratio-dependent) |
+| 720p < h ≤ 1080p | ≤ 30 fps | 4.6 @ scale=1.0 | x2_8 |
+| 1080p < h ≤ 2160p | ≤ 30 fps | downsample → 4.6 → SR | x2_8 (recovers 4K) |
 | any | > 30 fps | off | runs if ratio merits |
 
-The 4K source path was tried (RIFE 4.6 @ scale=0.5) and dropped — GB10
-ends up missing more frames than it adds, so 4K source plays through
-unmodified. FSRCNNX bypass at 4K source on 4K display is the
-upstream's [1.3× WHEN gate](https://github.com/Cryspia/fsrcnnx-cudnn).
+The 4K path downsamples to 1080p, runs RIFE there, and lets FSRCNNX
+upsample back to 4K — the only RIFE config GB10 can sustain at 4K.
+Benched on two native 4K clips (240 frames each, pipelined via
+`get_frame_async`):
+
+| 4K config | sample-01 fps | sample-02 fps | 48 fps budget |
+|---|---|---|---|
+| downsample → RIFE 4.6 → SR (current) | **65.7** | **68.6** | ✅ ~28% headroom |
+| RIFE 4.6 @ scale=0.5 (half-flow) | 41.1 | 41.2 | ❌ −17% |
+| RIFE 4.6 @ scale=1.0 (full-flow) | 27.1 | 27.2 | ❌ −77% |
+
+Y PSNR:
+
+| comparison | sample-01 | sample-02 |
+|---|---|---|
+| current path real frames vs original 4K | 45.0 dB (39.0–47.4) | 48.2 dB (47.0–48.8) |
+| current path interp frames vs full-flow | 38.5 dB | 34.8 dB |
+| half-flow interp frames vs full-flow | 39.1 dB | 35.1 dB |
+
+The current 4K config trades ~3–6 dB of real-frame Y PSNR vs original
+(visible as slightly softer detail on high-frequency textures) for the
+headroom to actually run. Interp-frame quality is within 0.3–0.6 dB of
+the half-flow path — the flow happens at 1080p in both cases, so the
+4K-vs-1080p warp difference is dominated by RIFE's inherent temporal
+uncertainty rather than spatial flow accuracy.
 
 Display target defaults to 4K. If you have a smaller screen, export
 `FSRCNNX_TARGET_W` / `FSRCNNX_TARGET_H` before launching mpv.

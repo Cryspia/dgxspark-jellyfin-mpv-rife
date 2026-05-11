@@ -58,16 +58,33 @@ engine（一次 30–60 秒，之后缓存在
 
 | 源分辨率 | 帧率 | RIFE | FSRCNNX (auto) |
 |---|---|---|---|
-| ≤ 720p | ≤ 30 fps | 4.26 | x3_16 / x4_16（按比例） |
-| 720p < h ≤ 1080p | ≤ 30 fps | 4.6 | x2_8 |
-| > 1080p | 任意 | 关 | bypass（ratio < 1.3） |
+| ≤ 720p | ≤ 30 fps | 4.26 @ scale=1.0 | x3_16 / x4_16（按比例） |
+| 720p < h ≤ 1080p | ≤ 30 fps | 4.6 @ scale=1.0 | x2_8 |
+| 1080p < h ≤ 2160p | ≤ 30 fps | 先下采样到 1080p → 4.6 → SR 升回 | x2_8（恢复到 4K） |
 | 任意 | > 30 fps | 关 | 比例满足时仍跑 |
 
-我们试过 4K 源走 RIFE 4.6 @ scale=0.5（半光流），实测 GB10 撑不住，
-丢的帧比加的还多，所以直接关掉了；4K 源现在裸通过。FSRCNNX 在 4K 源
-+ 4K 屏的场景下，根据上游
-[1.3× WHEN gate](https://github.com/Cryspia/fsrcnnx-cudnn) 也会自动
-bypass。
+4K 档先把源下采样到 1080p，在 1080p 上跑 RIFE，再用 FSRCNNX 升回 4K
+—— 是 GB10 上 **唯一能跑 48 fps 的** RIFE 配置。在两条原生 4K 视频上
+（各 240 帧，pipelined）实测：
+
+| 4K 配置 | sample-01 fps | sample-02 fps | 48 fps 预算 |
+|---|---|---|---|
+| 下采样 → RIFE 4.6 → SR（现行）| **65.7** | **68.6** | ✅ 余 ~28% |
+| RIFE 4.6 @ scale=0.5（half-flow）| 41.1 | 41.2 | ❌ 差 17% |
+| RIFE 4.6 @ scale=1.0（full-flow）| 27.1 | 27.2 | ❌ 差 77% |
+
+Y PSNR：
+
+| 比较对象 | sample-01 | sample-02 |
+|---|---|---|
+| 现行 real 帧 vs 原 4K | 45.0 dB (39.0–47.4) | 48.2 dB (47.0–48.8) |
+| 现行 interp 帧 vs full-flow | 38.5 dB | 34.8 dB |
+| half-flow 的 interp 帧 vs full-flow | 39.1 dB | 35.1 dB |
+
+现行 4K 档拿 real 帧 ~3–6 dB 的 PSNR 损失（视觉上高频纹理稍软）换来
+"能跑"。Interp 帧 PSNR 和 half-flow 路相差只有 0.3–0.6 dB —— 两者都
+在 1080p 估光流，所以 4K vs 1080p 的 warp 差别被 RIFE 时域插帧本身
+的不确定性主导，看不出来。
 
 显示目标默认 4K。如果是其他分辨率屏幕，启动 mpv 前 export
 `FSRCNNX_TARGET_W` / `FSRCNNX_TARGET_H` 即可。
