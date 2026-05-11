@@ -64,9 +64,17 @@ First playback at a new resolution JIT-compiles a TensorRT engine
 | Source | Frame rate | RIFE | FSRCNNX (auto) |
 |---|---|---|---|
 | ≤ 720p | ≤ 30 fps | 4.26 @ scale=1.0 | x3_16 / x4_16 (ratio-dependent) |
-| 720p < h ≤ 1080p | ≤ 30 fps | 4.6 @ scale=1.0 | x2_8 |
-| 1080p < h ≤ 2160p | ≤ 30 fps | mixed mode (see below) | x2_16 on interp |
+| 720p < h ≤ 1080p | < 25 fps (cinema) | 4.26 @ scale=1.0 | x2_16 |
+| 720p < h ≤ 1080p | 25–30 fps | 4.6 @ scale=1.0 | x2_8 |
+| 1080p < h ≤ 2160p | < 25 fps (cinema) | mixed mode, 4.26 interp | x2_16 on interp |
+| 1080p < h ≤ 2160p | 25–30 fps | mixed mode, 4.6 interp | x2_8 on interp |
 | any | > 30 fps | off | runs if ratio merits |
+
+The 25 fps threshold is the budget split: ≤24 fps source × 2 → 48 fps
+output → 20.8 ms/frame, which the heavy chain (RIFE 4.26 + 16-layer
+FSRCNNX) just fits. At 25+ fps the output budget drops to 16.7 ms,
+which the heavy chain misses — so 25/29.97/30 fps content uses the
+lighter (4.6 + 8-layer) variant.
 
 The 4K path is **mixed mode**: real frames pass through at original 4K
 (bit-exact), and only the synthesized in-between frames take the

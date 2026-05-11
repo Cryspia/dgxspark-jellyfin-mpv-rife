@@ -675,6 +675,12 @@ h = clip.height
 # fps_den=0 — fall back to 24 (treat as low-fps).
 fps = (clip.fps_num / clip.fps_den) if clip.fps_den else 24.0
 
+# Cinema-rate (≤24 fps) sources have a 20.8 ms/frame budget at 2× output;
+# 25–30 fps sources tighten to 16.7 ms/frame at 60 fps output. The heavy
+# chain (RIFE 4.26 + 16-layer FSRCNNX) fits the cinema budget but blows
+# past 16.7 ms — fall back to lighter (RIFE 4.6 + 8-layer) above 24 fps.
+heavy_fps = fps < 25
+
 if clip.format.bits_per_sample != 10:
     clip = core.resize.Point(clip, format=vs.YUV420P10)
 
@@ -683,7 +689,8 @@ if not rife_disabled() and fps <= 30:
     if h <= 720:
         clip = rife_yuv(clip, model="4.26", scale=1.0, factor_num=2, factor_den=1)
     elif h <= 1080:
-        clip = rife_yuv(clip, model="4.6",  scale=1.0, factor_num=2, factor_den=1)
+        model = "4.26" if heavy_fps else "4.6"
+        clip = rife_yuv(clip, model=model, scale=1.0, factor_num=2, factor_den=1)
     else:  # 1080 < h ≤ 2160 — 4K mixed mode.
            # Full 4K RIFE is too heavy on GB10 (~25 fps pipelined); even
            # scale=0.5 half-flow can't sustain 48fps (~38 fps). So we
@@ -692,18 +699,19 @@ if not rife_disabled() and fps <= 30:
            # original 4K source. Real frames stay bit-exact; only the
            # synthesized in-between frames pay the downsample+SR cost.
            #
-           # Because the chain runs on half the frames (N interp, not 2N),
-           # there's room for the HEAVIER model + family on the interp
-           # path: RIFE 4.26 (better motion estimation than 4.6) and
-           # 16-layer FSRCNNX (better high-freq recovery than 8-layer).
-           # Bench: ~65 fps pipelined → +35% over the 48 fps target.
+           # On the half-the-frames budget, ≤24 fps sources can afford
+           # the heavier interp chain (RIFE 4.26 + 16-layer FSRCNNX);
+           # 25+ fps falls back to the lighter (4.6 + 8-layer) variant
+           # to stay under the tighter 60 fps output budget.
         src_4k = clip
         target_h = 1080
         target_w = ((clip.width * target_h) // clip.height) & ~1
         down = core.resize.Bicubic(clip, width=target_w, height=target_h)
-        rife_low = rife_yuv(down, model="4.26", scale=1.0, factor_num=2, factor_den=1)
+        rife_model  = "4.26" if heavy_fps else "4.6"
+        sr_family_4k = "16-layer" if heavy_fps else "8-layer"
+        rife_low = rife_yuv(down, model=rife_model, scale=1.0, factor_num=2, factor_den=1)
         rife_interp_1080p = rife_low.std.SelectEvery(2, [1])
-        interp_4k = apply_fsrcnnx(rife_interp_1080p, family="16-layer")
+        interp_4k = apply_fsrcnnx(rife_interp_1080p, family=sr_family_4k)
         if interp_4k.width == src_4k.width and interp_4k.height == src_4k.height:
             clip = core.std.Interleave([src_4k, interp_4k])
         else:
@@ -713,11 +721,14 @@ if not rife_disabled() and fps <= 30:
             clip = interp_4k
         fsrcnnx_applied = True
 
-# h ≤ 720 needs 16-layer family (select_variant refuses 8-layer at
-# ratio ≥ 2.5); 1080p works with 8-layer (faster on the GB10). 4K
-# mixed-mode handled its own FSRCNNX call above.
+# h ≤ 720 always uses 16-layer (select_variant refuses 8-layer at
+# ratio ≥ 2.5). 1080p picks 16-layer at cinema rates, 8-layer at 25+ fps.
+# 4K mixed-mode handled its own FSRCNNX call above.
 if not fsrcnnx_applied:
-    family = "16-layer" if h <= 720 else "8-layer"
+    if h <= 720:
+        family = "16-layer"
+    else:
+        family = "16-layer" if heavy_fps else "8-layer"
     clip = apply_fsrcnnx(clip, family=family)
 
 clip.set_output()

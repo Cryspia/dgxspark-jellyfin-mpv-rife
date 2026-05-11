@@ -59,9 +59,16 @@ engine（一次 30–60 秒，之后缓存在
 | 源分辨率 | 帧率 | RIFE | FSRCNNX (auto) |
 |---|---|---|---|
 | ≤ 720p | ≤ 30 fps | 4.26 @ scale=1.0 | x3_16 / x4_16（按比例） |
-| 720p < h ≤ 1080p | ≤ 30 fps | 4.6 @ scale=1.0 | x2_8 |
-| 1080p < h ≤ 2160p | ≤ 30 fps | mixed 模式（见下文）| interp 上 x2_16 |
+| 720p < h ≤ 1080p | < 25 fps（电影帧率） | 4.26 @ scale=1.0 | x2_16 |
+| 720p < h ≤ 1080p | 25–30 fps | 4.6 @ scale=1.0 | x2_8 |
+| 1080p < h ≤ 2160p | < 25 fps（电影帧率） | mixed 模式，interp 用 4.26 | interp 上 x2_16 |
+| 1080p < h ≤ 2160p | 25–30 fps | mixed 模式，interp 用 4.6 | interp 上 x2_8 |
 | 任意 | > 30 fps | 关 | 比例满足时仍跑 |
+
+25 fps 阈值是预算分界：≤24 fps 源 × 2 → 48 fps 输出 → 20.8 ms/帧，
+重链（RIFE 4.26 + 16-layer FSRCNNX）刚好能装下。25+ fps 时输出预算
+压到 16.7 ms，重链装不下 —— 所以 25/29.97/30 fps 内容走轻链
+（4.6 + 8-layer）。
 
 4K 档走 **mixed 模式**：real 帧原 4K bit-exact passthrough，仅合成的
 interp 帧走下采样 → RIFE → SR 升回 4K 这条路。因为链只在一半帧上跑，
