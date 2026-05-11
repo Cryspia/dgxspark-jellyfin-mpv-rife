@@ -163,7 +163,7 @@ config reference, and troubleshooting.
 | `~/miniforge3/envs/vsmpv/` | Conda env: python, mpv, vapoursynth, vsrife, shim, tensorrt |
 | `~/.config/mpv/{mpv,input}.conf, rife.vpy, vs_gpu_helpers.py, sr_keys_helper.py` | Our config + helpers |
 | `~/.config/mpv/scripts/sr_keys.lua` | F8 / F9 keybind logic |
-| `~/.config/mpv/scripts/fsrcnnx-cudnn/` | Upstream fsrcnnx-cudnn bundle (Python pkg + .npz weights) |
+| `~/.config/mpv/fsrcnnx-cudnn/` | Upstream fsrcnnx-cudnn bundle (Python pkg + .npz weights) |
 | `~/.config/mpv/scripts/dandanplay/` | Danmaku script bundle |
 | `~/.config/jellyfin-mpv-shim/conf.json` | Shim's own config (server creds, etc.) |
 | `~/.config/jellyfin-mpv-shim/{mpv,input}.conf, rife.vpy, …` | Symlinks to `~/.config/mpv/` |

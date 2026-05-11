@@ -788,19 +788,25 @@ _t.Thread(target=_prewarm, daemon=True, name="rife-prewarm").start()
 EOF
   log "wrote $MPV_CFG_DIR/rife.vpy"
 
-  # Old per-band .vpy files / shader dir / in-tree weights have been
-  # superseded — clean up stale copies from previous installs.
+  # Old per-band .vpy files / shader dir / in-tree weights / old bundle
+  # location under scripts/ have all been superseded — clean stale
+  # copies from previous installs. The old `scripts/fsrcnnx-cudnn/`
+  # path caused mpv to log "Cannot find main.* in scripts/<subdir>"
+  # on every startup because mpv's multi-file-script convention wants
+  # `main.{lua,js,py,mjs}` as the entry, which the bundle doesn't
+  # ship. We host the bundle outside `scripts/` now to dodge that.
   rm -f  "$MPV_CFG_DIR/rife-light.vpy" "$MPV_CFG_DIR/rife-half.vpy"
-  rm -rf "$MPV_CFG_DIR/shaders" "$MPV_CFG_DIR/weights" "$MPV_CFG_DIR/fsrcnnx_cudnn"
+  rm -rf "$MPV_CFG_DIR/shaders" "$MPV_CFG_DIR/weights" \
+         "$MPV_CFG_DIR/fsrcnnx_cudnn" "$MPV_CFG_DIR/scripts/fsrcnnx-cudnn"
 
   # FSRCNNX cuDNN super-resolution: pull the upstream release bundle
-  # (Python pkg + .npz weights) and extract under scripts/. Pinned by
-  # tag so re-installing reproduces a known-good version. See
+  # (Python pkg + .npz weights) and extract to ~/.config/mpv/. Pinned
+  # by tag so re-installing reproduces a known-good version. See
   # https://github.com/Cryspia/fsrcnnx-cudnn for the source / weights /
   # benchmarks — fsrcnnx_yuv_auto, family, ratio gating etc. all live
   # there.
   local fsrcnnx_bundle_url="https://github.com/Cryspia/fsrcnnx-cudnn/releases/download/${FSRCNNX_CUDNN_VERSION}/fsrcnnx-cudnn-bundle.tar.gz"
-  local fsrcnnx_dir="$MPV_CFG_DIR/scripts/fsrcnnx-cudnn"
+  local fsrcnnx_dir="$MPV_CFG_DIR/fsrcnnx-cudnn"
   if [[ -f "$fsrcnnx_dir/.installed-version" ]] && \
      [[ "$(cat "$fsrcnnx_dir/.installed-version" 2>/dev/null)" == "$FSRCNNX_CUDNN_VERSION" ]]; then
     log "fsrcnnx-cudnn $FSRCNNX_CUDNN_VERSION already installed at $fsrcnnx_dir/"
@@ -810,10 +816,18 @@ EOF
     curl -fsSL -o "$tmp_bundle" "$fsrcnnx_bundle_url" || \
       fatal "failed to download $fsrcnnx_bundle_url"
     rm -rf "$fsrcnnx_dir"
-    tar -xzf "$tmp_bundle" -C "$MPV_CFG_DIR/scripts/"
+    tar -xzf "$tmp_bundle" -C "$MPV_CFG_DIR/"
     rm -f "$tmp_bundle"
+
+    # Strip the upstream stand-alone entry points. We use the Python
+    # package + weights directly from rife.vpy / sr_keys_helper.py;
+    # the lua + companion .vpy are for fsrcnnx-cudnn's solo install
+    # mode (which `vf-add`s its own vapoursynth filter — would
+    # double-stack on top of our rife.vpy if it ever fired).
+    rm -f "$fsrcnnx_dir/fsrcnnx_auto.lua" "$fsrcnnx_dir/fsrcnnx_sr.vpy"
+
     echo "$FSRCNNX_CUDNN_VERSION" > "$fsrcnnx_dir/.installed-version"
-    log "installed fsrcnnx-cudnn → $fsrcnnx_dir/"
+    log "installed fsrcnnx-cudnn → $fsrcnnx_dir/ (package + weights only)"
   fi
 }
 
@@ -1313,7 +1327,7 @@ PY
            "$MPV_CFG_DIR/rife.vpy" "$MPV_CFG_DIR/sr_keys_helper.py" \
            "$MPV_CFG_DIR/vs_gpu_helpers.py" \
            "$MPV_CFG_DIR/scripts/sr_keys.lua" \
-           "$MPV_CFG_DIR/scripts/fsrcnnx-cudnn/.installed-version" \
+           "$MPV_CFG_DIR/fsrcnnx-cudnn/.installed-version" \
            "$MPV_CFG_DIR/scripts/dandanplay/main.lua" \
            "$MPV_CFG_DIR/scripts/dandanplay/danmaku_helper.py" \
            "$MPV_CFG_DIR/danmaku-config.json" \
@@ -1410,7 +1424,8 @@ cmd_uninstall() {
     rm -f "$MPV_CFG_DIR/$f"
   done
   rm -rf "$MPV_CFG_DIR/scripts" "$MPV_CFG_DIR/shaders" \
-         "$MPV_CFG_DIR/weights" "$MPV_CFG_DIR/fsrcnnx_cudnn"
+         "$MPV_CFG_DIR/weights" "$MPV_CFG_DIR/fsrcnnx_cudnn" \
+         "$MPV_CFG_DIR/fsrcnnx-cudnn"
   # Preserved (not deleted):
   #   $MPV_CFG_DIR/danmaku-credentials.json   ← dandanplay AppId/Secret
   #   $MPV_CFG_DIR/danmaku-settings.json      ← user's panel choices

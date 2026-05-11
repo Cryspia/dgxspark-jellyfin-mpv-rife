@@ -10,10 +10,13 @@ Side-channel files (under /tmp, kernel-cleaned across reboots):
                                 cycle's current position
 
 The fsrcnnx-cudnn package + weights are installed by install.sh from
-the upstream release bundle to ~/.config/mpv/scripts/fsrcnnx-cudnn/
-(matches the layout documented in the upstream README). We add that
-directory to sys.path here so `from fsrcnnx_cudnn.vsfunc import …`
-resolves regardless of how the package was installed.
+the upstream release bundle to ~/.config/mpv/fsrcnnx-cudnn/. We host
+it next to mpv.conf rather than under scripts/ because mpv treats
+each scripts/<subdir>/ as a multi-file-script package wanting a
+`main.{lua,js,py,mjs}` entry — the bundle doesn't ship that, so
+putting it there triggers "Cannot find main.*" warnings on startup.
+We add the bundle directory to sys.path here so
+`from fsrcnnx_cudnn.vsfunc import …` resolves regardless.
 """
 
 import os
@@ -29,7 +32,7 @@ _MPV_HOME = Path(
     (os.environ.get("XDG_CONFIG_HOME") or
      os.path.expanduser("~/.config")) + "/mpv"
 )
-FSRCNNX_BUNDLE = _MPV_HOME / "scripts" / "fsrcnnx-cudnn"
+FSRCNNX_BUNDLE = _MPV_HOME / "fsrcnnx-cudnn"
 if FSRCNNX_BUNDLE.exists() and str(FSRCNNX_BUNDLE) not in sys.path:
     sys.path.insert(0, str(FSRCNNX_BUNDLE))
 
