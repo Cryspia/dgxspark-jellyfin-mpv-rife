@@ -91,7 +91,7 @@ DEFAULT_VIDEO_MIMES=(
 # fsrcnnx-cudnn release tag pulled by install_configs. Bumping this
 # fetches a different bundle from
 # https://github.com/Cryspia/fsrcnnx-cudnn/releases/download/<tag>/fsrcnnx-cudnn-bundle.tar.gz
-FSRCNNX_CUDNN_VERSION="v0.1"
+FSRCNNX_CUDNN_VERSION="v0.1.1"
 
 # Mirrors (USTC for China)
 USTC_CONDA_FORGE="https://mirrors.ustc.edu.cn/anaconda/cloud"
@@ -824,7 +824,11 @@ EOF
     # the lua + companion .vpy are for fsrcnnx-cudnn's solo install
     # mode (which `vf-add`s its own vapoursynth filter — would
     # double-stack on top of our rife.vpy if it ever fired).
-    rm -f "$fsrcnnx_dir/fsrcnnx_auto.lua" "$fsrcnnx_dir/fsrcnnx_sr.vpy"
+    # Both names handled: pre-v0.1.1 bundle had `fsrcnnx_auto.lua`,
+    # v0.1.1+ renamed it to `main.lua`.
+    rm -f "$fsrcnnx_dir/main.lua" \
+          "$fsrcnnx_dir/fsrcnnx_auto.lua" \
+          "$fsrcnnx_dir/fsrcnnx_sr.vpy"
 
     echo "$FSRCNNX_CUDNN_VERSION" > "$fsrcnnx_dir/.installed-version"
     log "installed fsrcnnx-cudnn → $fsrcnnx_dir/ (package + weights only)"
