@@ -32,15 +32,18 @@ Public API
 
 Limitations
 -----------
-- Input must be YUV420P10 (the production target). YUV420P8/16,
-  YUV422 / 444 etc. raise vs.Error — keeps the matrix code lean.
+- Input must be YUV420P10. Other YUV bit-depths and subsamplings
+  (YUV420P8/16, YUV422, YUV444) should be normalised upstream via
+  `core.resize.Bicubic(format=vs.YUV420P10)` — rife.vpy does this
+  before calling us, so the function stays strict on its own input.
 - Color matrices supported: BT.709, BT.2020 NCL, BT.601 (smpte170m).
   Chosen per-frame from the source's `_Matrix` prop. HDR PQ/HLG
   works because the matrix is the same in non-linear domain — RIFE
   has always operated on PQ-encoded RGB, not linearized light.
-- TV (limited) range is assumed; this matches mpv's typical playback.
-  Full-range input would need a `_ColorRange` prop check; not done
-  yet because it doesn't come up in the streaming workflow we target.
+- Both limited (TV) and full (PC) ranges are supported via the
+  `color_range` kwarg to `rife_yuv`. Game streaming (Moonlight,
+  NVENC), Parsec, ShadowPlay recordings typically encode full-range
+  YUV; the rife.vpy reads `_ColorRange` and passes it through.
 """
 
 from __future__ import annotations
