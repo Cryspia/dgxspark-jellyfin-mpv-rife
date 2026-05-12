@@ -41,6 +41,9 @@ interpolation + FSRCNNX luma upscaling** stack on **NVIDIA DGX Spark**
   Vision ICtCp matrix, RGB input, float YUV, etc.) hits a guarded
   fallback that passes the source through unmodified.
 
+  Internal working format: 4:4:4 collapses to 4:2:2, 4:2:2 stays at
+  4:2:2, everything else normalises to 4:2:0.
+
   Color accuracy: the YUV → RGB → YUV roundtrip on real content is
   bit-exact on Y and within 1 LSB on average for U/V, slightly more
   precise than zimg's CPU path (zimg's RGB48 intermediate has ~5 LSB

@@ -35,6 +35,8 @@ FSRCNNX 亮度超分**，全部跑在一个 Miniforge conda 环境里。
   的（Dolby Vision ICtCp matrix、RGB 输入、float YUV 等）会触发
   guarded fallback，把源原样 passthrough 出去。
 
+  内部工作格式：4:4:4 收成 4:2:2，4:2:2 保留，其他统一转 4:2:0。
+
   色彩精度：在实际内容上 YUV → RGB → YUV 的 roundtrip Y 通道
   **bit-exact**，U/V 通道平均 1 LSB 内，比 zimg 的 CPU 路径还略高
   （zimg 的 RGB48 中转有约 5 LSB 的 Y 整数舍入损失，我们 RGB 中间态
