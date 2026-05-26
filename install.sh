@@ -921,6 +921,12 @@ EOF
 SYS_GIR="/usr/lib/aarch64-linux-gnu/girepository-1.0"
 export GI_TYPELIB_PATH="\${GI_TYPELIB_PATH:+\$GI_TYPELIB_PATH:}\$SYS_GIR"
 export PYTHONHOME="$ENV_PREFIX"
+# Source the dual-machine cluster config so DUAL_WORKER_HOST + DUAL_RDMA_*
+# are visible to rife.vpy when the shim spawns mpv; without these in env,
+# rife.vpy short-circuits to single-machine mode (see rife.vpy:155).
+if [[ -f "$DUAL_CFG_FILE" ]]; then
+  set -a; . "$DUAL_CFG_FILE"; set +a
+fi
 exec "$ENV_PREFIX/bin/jellyfin-mpv-shim" "\$@"
 EOF
   chmod +x "$WRAPPER_DIR/jellyfin-mpv-shim"
