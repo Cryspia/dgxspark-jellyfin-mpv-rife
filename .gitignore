@@ -29,3 +29,8 @@ cred.json
 # Python
 __pycache__/
 *.pyc
+dual_machine/vs_gpu_helpers.py
+
+# Bench test clips — generated locally via bench/gen_clips.sh
+bench/clips/*.mp4
+bench/clips/*.mkv

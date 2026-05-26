@@ -93,6 +93,27 @@ DEFAULT_VIDEO_MIMES=(
 # https://github.com/Cryspia/fsrcnnx-cudnn/releases/download/<tag>/fsrcnnx-cudnn-bundle.tar.gz
 FSRCNNX_CUDNN_VERSION="v0.1.1"
 
+# Dual-machine layout. The host's mpv reads DUAL_* from this file (via
+# the mpv-conda wrapper); the secondary box's systemd worker service
+# reads it via EnvironmentFile.
+DUAL_CFG_DIR="$HOME/.config/dgxspark-mpv"
+DUAL_CFG_FILE="$DUAL_CFG_DIR/dual.conf"
+DUAL_WORKER_DIR="$HOME/dual_machine"
+DUAL_WORKER_SERVICE="dgxspark-dual-worker.service"
+DUAL_TRAY_DESKTOP="dgxspark-dual-secondary.desktop"
+DUAL_TRAY_AUTOSTART="$HOME/.config/autostart/$DUAL_TRAY_DESKTOP"
+
+# Default cluster config — used as fallback when neither env nor
+# interactive input provides a value. Override per-install via
+# DUAL_HOST_IP / DUAL_WORKER_IP / DUAL_RDMA_DEV / etc env vars.
+DUAL_DEFAULT_RDMA_PORT=29900
+DUAL_DEFAULT_LIVENESS_PORT=29905
+
+# Install-mode flags (set by cmd_install argv parsing). At most one of
+# the two dual flags can be set at a time.
+INSTALL_DUAL_HOST=0
+INSTALL_DUAL_SECONDARY=0
+
 # Mirrors (USTC for China)
 USTC_CONDA_FORGE="https://mirrors.ustc.edu.cn/anaconda/cloud"
 USTC_PYPI="https://pypi.mirrors.ustc.edu.cn/simple/"
@@ -333,6 +354,9 @@ install_pip_packages() {
 
   # TensorRT for the high-perf RIFE backend
   pip install tensorrt torch_tensorrt
+  # fsrcnnx-cudnn imports the Python frontend (`import cudnn`) at
+  # runtime — distinct from the runtime library `nvidia-cudnn-cu*`.
+  pip install nvidia-cudnn-frontend
 
   log "verifying versions:"
   python - <<'PY'
@@ -457,14 +481,22 @@ dither-depth=auto
 secondary-sub-ass-override=no
 secondary-sub-pos=0
 
-# FSRCNNX SR is now done inside vapoursynth (chained after rife_yuv
-# in each rife*.vpy via fsrcnnx_cudnn.vsfunc.fsrcnnx_yuv_auto). The
-# old GLSL shader path is disabled here to avoid double-upscale.
-# Restore by removing the leading `#` if you want to A/B test.
-#glsl-shaders=~~/shaders/FSRCNNX_x2_8-0-4-1.glsl
+# FSRCNNX SR is now done inside vapoursynth (chained after rife_yuv in
+# rife.vpy via fsrcnnx_cudnn.vsfunc.fsrcnnx_yuv_auto) — the legacy
+# FSRCNNX GLSL is intentionally disabled to avoid double-upscale.
+#
+# KrigBilateral.glsl: luma-guided kriging chroma upsampler (Shiandow).
+# Runs in mpv's display chroma stage — orthogonal to the in-vapoursynth
+# krig: that one upsamples src chroma to luma dim BEFORE FSRCNNX; this
+# one upsamples the FSRCNNX-output chroma (or any 4:2:0 source's chroma)
+# to display luma dim BEFORE the YUV→RGB matrix. Quality > the default
+# bilinear chroma scaler. Shift+F8 toggles at runtime.
+glsl-shaders=~~/shaders/KrigBilateral.glsl
 
-# RIFE + FSRCNNX. Single .vpy. F8 cycles FSRCNNX variant, F9 toggles RIFE.
-# See scripts/sr_keys.lua for the keybinds.
+# RIFE + FSRCNNX. Single .vpy. F8 toggles SR (single: cycle variant /
+# dual: on/off). F9 toggles INTERP (single: on/off / dual: cycle
+# 4 -> 3 -> 2 -> 1[SR-only] -> 4). See scripts/sr_keys.lua and
+# scripts/warmup.lua for the keybinds + cold-start pre-roll.
 #
 #   h ≤ 720         RIFE 4.26 + FSRCNNX family=16-layer (auto x3/x4)
 #   720 < h ≤ 1080  RIFE 4.6  + FSRCNNX family=8-layer  (auto x2_8)
@@ -476,12 +508,19 @@ secondary-sub-pos=0
 # `or 0` sentinel: at the first profile-cond evaluation (before the
 # demuxer fills video-params/h) the property is nil; defaulting to 0
 # fails the gate so the vf isn't briefly attached then ripped off.
-# `buffered-frames=12 / concurrent-frames=4` — deeper than vapoursynth's
-# defaults so the vs scheduler can overlap encode → infer → SR work.
+# `concurrent-frames=24 / buffered-frames=12` — must be ≥ ~16 or mpv's
+# vsapi per-call overhead (~16 ms gap between consecutive compute_callable
+# invocations) caps real-playback throughput at ~30 fps regardless of how
+# fast the filter chain itself is. With CF=24 mpv saturates at its
+# internal cap of 20 concurrent requests, which matches the bench config
+# the steady-state numbers in docs/performance.md were measured under.
+# bf=12 (not 24): at 4K source bf>16 starts to hurt filter throughput by
+# ~6 fps as the scheduler over-prefetches and pressures GPU memory; bf=12
+# keeps the pre-buffer healthy for playback smoothness without that hit.
 [rife]
 profile-cond=0<(p["video-params/h"] or 0) and (p["video-params/h"] or 0)<=2160
 profile-restore=copy-equal
-vf=vapoursynth=~~/rife.vpy:buffered-frames=12:concurrent-frames=4
+vf=vapoursynth=~~/rife.vpy:buffered-frames=12:concurrent-frames=24
 EOF
   log "wrote $MPV_CFG_DIR/mpv.conf"
 
@@ -489,135 +528,49 @@ EOF
   # variant / toggle RIFE). Header here is just documentation; the keys
   # themselves come from the lua script.
   cat > "$MPV_CFG_DIR/input.conf" <<'EOF'
-# F8 / F9 — bound by scripts/sr_keys.lua:
-#   F8: cycle FSRCNNX variant (16x4 → 16x3 → 16x2 → 8x2 → loop). Default
-#       starting point is whatever fsrcnnx_yuv_auto picks for the current
-#       source on this display (4K by default; override via env vars
-#       FSRCNNX_TARGET_W / FSRCNNX_TARGET_H). Per-file, returns to auto
-#       on the next file-load.
-#   F9: toggle RIFE on/off independent of FSRCNNX. Persists across files.
+# Keybinds bound by scripts/sr_keys.lua:
+#   F8:        SR toggle.
+#                * single mode: cycle FSRCNNX variant (x4_16 → x3_16 →
+#                  x2_16 → x2_8 → off → loop). Per-file.
+#                * dual mode:   on/off only (the bucket auto-picks
+#                  variant). 4K-DS source rejects OFF (RIFE-DS needs SR
+#                  to upscale back).
+#   F9:        interp toggle / multiplier.
+#                * single mode: toggle RIFE on/off.
+#                * dual mode:   cycle 4 → 3 → 2 → off → 4. OFF disables
+#                  the whole dual chain and drops to single SR-only.
+#   Shift+F8:  toggle KrigBilateral chroma GLSL (display-stage chroma
+#              upsample). Persists across files. Instant — no vf reload.
+#   Shift+F9:  toggle dual-machine offload (no-op when DUAL_WORKER_HOST
+#              isn't configured). Persists across files.
 #
-# Both keys force a vapoursynth filter reload (~1–3 s freeze) — there's
-# no runtime parameter switch inside the cuDNN runner.
+# F8 / F9 / Shift+F9 force a vapoursynth filter reload (~1–3 s freeze)
+# because there's no runtime parameter switch inside our chain — we
+# rebuild it. Shift+F8 only flips an mpv property and is instant.
 EOF
   log "wrote $MPV_CFG_DIR/input.conf"
 
-  # sr_keys.lua — F8 cycles FSRCNNX variant via /tmp/fsrcnnx_variant
-  # override file, F9 toggles RIFE on/off via /tmp/rife_disabled. Both
-  # force a vf reload so the .vpy re-reads the side-channel files.
-  cat > "$MPV_CFG_DIR/scripts/sr_keys.lua" <<'EOF'
--- F8 — cycle FSRCNNX variant.        F9 — toggle RIFE on/off.
---
--- Both keys force a vapoursynth filter reload (~1–3 s freeze) because
--- there's no runtime parameter switch inside our chain — we re-build it.
---
--- Communication with the .vpy chain (file-based, so any vf reload picks
--- up the new state):
---   /tmp/fsrcnnx_variant         — override variant. Empty/missing =
---                                  auto. Otherwise "x2_8" / "x2_16" /
---                                  "x3_16" / "x4_16". Written by F8.
---                                  Cleared on file-loaded (return to
---                                  auto for each new video).
---   /tmp/fsrcnnx_active_variant  — what the .vpy is currently running
---                                  (auto-resolved). Written by the
---                                  .vpy. Read by F8 to know the cycle's
---                                  current position.
---   /tmp/rife_disabled           — touch-file. If present, .vpy skips
---                                  rife_yuv. Toggled by F9. Persists
---                                  across files.
---
--- Default state on first file load: F8 = auto, F9 = enabled.
+  # sr_keys.lua — keybind handler for F8 / F9 / Shift+F8 / Shift+F9.
+  # See its own header for the full mapping; install.sh just installs.
+  cp -f "$PROJECT_DIR/scripts/sr_keys.lua" "$MPV_CFG_DIR/scripts/sr_keys.lua"
+  log "copied scripts/sr_keys.lua to $MPV_CFG_DIR/scripts/"
 
-local mp = require "mp"
+  # warmup.lua — pause + pre-render 1 s of frames at file-loaded so the
+  # cold cuDNN / RIFE / FSRCNNX graphs land before playback starts.
+  # Both single and dual paths benefit. WARMUP_DISABLE=1 in env → no-op.
+  cp -f "$PROJECT_DIR/scripts/warmup.lua" "$MPV_CFG_DIR/scripts/warmup.lua"
+  log "copied scripts/warmup.lua to $MPV_CFG_DIR/scripts/"
 
-local OVERRIDE_FILE = "/tmp/fsrcnnx_variant"
-local ACTIVE_FILE   = "/tmp/fsrcnnx_active_variant"
-local RIFE_OFF_FILE = "/tmp/rife_disabled"
+  # dual_seek_flush.lua — bumps /tmp/dual_machine_seek_epoch on every
+  # mpv seek so the dual-machine dispatcher's epoch watcher can flush
+  # stale in-flight queue_mgr state. Without this, any seek freezes
+  # dual-mode mpv for 30-40 s while wait_phase_done sits on an mpv VA
+  # gate that the seek made unreachable. DUAL_SEEK_FLUSH_DISABLE=1 to
+  # opt out.
+  cp -f "$PROJECT_DIR/scripts/dual_seek_flush.lua" \
+        "$MPV_CFG_DIR/scripts/dual_seek_flush.lua"
+  log "copied scripts/dual_seek_flush.lua to $MPV_CFG_DIR/scripts/"
 
--- Cycle includes "off" as the final stop so F8 can fully bypass FSRCNNX.
--- When the .vpy reads /tmp/fsrcnnx_variant == "off", it skips the SR pass
--- entirely and outputs the post-RIFE clip (or the source if F9 is also
--- off). Pressing F8 from "off" wraps back to "x4_16".
-local CYCLE = { "x4_16", "x3_16", "x2_16", "x2_8", "off" }
-
-local function cycle_index(variant)
-  for i, v in ipairs(CYCLE) do
-    if v == variant then return i end
-  end
-  return nil
-end
-
-local function read_file(path)
-  local fh = io.open(path, "r")
-  if not fh then return nil end
-  local s = fh:read("*all")
-  fh:close()
-  return s and s:match("^%s*(.-)%s*$") or nil
-end
-
-local function write_file(path, s)
-  local fh = io.open(path, "w")
-  if not fh then return false end
-  fh:write(s); fh:close()
-  return true
-end
-
-local function file_exists(path)
-  local fh = io.open(path, "r")
-  if fh then fh:close(); return true end
-  return false
-end
-
-local function reload_vf()
-  -- Clear-then-restore is the most reliable way to force a re-exec
-  -- of the .vpy. `vf-command` doesn't reach inside vapoursynth.
-  local current = mp.get_property("vf")
-  if not current or current == "" then return end
-  mp.set_property("vf", "")
-  mp.set_property("vf", current)
-end
-
-local function cycle_fsrcnnx()
-  local active = read_file(ACTIVE_FILE)
-  if not active or active == "" or active == "none" then
-    -- Chain is currently bypassing FSRCNNX (e.g. 4K → 4K, ratio < 1.3).
-    -- Start the cycle from the front rather than refusing.
-    active = CYCLE[#CYCLE]   -- so next = CYCLE[1] = x4_16
-  end
-  local idx = cycle_index(active)
-  local next_idx = (idx and (idx % #CYCLE) + 1) or 1
-  local next_variant = CYCLE[next_idx]
-
-  write_file(OVERRIDE_FILE, next_variant)
-  local label = (next_variant == "off") and "OFF" or next_variant
-  mp.osd_message(string.format("FSRCNNX → %s (reloading…)", label), 2)
-  reload_vf()
-end
-
-local function toggle_rife()
-  if file_exists(RIFE_OFF_FILE) then
-    os.remove(RIFE_OFF_FILE)
-    mp.osd_message("RIFE: ON (reloading…)", 2)
-  else
-    write_file(RIFE_OFF_FILE, "")
-    mp.osd_message("RIFE: OFF (reloading…)", 2)
-  end
-  reload_vf()
-end
-
-local function reset_on_file_load()
-  -- F8 (FSRCNNX variant) resets per file — each video gets its own
-  -- auto-pick starting point. F9 (RIFE on/off) persists, since it's
-  -- a global preference rather than per-source tuning.
-  os.remove(OVERRIDE_FILE)
-  os.remove(ACTIVE_FILE)
-end
-
-mp.add_key_binding("F8", "fsrcnnx-cycle", cycle_fsrcnnx)
-mp.add_key_binding("F9", "rife-toggle",   toggle_rife)
-mp.register_event("file-loaded", reset_on_file_load)
-EOF
-  log "wrote $MPV_CFG_DIR/scripts/sr_keys.lua"
 
   # sr_keys_helper.py — Python helper imported by the rife*.vpy files.
   # Reads the side-channel files written by sr_keys.lua and applies
@@ -638,183 +591,30 @@ EOF
   # clip.height picks the right RIFE model and FSRCNNX family.
   # F8 / F9 keybinds (scripts/sr_keys.lua) override variant / RIFE-on
   # at runtime via /tmp/fsrcnnx_variant and /tmp/rife_disabled.
-  cat > "$MPV_CFG_DIR/rife.vpy" <<'EOF'
-# Unified RIFE + FSRCNNX pipeline.
-#
-# F8 cycles FSRCNNX variant (16x4 → 16x3 → 16x2 → 8x2 → OFF → loop).
-# F9 toggles RIFE on/off independently. Both bound by scripts/sr_keys.lua.
-#
-#   h ≤ 720         RIFE 4.26 + scale=1.0  + FSRCNNX family=16-layer
-#   720 < h ≤ 1080  RIFE 4.6  + scale=1.0  + FSRCNNX family=8-layer
-#   1080 < h ≤ 2160 mixed mode — original 4K real frames passthrough;
-#                   interp frames go through downsample → RIFE 4.26 →
-#                   FSRCNNX 16-layer → upsample back to 4K
-#   fps > 30        RIFE skipped, FSRCNNX still runs if ratio merits
-
-import os, sys
-from pathlib import Path
-
-try:
-    HERE = Path(__file__).resolve().parent
-except NameError:
-    HERE = Path(os.environ.get("MPV_HOME") or
-                 os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-                 + "/mpv").resolve()
-sys.path.insert(0, str(HERE))
-
-import vapoursynth as vs
-import vsrife
-from vs_gpu_helpers import rife_yuv
-from sr_keys_helper import apply_fsrcnnx, rife_disabled
-
-core = vs.core
-clip = video_in
-
-# Defensive guard: if anything in chain construction fails — RGB / 4:2:2 /
-# 4:4:4 / float YUV / Dolby Vision ICtCp / missing weights / cuDNN graph
-# build error — pass the source through unmodified. mpv would auto-disable
-# the filter on failure anyway and play the bare source; doing it here
-# explicitly avoids the scary "filter failed" log line and keeps the
-# user's playback uninterrupted. For exotic formats the interpolation
-# wouldn't have kept up at vsync anyway, so the trade is fine.
-try:
-    # Whitelist the colour properties we actually support. The chain's
-    # YUV↔RGB math hard-codes BT.709/601/2020 matrices; anything else
-    # (Dolby Vision ICtCp, niche HDR variants) would silently produce
-    # wrong colours rather than crash. Catch those at init and bail to
-    # passthrough. Both limited (TV, default for streaming/Blu-ray)
-    # and full (PC, common for game streaming / screen recordings)
-    # ranges are supported via the color_range parameter to rife_yuv.
-    _KNOWN_MATRICES = {1, 5, 6, 7, 9, 10}    # 709, 170m, 240m, 2020ncl
-    _MATRIX_S = {1: "709", 5: "470bg", 6: "170m", 7: "240m",
-                 9: "2020ncl", 10: "2020cl"}
-    _src_props = clip.get_frame(0).props
-    _matrix = int(_src_props.get("_Matrix", 1))
-    _color_range_int = int(_src_props.get("_ColorRange", 1))
-    if _matrix not in _KNOWN_MATRICES:
-        raise RuntimeError(f"unsupported _Matrix={_matrix} "
-                             f"(known: {sorted(_KNOWN_MATRICES)})")
-    if _color_range_int not in (0, 1):
-        raise RuntimeError(f"unsupported _ColorRange={_color_range_int} "
-                             f"(need 0=full or 1=limited)")
-    color_range = "full" if _color_range_int == 0 else "limited"
-    matrix_s = _MATRIX_S[_matrix]
-
-    h = clip.height
-    fps = (clip.fps_num / clip.fps_den) if clip.fps_den else 24.0
-    # Cinema-rate (≤24 fps) sources have a 20.8 ms/frame budget at 2×
-    # output; 25–30 fps sources tighten to 16.7 ms/frame at 60 fps. The
-    # heavy chain (4.26 + 16-layer) fits the cinema budget but blows
-    # past 16.7 ms — fall back to lighter (4.6 + 8-layer) above 24 fps.
-    heavy_fps = fps < 25
-
-    # Pick the working format: 4:2:2 / 4:4:4 inputs stay (or collapse to)
-    # 4:2:2 to keep the extra chroma fidelity; everything else lands at
-    # 4:2:0. rife_yuv's GPU YUV↔RGB path is 4:2:0-only, so the 4:2:2
-    # branch falls back to vsrife direct with zimg YUV↔RGB — measured
-    # within ~0.4% of the 4:2:0 fast path on this hardware because zimg
-    # runs concurrently with the GPU rife/SR work.
-    _sw, _sh = clip.format.subsampling_w, clip.format.subsampling_h
-    keep_422 = (_sw == 1 and _sh == 0) or (_sw == 0 and _sh == 0)
-    target_fmt = vs.YUV422P10 if keep_422 else vs.YUV420P10
-    if clip.format.id != int(target_fmt):
-        clip = core.resize.Bicubic(clip, format=target_fmt)
-
-    def _rife(c, model, scale=1.0):
-        """4:2:0: rife_yuv (GPU YUV↔RGB, fast path). 4:2:2: vsrife
-        direct with zimg YUV↔RGB. Both produce a YUV clip with the same
-        subsampling as the input."""
-        if c.format.id == int(vs.YUV420P10):
-            return rife_yuv(c, model=model, scale=scale,
-                            factor_num=2, factor_den=1, color_range=color_range)
-        rgb = core.resize.Bicubic(c, format=vs.RGBH,
-                                   matrix_in_s=matrix_s, range_in_s=color_range)
-        rgb = vsrife.rife(rgb, model=model, scale=scale,
-                           factor_num=2, factor_den=1, trt=True)
-        return core.resize.Bicubic(rgb, format=c.format.id,
-                                    matrix_s=matrix_s, range_s=color_range)
-
-    fsrcnnx_applied = False
-    if not rife_disabled() and fps <= 30:
-        if h <= 720:
-            clip = _rife(clip, "4.26")
-        elif h <= 1080:
-            clip = _rife(clip, "4.26" if heavy_fps else "4.6")
-        else:  # 1080 < h ≤ 2160 — 4K mixed mode.
-               # Full 4K RIFE is too heavy on GB10 (~25 fps pipelined); even
-               # scale=0.5 half-flow can't sustain 48fps (~38 fps). So we
-               # downsample to 1080p, run RIFE there, take ONLY the interp
-               # frames, SR them back to 4K, and Interleave with the
-               # original 4K source. Real frames stay bit-exact; only the
-               # synthesized in-between frames pay the downsample+SR cost.
-               #
-               # On the half-the-frames budget, ≤24 fps sources can afford
-               # the heavier interp chain (RIFE 4.26 + 16-layer FSRCNNX);
-               # 25+ fps falls back to the lighter (4.6 + 8-layer) variant
-               # to stay under the tighter 60 fps output budget.
-            src_4k = clip
-            target_h = 1080
-            target_w = ((clip.width * target_h) // clip.height) & ~1
-            down = core.resize.Bicubic(clip, width=target_w, height=target_h)
-            rife_model  = "4.26" if heavy_fps else "4.6"
-            sr_family_4k = "16-layer" if heavy_fps else "8-layer"
-            rife_low = _rife(down, rife_model)
-            rife_interp_1080p = rife_low.std.SelectEvery(2, [1])
-            interp_4k = apply_fsrcnnx(rife_interp_1080p, family=sr_family_4k)
-            if interp_4k.width == src_4k.width and interp_4k.height == src_4k.height:
-                clip = core.std.Interleave([src_4k, interp_4k])
-            else:
-                # F8 forced FSRCNNX off / x3 / x4 — interp_4k isn't at 4K
-                # so we can't Interleave. Fall back to the SR chain
-                # directly (no original-frame preservation; mpv display
-                # path handles fit).
-                clip = interp_4k
-            fsrcnnx_applied = True
-
-    # h ≤ 720 always uses 16-layer (select_variant refuses 8-layer at
-    # ratio ≥ 2.5). 1080p picks 16-layer at cinema rates, 8-layer at
-    # 25+ fps. 4K mixed-mode handled its own FSRCNNX call above.
-    if not fsrcnnx_applied:
-        if h <= 720:
-            family = "16-layer"
-        else:
-            family = "16-layer" if heavy_fps else "8-layer"
-        clip = apply_fsrcnnx(clip, family=family)
-except Exception as _e:
-    fmt_name = getattr(video_in.format, "name", "?")
-    sys.stderr.write(
-        f"[rife.vpy] chain setup failed for source format {fmt_name}: "
-        f"{type(_e).__name__}: {_e} — passing through unmodified\n")
-    clip = video_in
-
-clip.set_output()
-
-# Pre-warm: kick frame 0 off on a background thread so the FSRCNNX
-# cuDNN graph build + RIFE TRT engine load overlap with the rest of
-# mpv's startup (audio init, OSD layout, seek-to-start). vapoursynth
-# caches the computed frame, so mpv's own first-frame fetch is usually
-# an instant hit. daemon=True so we don't keep the process alive if
-# the filter is replaced (F8/F9 reload) before frame 0 finishes.
-import threading as _t
-def _prewarm(_clip=clip):
-    try:
-        _clip.get_frame(0)
-    except Exception:
-        pass
-_t.Thread(target=_prewarm, daemon=True, name="rife-prewarm").start()
-EOF
+  cp -f "$PROJECT_DIR/dual_machine/rife.vpy" "$MPV_CFG_DIR/"
   log "wrote $MPV_CFG_DIR/rife.vpy"
 
-  # Old per-band .vpy files / shader dir / in-tree weights / old bundle
-  # location under scripts/ have all been superseded — clean stale
-  # copies from previous installs. The old `scripts/fsrcnnx-cudnn/`
-  # path caused mpv to log "Cannot find main.* in scripts/<subdir>"
-  # on every startup because mpv's multi-file-script convention wants
-  # `main.{lua,js,py,mjs}` as the entry, which the bundle doesn't
-  # ship. We host the bundle outside `scripts/` now to dodge that.
+  # Old per-band .vpy files / legacy FSRCNNX glsl shaders / in-tree
+  # weights / old bundle location under scripts/ have all been
+  # superseded — clean stale copies from previous installs. The old
+  # `scripts/fsrcnnx-cudnn/` path caused mpv to log "Cannot find main.*
+  # in scripts/<subdir>" on every startup because mpv's multi-file-
+  # script convention wants `main.{lua,js,py,mjs}` as the entry, which
+  # the bundle doesn't ship. We host the bundle outside `scripts/` now
+  # to dodge that.
   rm -f  "$MPV_CFG_DIR/rife-light.vpy" "$MPV_CFG_DIR/rife-half.vpy"
-  rm -rf "$MPV_CFG_DIR/shaders" "$MPV_CFG_DIR/weights" \
+  rm -rf "$MPV_CFG_DIR/weights" \
          "$MPV_CFG_DIR/fsrcnnx_cudnn" "$MPV_CFG_DIR/scripts/fsrcnnx-cudnn"
+  rm -f  "$MPV_CFG_DIR/shaders/FSRCNNX_"*.glsl 2>/dev/null
+
+  # Shaders: install KrigBilateral.glsl (Shiandow's luma-guided chroma
+  # upsampler, vendored under shaders/). mpv.conf points glsl-shaders
+  # at this path by default; Shift+F8 toggles at runtime.
+  mkdir -p "$MPV_CFG_DIR/shaders"
+  if compgen -G "$PROJECT_DIR/shaders/*.glsl" > /dev/null; then
+    cp -f "$PROJECT_DIR/shaders/"*.glsl "$MPV_CFG_DIR/shaders/"
+    log "copied $(ls "$PROJECT_DIR/shaders/"*.glsl | wc -l) glsl shader(s) to $MPV_CFG_DIR/shaders/"
+  fi
 
   # FSRCNNX cuDNN super-resolution: pull the upstream release bundle
   # (Python pkg + .npz weights) and extract to ~/.config/mpv/. Pinned
@@ -915,6 +715,28 @@ warm("RIFE 4.6  @ 1080p", "4.6",  1920, 1080)
 # 4K sources — mixed mode downsamples to 1080p then runs 4.26.
 warm("RIFE 4.26 @ 1080p (for 4K mixed-mode interp)", "4.26", 1920, 1080)
 PY
+
+  # Pre-compile the chroma kriging CUDA extension. Without this the
+  # first frame using KrigBilateral chroma (yuv_p10_to_rgb in
+  # vs_gpu_helpers + fsrcnnx_yuv's fused path) pays ~18 s of nvcc/ninja
+  # JIT mid-playback. Idempotent: the second call short-circuits on the
+  # cached .so under ~/.cache/torch_extensions/. Same env + bundle path
+  # logic as sr_keys_helper / native_dispatcher.
+  log "pre-compiling chroma_krig CUDA extension"
+  # Older fsrcnnx-cudnn release tarballs (≤ v0.1.1) ship without
+  # chroma_krig.py / csrc/. Falling back to a runtime JIT in that
+  # case just costs ~18 s on first frame and otherwise plays fine.
+  if ! PYTHONPATH="$MPV_CFG_DIR/fsrcnnx-cudnn:${PYTHONPATH:-}" \
+       python - <<'PY'
+import time
+t0 = time.time()
+from fsrcnnx_cudnn.chroma_krig import precompile
+precompile()
+print(f"  chroma_krig: ready in {time.time()-t0:.1f}s")
+PY
+  then
+    warn "chroma_krig precompile skipped (bundle missing the module — first frame will JIT)"
+  fi
 }
 
 # ============================================================================
@@ -1001,7 +823,7 @@ PY
     ln -s "$src" "$dst"
     log "linked $dst → $src"
   done
-  for name in scripts; do
+  for name in scripts shaders; do
     src="$MPV_CFG_DIR/$name"
     dst="$SHIM_CFG_DIR/$name"
     [[ -L "$dst" ]] && continue
@@ -1026,8 +848,14 @@ install_launchers() {
   cat > "$WRAPPER_DIR/mpv-conda" <<EOF
 #!/usr/bin/env bash
 # Wrapper: sets PYTHONHOME so mpv's embedded Python (vapoursynth/RIFE)
-# finds its stdlib when launched without conda activation.
+# finds its stdlib when launched without conda activation. Also
+# sources the dual-machine cluster config if --dual-host was installed,
+# so DUAL_WORKER_HOST + DUAL_RDMA_* are visible to rife.vpy at
+# playback time without any per-user env setup.
 export PYTHONHOME="$ENV_PREFIX"
+if [[ -f "$DUAL_CFG_FILE" ]]; then
+  set -a; . "$DUAL_CFG_FILE"; set +a
+fi
 exec "$ENV_PREFIX/bin/mpv" "\$@"
 EOF
   chmod +x "$WRAPPER_DIR/mpv-conda"
@@ -1194,38 +1022,44 @@ EOF
 # ============================================================================
 cmd_install() {
   # Parse install-specific flags. All optional; defaults preserve the
-  # original behavior (mirrors ON, danmaku ON).
+  # original behavior (mirrors ON, danmaku ON, single-machine install).
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-mirrors|--no-mirror|--no-ustc) USE_MIRRORS=0; shift ;;
       --no-danmaku|--skip-danmaku)        INSTALL_DANMAKU=0; shift ;;
       --rebuild-trt)                      REBUILD_TRT=1; shift ;;
       --set-default-video|--default-video) SET_DEFAULT_VIDEO=1; shift ;;
+      --dual-host)                        INSTALL_DUAL_HOST=1; shift ;;
+      --dual-secondary)                   INSTALL_DUAL_SECONDARY=1; shift ;;
       -h|--help)
         cat <<EOF
 Usage: $0 install [--no-mirrors] [--no-danmaku] [--rebuild-trt]
                   [--set-default-video]
+                  [--dual-host | --dual-secondary]
 
   --no-mirrors    Don't write USTC mirrors into ~/.condarc and
                   ~/.config/pip/pip.conf. Use this outside China
                   where the USTC endpoints are slow / unreachable.
-  --no-danmaku    Skip the danmaku (bullet-chat) plugin step. The
-                  rest of the stack (mpv + RIFE + FSRCNNX + shim)
-                  installs normally.
-  --rebuild-trt   Wipe the TRT engine cache before re-warming. Use
-                  this if you've upgraded the NVIDIA driver / CUDA
-                  / TensorRT and your existing cached engines now
-                  produce broken video — vsrife keys engines on GPU
-                  model + TRT version but not driver build, so an
-                  in-place driver upgrade can leave stale-but-
-                  matching cache files. Adds ~2-3 min to install.
+  --no-danmaku    Skip the danmaku (bullet-chat) plugin step.
+  --rebuild-trt   Wipe the TRT engine cache before re-warming.
   --set-default-video
-                  Promote mpv-conda to the GNOME default video
-                  player (xdg-mime default for mp4/mkv/webm/mov/
-                  avi/mpeg/m4v/flv/3gp/wmv/ogg/asf/hls). Without
-                  this flag mpv-conda is still registered as a
-                  candidate (shows up in "Open With…") but totem
-                  remains the default.
+                  Promote mpv-conda to the GNOME default video player.
+
+  --dual-host     Run the regular (single-machine) install AND set up
+                  this box as the primary side of a dual-machine
+                  cluster. Writes $DUAL_CFG_FILE with the cluster
+                  config (interactive; or set DUAL_RDMA_DEV /
+                  DUAL_HOST_IP / DUAL_PEER_IP env vars to skip prompts).
+                  Pre-compiles the chroma_krig CUDA kernel.
+
+  --dual-secondary
+                  Worker-only install for the OTHER box of the cluster.
+                  Skips the mpv build, jellyfin-mpv-shim, danmaku and
+                  default-video registration. Installs the conda env +
+                  vsrife + fsrcnnx-cudnn + worker.py code, registers a
+                  systemd --user service (started + enabled), and a
+                  GNOME autostart entry for a tray app that exposes a
+                  Quit menu. Writes the same $DUAL_CFG_FILE.
 EOF
         return 0
         ;;
@@ -1233,24 +1067,48 @@ EOF
     esac
   done
 
-  log "install flags: USE_MIRRORS=$USE_MIRRORS  INSTALL_DANMAKU=$INSTALL_DANMAKU  REBUILD_TRT=$REBUILD_TRT  SET_DEFAULT_VIDEO=$SET_DEFAULT_VIDEO"
+  if (( INSTALL_DUAL_HOST && INSTALL_DUAL_SECONDARY )); then
+    fatal "--dual-host and --dual-secondary are mutually exclusive"
+  fi
+
+  local mode="single"
+  (( INSTALL_DUAL_HOST ))      && mode="dual-host"
+  (( INSTALL_DUAL_SECONDARY )) && mode="dual-secondary"
+  log "install mode: $mode  flags: mirrors=$USE_MIRRORS danmaku=$INSTALL_DANMAKU rebuild-trt=$REBUILD_TRT default-video=$SET_DEFAULT_VIDEO"
 
   detect_environment
   install_apt_packages
   install_miniforge
   create_conda_env
-  build_mpv
   install_pip_packages
   apply_patches
-  install_configs
-  warm_trt_cache
-  if (( INSTALL_DANMAKU )); then
-    install_danmaku
+
+  if (( INSTALL_DUAL_SECONDARY )); then
+    # Worker-only path. Skip mpv build / shim / danmaku / launchers /
+    # set-default-video — none of these are useful on a box that only
+    # serves RDMA from worker.py. Configs + warm_trt are still wanted
+    # since the worker needs vsrife engines and the fsrcnnx-cudnn
+    # bundle (chroma_krig CUDA kernel).
+    install_configs
+    warm_trt_cache
+    dual_install_secondary_pieces
   else
-    section "step 8b/10: danmaku plugin (skipped — --no-danmaku)"
+    # Single-machine OR dual-host: full stack.
+    build_mpv
+    install_configs
+    warm_trt_cache
+    if (( INSTALL_DANMAKU )); then
+      install_danmaku
+    else
+      section "step 8b/10: danmaku plugin (skipped — --no-danmaku)"
+    fi
+    install_shim_config
+    install_launchers
+    if (( INSTALL_DUAL_HOST )); then
+      dual_install_host_pieces
+    fi
   fi
-  install_shim_config
-  install_launchers
+
   print_install_summary
 }
 
@@ -1273,6 +1131,22 @@ cmd_status() {
       printf "  %-42s %s\n" "$p" "(not installed)"
     fi
   done
+
+  section "dual-machine"
+  if [[ -f $DUAL_CFG_FILE ]]; then
+    echo "  config:  $DUAL_CFG_FILE"
+    sed 's/^/    /' "$DUAL_CFG_FILE" | head -12
+    if systemctl --user list-unit-files 2>/dev/null \
+        | grep -q "$DUAL_WORKER_SERVICE"; then
+      local st
+      st=$(systemctl --user is-active "$DUAL_WORKER_SERVICE" 2>/dev/null || true)
+      echo "  worker service: $DUAL_WORKER_SERVICE  ($st)"
+    fi
+    [[ -e $DUAL_TRAY_AUTOSTART ]] && echo "  tray autostart: $DUAL_TRAY_AUTOSTART"
+    [[ -d $DUAL_WORKER_DIR ]] && echo "  worker dir: $DUAL_WORKER_DIR"
+  else
+    echo "  (not configured — run install with --dual-host or --dual-secondary)"
+  fi
 
   section "miniforge + conda env"
   if [[ -x "$FORGE_DIR/bin/conda" ]]; then
@@ -1428,12 +1302,15 @@ PY
 # ============================================================================
 cmd_uninstall() {
   section "uninstall"
-  log "stopping any running shim/mpv processes (from this env)"
+  log "stopping any running shim/mpv/worker processes"
   pkill -f "$ENV_PREFIX/bin/jellyfin-mpv-shim" 2>/dev/null || true
   pkill -f "$ENV_PREFIX/bin/mpv" 2>/dev/null || true
   pkill -f "$WRAPPER_DIR/jellyfin-mpv-shim" 2>/dev/null || true
   pkill -f "$WRAPPER_DIR/mpv-conda" 2>/dev/null || true
   sleep 1
+
+  # Drop dual-machine pieces too (no-op if they were never installed).
+  dual_uninstall_pieces
 
   # Selective cleanup: preserve user-supplied state across reinstalls.
   # Specifically keep dandanplay AppId (registration takes 1-3 days) and
@@ -1546,6 +1423,295 @@ EOF
 }
 
 # ============================================================================
+# Dual-machine install pieces
+# ============================================================================
+
+# Default high-speed iface: first UP enp1s0* / enP2p1s0* device. The
+# Spark CX7 NIC presents two PCIe ports that bond into one 200 G link;
+# both names start with the same prefix, so picking either rail is
+# enough to pin a default — link aggregation pairs are derived below.
+dual_detect_iface_default() {
+  ip -o link show up 2>/dev/null \
+    | awk -F': ' '/enp1s0|enP2p1s0/ {print $2; exit}' \
+    | awk '{print $1}'
+}
+
+dual_detect_local_ip() {
+  local iface=$1
+  ip -4 -o addr show dev "$iface" 2>/dev/null \
+    | awk '{print $4}' | cut -d/ -f1 | head -1
+}
+
+# Probe one interactive value with env-pre-set short-circuit. $1 = env
+# var name (used as the override channel); $2 = prompt label; $3 = default.
+# Prints the resolved value on stdout (no other noise — caller captures).
+_dual_prompt() {
+  local env_name=$1 label=$2 default=$3
+  local pre="${!env_name:-}"
+  if [[ -n $pre ]]; then
+    printf '%s\n' "$pre"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    local answer
+    read -r -p "  $label [$default]: " answer < /dev/tty
+    if [[ -z $answer ]]; then printf '%s\n' "$default"
+    else                       printf '%s\n' "$answer"
+    fi
+  else
+    printf '%s\n' "$default"
+  fi
+}
+
+# Gather DUAL_* values from env / interactive / defaults, write to
+# $DUAL_CFG_FILE in /etc/environment-style key=value form so it works
+# both as systemd EnvironmentFile and as `set -a; source ...; set +a`
+# for the mpv-conda wrapper.
+dual_configure() {
+  local role=$1   # "host" or "secondary"
+  section "step D1: dual-machine config (role=$role)"
+
+  cat <<EOF
+A dual-machine install needs a 200 G RoCE link between this box and
+the other Spark, with static IPs (not DHCP) on the high-speed
+interface. Link aggregation across both PCIe ports of the CX7 NIC is
+enabled by default — bench numbers in docs/performance.md assume
+this. Press <Enter> to accept any default, or set the corresponding
+env before re-running to skip prompts (DUAL_RDMA_DEV / DUAL_HOST_IP /
+DUAL_WORKER_IP / etc).
+
+EOF
+
+  local iface_default; iface_default=$(dual_detect_iface_default)
+  iface_default=${iface_default:-enp1s0f0np0}
+
+  local rdma_dev_default; rdma_dev_default=$(printf 'rocep1s0f%s' "$(printf '%s' "$iface_default" | sed -nE 's/.*enp1s0f([0-9]+)np[0-9]+/\1/p')")
+  rdma_dev_default=${rdma_dev_default:-rocep1s0f0}
+
+  local self_ip_default; self_ip_default=$(dual_detect_local_ip "$iface_default")
+  self_ip_default=${self_ip_default:-10.200.128.1}
+
+  local peer_ip_default
+  if [[ $role == "host" ]]; then peer_ip_default="10.200.128.2"
+  else                            peer_ip_default="10.200.128.1"
+  fi
+
+  local IFACE     RDMA_DEV  SELF_IP   PEER_IP   RDMA_PORT  WORKER_USER
+  IFACE=$(_dual_prompt DUAL_IFACE       "high-speed interface"      "$iface_default")
+  RDMA_DEV=$(_dual_prompt DUAL_RDMA_DEV "RDMA device"               "$rdma_dev_default")
+  SELF_IP=$(_dual_prompt DUAL_SELF_IP   "this box's IP on the link" "$self_ip_default")
+  PEER_IP=$(_dual_prompt DUAL_PEER_IP   "peer's IP on the link"     "$peer_ip_default")
+  RDMA_PORT=$(_dual_prompt DUAL_RDMA_PORT "RDMA port"               "$DUAL_DEFAULT_RDMA_PORT")
+  if [[ $role == "host" ]]; then
+    WORKER_USER=$(_dual_prompt DUAL_WORKER_USER \
+                  "guest user (for ssh + rsync from bench)" "ubuntu")
+  fi
+  # MASTER_PORT / NCCL_IB_HCA / NCCL_SOCKET_IFNAME used to be written
+  # here for torch.distributed rendezvous. Since the drop-NCCL refactor
+  # (control plane is now a single TCP socket on DUAL_LIVENESS_PORT),
+  # none of those are read by anything. The single RDMA device on
+  # DUAL_RDMA_DEV is enough for pyverbs; multi-rail aggregation, if
+  # ever needed, would be configured at the pyverbs layer directly.
+
+  # Role-specific host/worker IP mapping. From the HOST's perspective
+  # DUAL_WORKER_HOST is the peer. From the SECONDARY's perspective
+  # DUAL_HOST_IP is the peer.
+  local HOST_IP WORKER_HOST
+  if [[ $role == "host" ]]; then
+    HOST_IP="$SELF_IP"
+    WORKER_HOST="$PEER_IP"
+  else
+    HOST_IP="$PEER_IP"
+    WORKER_HOST="$SELF_IP"
+  fi
+
+  mkdir -p "$DUAL_CFG_DIR"
+  cat > "$DUAL_CFG_FILE" <<EOF
+# dgxspark-jellyfin-mpv-rife — dual-machine cluster config.
+# Source of truth for both the mpv-conda launcher (host) and the
+# systemd worker unit (secondary). Regenerate by re-running
+# install.sh with --dual-host or --dual-secondary.
+
+DUAL_ROLE=$role
+DUAL_IFACE=$IFACE
+DUAL_RDMA_DEV=$RDMA_DEV
+DUAL_RDMA_PORT=$RDMA_PORT
+DUAL_HOST_IP=$HOST_IP
+DUAL_WORKER_HOST=$WORKER_HOST
+${WORKER_USER:+DUAL_WORKER_USER=$WORKER_USER}
+EOF
+  log "wrote $DUAL_CFG_FILE:"
+  sed 's/^/    /' "$DUAL_CFG_FILE"
+}
+
+# Copy worker.py + supporting modules to $DUAL_WORKER_DIR so the
+# systemd unit has a stable path (independent of where the repo lives).
+dual_install_worker_files() {
+  section "step D2: install worker code → $DUAL_WORKER_DIR"
+  mkdir -p "$DUAL_WORKER_DIR"
+  install -m 0644 "$PROJECT_DIR/dual_machine/worker.py"          "$DUAL_WORKER_DIR/"
+  install -m 0644 "$PROJECT_DIR/dual_machine/worker_3proc.py"    "$DUAL_WORKER_DIR/"
+  install -m 0644 "$PROJECT_DIR/dual_machine/rdma_transport.py"  "$DUAL_WORKER_DIR/"
+  install -m 0644 "$PROJECT_DIR/dual_machine/mp_pipeline.py"     "$DUAL_WORKER_DIR/"
+  install -m 0644 "$PROJECT_DIR/dual_machine/cc_cache.py"        "$DUAL_WORKER_DIR/"
+  install -m 0644 "$PROJECT_DIR/dual_machine/queue_mgr.py"       "$DUAL_WORKER_DIR/"
+  install -m 0644 "$PROJECT_DIR/dual_machine/common.py"          "$DUAL_WORKER_DIR/"
+  install -m 0644 "$PROJECT_DIR/vs_gpu_helpers.py"               "$DUAL_WORKER_DIR/"
+  log "installed worker files: $(ls $DUAL_WORKER_DIR/*.py | wc -l) modules"
+}
+
+# Render worker.service.in → systemd-user unit dir.
+dual_install_secondary_service() {
+  section "step D3: install $DUAL_WORKER_SERVICE (systemd --user)"
+  local unit_dir="$HOME/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  sed -e "s|@DUAL_CONFIG_FILE@|$DUAL_CFG_FILE|g" \
+      -e "s|@PYTHON_BIN@|$ENV_PREFIX/bin/python|g" \
+      -e "s|@WORKER_PY@|$DUAL_WORKER_DIR/worker.py|g" \
+      "$PROJECT_DIR/dual_machine/worker.service.in" \
+    > "$unit_dir/$DUAL_WORKER_SERVICE"
+  systemctl --user daemon-reload
+  systemctl --user enable "$DUAL_WORKER_SERVICE" 2>&1 \
+    | grep -v 'Created symlink' || true
+  # `restart` (not `start`) so re-running install on an upgraded
+  # codebase actually picks up the new worker.py — `start` is a no-op
+  # if the unit is already active and the user would be silently left
+  # on the old binary.
+  systemctl --user restart "$DUAL_WORKER_SERVICE" || \
+    warn "systemctl --user restart failed — start it manually after login"
+  log "installed + (re)started $unit_dir/$DUAL_WORKER_SERVICE"
+}
+
+# Tray app (PyGObject + AppIndicator). Drops the script next to the
+# worker, registers a .desktop in autostart.
+dual_install_secondary_tray() {
+  section "step D4: install secondary tray + launcher + autostart"
+  if [[ ! -f "$PROJECT_DIR/dual_machine/secondary_tray.py" ]]; then
+    warn "secondary_tray.py missing in project — skipping tray install"
+    return 0
+  fi
+  install -m 0755 "$PROJECT_DIR/dual_machine/secondary_tray.py" \
+                  "$DUAL_WORKER_DIR/secondary_tray.py"
+
+  # Install the mpv icon on this box too (the single-machine flow
+  # does it in install_launchers, which --dual-secondary skips). The
+  # tray uses `Icon=mpv-conda`, the same name single-machine apps use.
+  for size in 16 32 64 128; do
+    local src="$PROJECT_DIR/icons/mpv/$size.png"
+    [[ -f $src ]] || continue
+    local dst_dir="$ICON_ROOT/${size}x${size}/apps"
+    mkdir -p "$dst_dir"
+    cp -f "$src" "$dst_dir/mpv-conda.png"
+  done
+  if [[ -f "$PROJECT_DIR/icons/mpv/scalable.svg" ]]; then
+    mkdir -p "$ICON_ROOT/scalable/apps"
+    cp -f "$PROJECT_DIR/icons/mpv/scalable.svg" \
+          "$ICON_ROOT/scalable/apps/mpv-conda.svg"
+  fi
+  gtk-update-icon-cache -f -t "$ICON_ROOT" 2>/dev/null || true
+
+  # Wrapper sets GI_TYPELIB_PATH so the conda Python can find the
+  # system's AyatanaAppIndicator3 typelib (conda-forge has none on
+  # aarch64) — same trick the jellyfin-mpv-shim wrapper uses.
+  mkdir -p "$WRAPPER_DIR"
+  cat > "$WRAPPER_DIR/dgxspark-dual-tray" <<EOF
+#!/usr/bin/env bash
+SYS_GIR="/usr/lib/aarch64-linux-gnu/girepository-1.0"
+export GI_TYPELIB_PATH="\${GI_TYPELIB_PATH:+\$GI_TYPELIB_PATH:}\$SYS_GIR"
+export PYTHONHOME="$ENV_PREFIX"
+exec "$ENV_PREFIX/bin/python" "$DUAL_WORKER_DIR/secondary_tray.py" "\$@"
+EOF
+  chmod +x "$WRAPPER_DIR/dgxspark-dual-tray"
+
+  local desktop_body
+  desktop_body="[Desktop Entry]
+Type=Application
+Name=DGX Spark Dual Worker
+GenericName=Dual-machine worker tray
+Comment=Status + Quit menu for the dual-machine worker service
+Icon=mpv-conda
+Exec=$WRAPPER_DIR/dgxspark-dual-tray
+Terminal=false
+Categories=AudioVideo;Player;
+StartupNotify=false"
+
+  # GNOME Activities launcher — what the user sees in the app grid /
+  # Alt-F2. Without this only the autostart entry below exists, and
+  # the user has no way to start the tray after manually quitting it.
+  mkdir -p "$APPS_DIR"
+  printf '%s\n' "$desktop_body" > "$APPS_DIR/$DUAL_TRAY_DESKTOP"
+  update-desktop-database "$APPS_DIR" 2>/dev/null || true
+  log "launcher at $APPS_DIR/$DUAL_TRAY_DESKTOP"
+
+  # Autostart on login — the launcher is just for manual restart.
+  mkdir -p "$(dirname "$DUAL_TRAY_AUTOSTART")"
+  printf '%s\nX-GNOME-Autostart-enabled=true\n' \
+    "$desktop_body" > "$DUAL_TRAY_AUTOSTART"
+  log "tray autostart at $DUAL_TRAY_AUTOSTART"
+
+  # Linger keeps the user session alive at boot (before any GUI login),
+  # so the worker.service starts when the box powers on instead of
+  # waiting for someone to log into GNOME. Requires sudo.
+  if loginctl show-user "$USER" 2>/dev/null | grep -q '^Linger=yes$'; then
+    log "user session lingering already enabled"
+  else
+    log "enabling user session lingering (sudo loginctl enable-linger $USER)"
+    if sudo loginctl enable-linger "$USER" 2>/dev/null; then
+      log "  ✓ worker.service will start at boot"
+    else
+      warn "  could not enable linger — worker.service will only start on login"
+    fi
+  fi
+}
+
+# Compile chroma_krig CUDA kernel at install time so first-frame
+# playback doesn't pay the ~30 s JIT cost. Imports fsrcnnx_cudnn.chroma_krig
+# inside conda env; load_inline + ninja compiles to ~/.cache/torch_extensions.
+dual_precompile_krig() {
+  section "step D5: pre-compile chroma_krig CUDA kernel"
+  if ! "$ENV_PREFIX/bin/python" -c \
+       "import sys; sys.path.insert(0, '$MPV_CFG_DIR/fsrcnnx-cudnn'); \
+        import fsrcnnx_cudnn.chroma_krig as _; print('chroma_krig:', _.__file__)"; then
+    warn "chroma_krig pre-compile failed; first frame at runtime will JIT"
+  else
+    log "chroma_krig compiled into ~/.cache/torch_extensions"
+  fi
+}
+
+dual_install_host_pieces() {
+  dual_configure "host"
+  dual_precompile_krig
+  log "host-side dual install done. To enable dual mode in mpv, your"
+  log "playback session must source $DUAL_CFG_FILE before launching mpv-conda."
+  log "(The default mpv-conda wrapper already does this when the file exists.)"
+}
+
+dual_install_secondary_pieces() {
+  dual_configure "secondary"
+  dual_install_worker_files
+  dual_install_secondary_service
+  dual_install_secondary_tray
+  dual_precompile_krig
+  log "secondary-side dual install done."
+  log "  service: systemctl --user status $DUAL_WORKER_SERVICE"
+  log "  log:     $HOME/.cache/dgxspark-dual-worker.log (or journalctl --user -u $DUAL_WORKER_SERVICE)"
+}
+
+dual_uninstall_pieces() {
+  section "step D-X: uninstall dual-machine pieces"
+  if systemctl --user list-unit-files 2>/dev/null | grep -q "$DUAL_WORKER_SERVICE"; then
+    systemctl --user disable --now "$DUAL_WORKER_SERVICE" 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/$DUAL_WORKER_SERVICE"
+    systemctl --user daemon-reload
+  fi
+  rm -f "$DUAL_TRAY_AUTOSTART"
+  rm -f "$DUAL_CFG_FILE"
+  [[ -d $DUAL_CFG_DIR && -z "$(ls -A "$DUAL_CFG_DIR" 2>/dev/null)" ]] && rmdir "$DUAL_CFG_DIR"
+  rm -rf "$DUAL_WORKER_DIR"
+  log "removed dual config + service + tray autostart + worker dir."
+}
+
+# ============================================================================
 # Dispatcher
 # ============================================================================
 case "${1:-}" in
@@ -1557,7 +1723,8 @@ case "${1:-}" in
 $(basename "$0") — dgxspark-jellyfin-mpv-rife
 
 Usage:
-  $0 install [flags]   install everything on a clean DGX Spark + GNOME system
+  $0 install [flags]   install (single-machine by default; --dual-host /
+                       --dual-secondary for the two roles of a dual cluster)
   $0 status            show what's currently installed and where
   $0 uninstall         remove everything we installed except apt + miniforge
 
