@@ -37,7 +37,7 @@ WORKER_USER="${WORKER_USER:-${DUAL_WORKER_USER:-ubuntu}}"
 # Relative path — ssh's login shell resolves it under the remote
 # user's home, so we don't have to know /home/$WORKER_USER vs
 # /Users/$WORKER_USER vs anything else.
-WORKER_DIR="${WORKER_DIR:-${DUAL_WORKER_DIR:-dual_machine}}"
+WORKER_DIR="${WORKER_DIR:-${DUAL_WORKER_DIR:-.local/share/dgxspark-mpv/worker}}"
 RDMA_DEV="${RDMA_DEV:-${DUAL_RDMA_DEV:-rocep1s0f0}}"
 RDMA_PORT="${RDMA_PORT:-${DUAL_RDMA_PORT:-29900}}"
 MASTER_PORT="${MASTER_PORT:-$((30000 + (RANDOM ^ $$) % 5000))}"

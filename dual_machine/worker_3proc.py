@@ -514,10 +514,11 @@ def compute_proc_main():
     log(f"cuda device set: {dev}")
 
     # Reconstitute the same paths that worker.py sets up so we can
-    # import the engine builders. Use __file__ instead of the hard-
-    # coded /home/spark/dual_machine — works on both worker (where the
-    # file lives at that path) and host (where it's the project's
-    # dual_machine/ subdir). Without insert(0,...) Python's `-c -B`
+    # import the engine builders. Use __file__ rather than a hard-coded
+    # install path — works for both the secondary box (where install.sh
+    # drops files under ~/.local/share/dgxspark-mpv/worker/) and the
+    # host (where it's the project's dual_machine/ subdir). Without
+    # insert(0,...) Python's `-c -B`
     # mode puts the parent's cwd at sys.path[0], which on the host
     # ends up shadowing dual_machine/vs_gpu_helpers.py with the stale
     # top-level copy at `<project>/vs_gpu_helpers.py`.
