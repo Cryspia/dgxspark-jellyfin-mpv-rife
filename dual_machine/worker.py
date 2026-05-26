@@ -31,8 +31,12 @@ from __future__ import annotations
 import os, sys, time, socket, struct, threading, traceback
 from pathlib import Path
 
-REPO = Path("/home/spark/projects/dgxspark-jellyfin-mpv-rife")
-sys.path.insert(0, str(REPO / "dual_machine"))
+# Make worker_3proc / mp_pipeline / vs_gpu_helpers / etc. importable
+# from wherever worker.py is — the install location (where install.sh
+# put it) or the source tree (when running out of a git clone for dev).
+# Avoid hardcoding any path here.
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
 _PY_BIN = str(Path(sys.executable).parent)
 if _PY_BIN not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _PY_BIN + os.pathsep + os.environ.get("PATH", "")
@@ -47,7 +51,6 @@ if _FSRCNNX_BUNDLE.exists() and str(_FSRCNNX_BUNDLE) not in sys.path:
 _BUNDLE_WEIGHTS = _FSRCNNX_BUNDLE / "weights"
 if _BUNDLE_WEIGHTS.exists() and "WMP_WEIGHTS_DIR" not in os.environ:
     os.environ["WMP_WEIGHTS_DIR"] = str(_BUNDLE_WEIGHTS)
-sys.path.insert(0, str(Path("/home/spark/dual_machine")))
 
 import torch
 
