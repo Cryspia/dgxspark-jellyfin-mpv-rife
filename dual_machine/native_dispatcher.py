@@ -328,13 +328,7 @@ def make_dispatcher(
         f"variant=x{fsrcnnx_scale} downsample_pre={downsample_pre}\n")
     sys.stderr.flush()
     _t0 = _time.perf_counter()
-    # fsrcnnx-cudnn bundle (install.sh drops it here); same lookup as
-    # worker.py / sr_keys_helper.
-    _mpv_home = Path(
-        os.environ.get("MPV_HOME") or
-        (os.environ.get("XDG_CONFIG_HOME") or
-         os.path.expanduser("~/.config")) + "/mpv"
-    )
+    # _mpv_home already computed above; reuse for the weights lookup.
     wpath = _mpv_home / "fsrcnnx-cudnn" / "weights" / f"{variant}.npz"
     # The dispatcher's `local_runner` is only used for this prewarm — the
     # actual compute-proc FSRCNNX runner is built independently inside
@@ -466,7 +460,7 @@ def make_dispatcher(
             matrix_s=matrix_s, color_range=color_range,
             chroma_mode=chroma_kernel, bits=10,
             downsample_pre=downsample_pre,
-            weights_dir=weights_dir,
+            weights_dir=str(_mpv_home / "fsrcnnx-cudnn" / "weights"),
             log=lambda m: sys.stderr.write(m + "\n"),
         )
         host_mp.setup()
