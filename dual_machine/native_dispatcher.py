@@ -1419,7 +1419,7 @@ def make_dispatcher(
     # file is the common case — mpv stops issuing K+1 so the last
     # mult-1 phases of K never publish) we used to return silently
     # with the dst VA un-touched; mpv then displayed whatever the
-    # buffer pool last held = garbage = 花屏 at file end. Write a
+    # buffer pool last held = garbage at file end. Write a
     # known black frame instead so the user sees a brief blackout
     # (1-3 frames, ≤ 84 ms at 24 fps × mult=3) rather than residue.
     #
