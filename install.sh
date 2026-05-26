@@ -574,6 +574,16 @@ EOF
         "$MPV_CFG_DIR/scripts/dual_seek_flush.lua"
   log "copied scripts/dual_seek_flush.lua to $MPV_CFG_DIR/scripts/"
 
+  # dual_fps_override.lua — pre-vpy ffprobe sidecar that writes
+  # /tmp/dual_machine_mult_override based on real source fps + height.
+  # Works around mpv's vsapi rate-propagation bug where some MKV/MP4
+  # containers hand fps_num=0/fps_den=0 to vapoursynth, forcing
+  # rife.vpy's in-vpy heuristic into the conservative mult=2 branch.
+  # DUAL_FPS_OVERRIDE_DISABLE=1 to opt out.
+  cp -f "$PROJECT_DIR/scripts/dual_fps_override.lua" \
+        "$MPV_CFG_DIR/scripts/dual_fps_override.lua"
+  log "copied scripts/dual_fps_override.lua to $MPV_CFG_DIR/scripts/"
+
 
   # sr_keys_helper.py — Python helper imported by the rife*.vpy files.
   # Reads the side-channel files written by sr_keys.lua and applies
