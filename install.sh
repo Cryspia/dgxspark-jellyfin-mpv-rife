@@ -597,33 +597,40 @@ EOF
   cp -f "$PROJECT_DIR/dual_machine/rife.vpy" "$MPV_CFG_DIR/"
   log "wrote $MPV_CFG_DIR/rife.vpy"
 
-  # dual_machine/*.py — rife.vpy adds $MPV_CFG_DIR/dual_machine to
-  # sys.path and imports native_dispatcher / queue_mgr / etc. from
-  # it (the singleton + lua-hook plumbing). Mirror the project's
-  # dual_machine/ tree so the import resolves without depending on
-  # the source tree being in a fixed location. native_filter is a
-  # vapoursynth C++ filter; build it if the .so isn't there yet
-  # (a fresh clone has the sources but not the build/ output).
-  local native_so="$PROJECT_DIR/dual_machine/native_filter/build/libdgxspark_split_dual.so"
-  if [[ ! -f "$native_so" ]]; then
-    section "step 7b/10: cmake build native_filter"
-    in_env bash -c "
-      cd '$PROJECT_DIR/dual_machine/native_filter'
-      mkdir -p build && cd build
-      cmake -DCMAKE_BUILD_TYPE=Release .. >/tmp/native_filter_cmake.log 2>&1
-      make -j$(nproc) >>/tmp/native_filter_cmake.log 2>&1
-    " || fatal "native_filter build failed — see /tmp/native_filter_cmake.log"
-    [[ -f "$native_so" ]] || fatal "build claimed success but $native_so is missing"
-    log "built $(ls -la "$native_so" | awk '{print $5}') bytes"
+  # dual_machine/*.py + native_filter — host-only. rife.vpy (run by
+  # mpv) adds $MPV_CFG_DIR/dual_machine to sys.path and imports
+  # native_dispatcher / queue_mgr / etc. The native_filter directory
+  # holds a vapoursynth C++ plugin (libdgxspark_split_dual.so) that
+  # rife.vpy LoadPlugin()s when dual mode is active. The secondary
+  # box doesn't run mpv → skip the whole block there.
+  if (( INSTALL_DUAL_SECONDARY == 0 )); then
+    local native_so="$PROJECT_DIR/dual_machine/native_filter/build/libdgxspark_split_dual.so"
+    if [[ ! -f "$native_so" ]]; then
+      section "step 7b/10: cmake build native_filter"
+      # pybind11 is a build-time dep for the .so — pip-install into the
+      # conda env if missing (mamba create doesn't pull it in by default).
+      in_env bash -c '
+        python -c "import pybind11" 2>/dev/null \
+          || pip install --quiet pybind11
+      ' || warn "pybind11 install failed; cmake may not find it"
+      in_env bash -c "
+        cd '$PROJECT_DIR/dual_machine/native_filter'
+        mkdir -p build && cd build
+        cmake -DCMAKE_BUILD_TYPE=Release .. >/tmp/native_filter_cmake.log 2>&1
+        make -j$(nproc) >>/tmp/native_filter_cmake.log 2>&1
+      " || fatal "native_filter build failed — see /tmp/native_filter_cmake.log"
+      [[ -f "$native_so" ]] || fatal "build claimed success but $native_so is missing"
+      log "built $(ls -la "$native_so" | awk '{print $5}') bytes"
+    fi
+    install -d "$MPV_CFG_DIR/dual_machine" "$MPV_CFG_DIR/dual_machine/native_filter"
+    rsync -a --delete --exclude='__pycache__' --exclude='native_filter' \
+          --exclude='*.sh' --exclude='*.md' --exclude='*.in' --exclude='rife.vpy' \
+          "$PROJECT_DIR/dual_machine/" "$MPV_CFG_DIR/dual_machine/"
+    rsync -a --delete --exclude='__pycache__' \
+          "$PROJECT_DIR/dual_machine/native_filter/" \
+          "$MPV_CFG_DIR/dual_machine/native_filter/"
+    log "wrote $MPV_CFG_DIR/dual_machine/ ($(ls "$MPV_CFG_DIR/dual_machine"/*.py 2>/dev/null | wc -l) py modules + native_filter/)"
   fi
-  install -d "$MPV_CFG_DIR/dual_machine" "$MPV_CFG_DIR/dual_machine/native_filter"
-  rsync -a --delete --exclude='__pycache__' --exclude='native_filter' \
-        --exclude='*.sh' --exclude='*.md' --exclude='*.in' --exclude='rife.vpy' \
-        "$PROJECT_DIR/dual_machine/" "$MPV_CFG_DIR/dual_machine/"
-  rsync -a --delete --exclude='__pycache__' \
-        "$PROJECT_DIR/dual_machine/native_filter/" \
-        "$MPV_CFG_DIR/dual_machine/native_filter/"
-  log "wrote $MPV_CFG_DIR/dual_machine/ ($(ls "$MPV_CFG_DIR/dual_machine"/*.py 2>/dev/null | wc -l) py modules + native_filter/)"
 
   # Old per-band .vpy files / legacy FSRCNNX glsl shaders / in-tree
   # weights / old bundle location under scripts/ have all been
