@@ -44,6 +44,7 @@ local state = {
   last_pos      = nil,
   saved_pause   = nil,
   saved_mute    = nil,
+  saved_pos     = nil,
   started_at    = 0,
   step_started  = 0,
   finished      = false,
@@ -53,8 +54,11 @@ local function finish(reason)
   if state.finished then return end
   state.finished = true
   state.active = false
-  -- Restore from frame 0. exact seek so we land deterministically.
-  mp.commandv("seek", "0", "absolute", "exact")
+  -- Restore to the file-loaded position. Jellyfin resume hands mpv
+  -- `loadfile … start=<pos>`, so time-pos at file-loaded is the resume
+  -- point; defaulting to 0 here used to drag resumed playback back to
+  -- the start of the file. exact seek so we land deterministically.
+  mp.commandv("seek", tostring(state.saved_pos or 0), "absolute", "exact")
   -- Tiny delay so the seek's resulting frame request flushes before
   -- we unpause (otherwise the unpause race can show 1 stale frame).
   mp.add_timeout(0.05, function()
@@ -138,6 +142,7 @@ local function on_file_loaded()
   state.step_started  = state.started_at
   state.saved_pause   = mp.get_property_bool("pause")
   state.saved_mute    = mp.get_property_bool("mute")
+  state.saved_pos     = mp.get_property_number("time-pos") or 0
 
   -- Pick frame count from source fps. container-fps is the demuxer's
   -- reported source rate (24/25/30); we want ~1s of source frames so
