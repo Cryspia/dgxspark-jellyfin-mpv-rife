@@ -576,8 +576,11 @@ def compute_proc_main():
     # one-shot cost so reactivation is cheap once the in-pipeline race
     # (krig output → 0 on ~10% of frames; see project memory) is fixed.
     from fsrcnnx_cudnn.chroma_krig import krig_bilateral_chroma  # noqa: F401
+    # Fallback only kicks in if worker.py didn't pre-set WMP_WEIGHTS_DIR
+    # (it does so when ~/.config/mpv/fsrcnnx-cudnn/weights exists).
+    # Same lookup as the _mpv_home block above.
     WEIGHTS_DIR = os.environ.get(
-        "WMP_WEIGHTS_DIR", "/home/spark/dual_machine/weights")
+        "WMP_WEIGHTS_DIR", str(_mpv_home / "fsrcnnx-cudnn" / "weights"))
     if no_sr:
         log(f"DUAL_NO_SR=1 — skipping FSRCNNX runner build "
             f"(variant={variant} would have been {proc_w}x{proc_h})")

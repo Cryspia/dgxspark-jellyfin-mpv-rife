@@ -328,8 +328,14 @@ def make_dispatcher(
         f"variant=x{fsrcnnx_scale} downsample_pre={downsample_pre}\n")
     sys.stderr.flush()
     _t0 = _time.perf_counter()
-    weights_dir = "/home/spark/.config/mpv/fsrcnnx-cudnn/weights"
-    wpath = Path(weights_dir) / f"{variant}.npz"
+    # fsrcnnx-cudnn bundle (install.sh drops it here); same lookup as
+    # worker.py / sr_keys_helper.
+    _mpv_home = Path(
+        os.environ.get("MPV_HOME") or
+        (os.environ.get("XDG_CONFIG_HOME") or
+         os.path.expanduser("~/.config")) + "/mpv"
+    )
+    wpath = _mpv_home / "fsrcnnx-cudnn" / "weights" / f"{variant}.npz"
     # The dispatcher's `local_runner` is only used for this prewarm — the
     # actual compute-proc FSRCNNX runner is built independently inside
     # HostMP's subprocess. Skip both when no_sr (the compute proc reads
