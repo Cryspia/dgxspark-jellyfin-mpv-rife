@@ -98,7 +98,10 @@ FSRCNNX_CUDNN_VERSION="v0.2.2"
 # reads it via EnvironmentFile.
 DUAL_CFG_DIR="$HOME/.config/dgxspark-mpv"
 DUAL_CFG_FILE="$DUAL_CFG_DIR/dual.conf"
-DUAL_WORKER_DIR="$HOME/dual_machine"
+DUAL_WORKER_DIR="$HOME/.local/share/dgxspark-mpv/worker"
+# Old install location, retained for migration / uninstall cleanup
+# of installs predating the move to ~/.local/share/.
+DUAL_WORKER_DIR_LEGACY="$HOME/dual_machine"
 DUAL_WORKER_SERVICE="dgxspark-dual-worker.service"
 DUAL_TRAY_DESKTOP="dgxspark-dual-secondary.desktop"
 DUAL_TRAY_AUTOSTART="$HOME/.config/autostart/$DUAL_TRAY_DESKTOP"
@@ -1567,6 +1570,7 @@ DUAL_RDMA_DEV=$RDMA_DEV
 DUAL_RDMA_PORT=$RDMA_PORT
 DUAL_HOST_IP=$HOST_IP
 DUAL_WORKER_HOST=$WORKER_HOST
+DUAL_WORKER_DIR=$DUAL_WORKER_DIR
 ${WORKER_USER:+DUAL_WORKER_USER=$WORKER_USER}
 EOF
   log "wrote $DUAL_CFG_FILE:"
@@ -1577,6 +1581,15 @@ EOF
 # systemd unit has a stable path (independent of where the repo lives).
 dual_install_worker_files() {
   section "step D2: install worker code → $DUAL_WORKER_DIR"
+  # Migrate from the pre-2026-05 install layout: drop the orphaned
+  # $HOME/dual_machine tree once the new path is populated. Skip the
+  # rm if it's somehow the same directory (defensive — should never
+  # happen since DUAL_WORKER_DIR moved under .local).
+  if [[ -d "$DUAL_WORKER_DIR_LEGACY" \
+        && "$DUAL_WORKER_DIR_LEGACY" != "$DUAL_WORKER_DIR" ]]; then
+    log "migrating: removing legacy $DUAL_WORKER_DIR_LEGACY"
+    rm -rf "$DUAL_WORKER_DIR_LEGACY"
+  fi
   mkdir -p "$DUAL_WORKER_DIR"
   install -m 0644 "$PROJECT_DIR/dual_machine/worker.py"          "$DUAL_WORKER_DIR/"
   install -m 0644 "$PROJECT_DIR/dual_machine/worker_3proc.py"    "$DUAL_WORKER_DIR/"
@@ -1736,7 +1749,12 @@ dual_uninstall_pieces() {
   rm -f "$DUAL_TRAY_AUTOSTART"
   rm -f "$DUAL_CFG_FILE"
   [[ -d $DUAL_CFG_DIR && -z "$(ls -A "$DUAL_CFG_DIR" 2>/dev/null)" ]] && rmdir "$DUAL_CFG_DIR"
-  rm -rf "$DUAL_WORKER_DIR"
+  rm -rf "$DUAL_WORKER_DIR" "$DUAL_WORKER_DIR_LEGACY"
+  # If $DUAL_WORKER_DIR was the only thing under
+  # ~/.local/share/dgxspark-mpv/, prune the empty parent so an
+  # uninstall doesn't leave breadcrumbs behind.
+  local dual_share_parent; dual_share_parent="$(dirname "$DUAL_WORKER_DIR")"
+  [[ -d $dual_share_parent && -z "$(ls -A "$dual_share_parent" 2>/dev/null)" ]] && rmdir "$dual_share_parent"
   log "removed dual config + service + tray autostart + worker dir."
 }
 

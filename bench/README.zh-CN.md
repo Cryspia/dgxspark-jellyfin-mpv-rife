@@ -122,7 +122,7 @@ worker 端开 `DUAL_PROFILE=1` + `DUAL_RDMA_PROF=1` +
 | `HOST_IP`    | 来自 `$DUAL_HOST_IP` | RoCE 链路上的本机 |
 | `WORKER_IP`  | 来自 `$DUAL_WORKER_HOST` | RoCE 链路上的 worker |
 | `WORKER_USER`| 来自 `$DUAL_WORKER_USER`，否则 `ubuntu` | worker ssh 用户 |
-| `WORKER_DIR` | 来自 `$DUAL_WORKER_DIR`，否则 `~/dual_machine` （相对 worker 用户家） | rsync 目标 |
+| `WORKER_DIR` | 来自 `$DUAL_WORKER_DIR`，否则 `~/.local/share/dgxspark-mpv/worker` | rsync 目标 |
 | `RDMA_DEV`   | 来自 `$DUAL_RDMA_DEV`，否则 `rocep1s0f0` | 本机 RDMA 设备 |
 | `RDMA_PORT`  | 来自 `$DUAL_RDMA_PORT`，否则 `29900` | worker 端 RDMA 监听端口 |
 | `CLIP_24` / `CLIP_120` | `bench/clips/sample-1080p-{24,120}.mp4` | 输入 |

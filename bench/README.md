@@ -136,7 +136,7 @@ the bottleneck?).
 | `HOST_IP`    | from `$DUAL_HOST_IP` | this box on the RoCE link |
 | `WORKER_IP`  | from `$DUAL_WORKER_HOST` | worker box on the RoCE link |
 | `WORKER_USER`| from `$DUAL_WORKER_USER`, else `ubuntu` | ssh user for worker |
-| `WORKER_DIR` | from `$DUAL_WORKER_DIR`, else `~/dual_machine` on the worker | rsync target on worker |
+| `WORKER_DIR` | from `$DUAL_WORKER_DIR`, else `~/.local/share/dgxspark-mpv/worker` on the worker | rsync target on worker |
 | `RDMA_DEV`   | from `$DUAL_RDMA_DEV`, else `rocep1s0f0` | local RDMA device |
 | `RDMA_PORT`  | from `$DUAL_RDMA_PORT`, else `29900` | RDMA listen port (worker side) |
 | `CLIP_24` / `CLIP_120` | `bench/clips/sample-1080p-{24,120}.mp4` | inputs |
