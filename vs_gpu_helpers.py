@@ -62,6 +62,79 @@ import torch.nn.functional as F
 import vapoursynth as vs
 
 
+# Make the fsrcnnx-cudnn bundle importable from here (matches the
+# resolution logic in sr_keys_helper). We need `chroma_krig` for the
+# luma-guided kriging chroma upsample inside `yuv_p10_to_rgb`. Lazy:
+# the first call to `_chroma_upsample` tries to import, caches the
+# result (or the failure), and falls back to bilinear otherwise.
+_MPV_HOME = Path(
+    os.environ.get("MPV_HOME") or
+    (os.environ.get("XDG_CONFIG_HOME") or
+     os.path.expanduser("~/.config")) + "/mpv"
+)
+_FSRCNNX_BUNDLE = _MPV_HOME / "fsrcnnx-cudnn"
+if _FSRCNNX_BUNDLE.exists() and str(_FSRCNNX_BUNDLE) not in sys.path:
+    sys.path.insert(0, str(_FSRCNNX_BUNDLE))
+
+# Make `ninja` discoverable by torch's load_inline JIT compiler. mpv-conda
+# wrapper sets PYTHONHOME but not PATH, so `shutil.which("ninja")` returns
+# None and the chroma_krig kernel compile aborts. Same workaround
+# worker.py applies for the dual-machine remote process.
+_PY_BIN = str(Path(sys.executable).parent)
+if _PY_BIN not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = _PY_BIN + os.pathsep + os.environ.get("PATH", "")
+
+_krig_fn: "callable | None | bool" = None    # None = not tried, False = unavailable
+
+
+def _chroma_upsample(
+    y_full: torch.Tensor,    # (H, W) fp32, range-normalised luma in [0, 1]
+    u_lo:   torch.Tensor,    # (cH, cW) fp32, range-normalised chroma
+    v_lo:   torch.Tensor,    # (cH, cW) fp32, range-normalised chroma
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Upsample (u_lo, v_lo) to y_full's shape. Tries kriging (~3 ms
+    on GB10, +6-7 dB U/V over bilinear) first; falls back to bilinear
+    if `fsrcnnx_cudnn.chroma_krig` is not importable or its kernel
+    JIT-compile fails. Inputs are range-normalised per the source's
+    _ColorRange (limited stretches Y to [0,1]; chroma sits in ~[-0.5,
+    0.5]); krig is linear in chroma, so negative values pass through
+    correctly. Returns (u_full, v_full) in the same range as inputs."""
+    global _krig_fn
+    h, w = y_full.shape
+    if _krig_fn is None:
+        try:
+            from fsrcnnx_cudnn.chroma_krig import krig_bilateral_chroma
+            _krig_fn = krig_bilateral_chroma
+        except Exception as _e:
+            sys.stderr.write(
+                f"[vs_gpu_helpers] chroma_krig unavailable "
+                f"({type(_e).__name__}: {_e}) — falling back to bilinear\n")
+            _krig_fn = False
+    if _krig_fn is not False:
+        try:
+            u_out = torch.empty((1, 1, h, w),
+                                  device=y_full.device, dtype=torch.float16)
+            v_out = torch.empty_like(u_out)
+            _krig_fn(
+                y_full[None, None].to(torch.float16),
+                u_lo[None, None].to(torch.float16),
+                v_lo[None, None].to(torch.float16),
+                u_out=u_out, v_out=v_out,
+            )
+            return (u_out[0, 0].to(torch.float32),
+                    v_out[0, 0].to(torch.float32))
+        except Exception as _e:
+            sys.stderr.write(
+                f"[vs_gpu_helpers] krig launch failed "
+                f"({type(_e).__name__}: {_e}) — falling back to bilinear\n")
+            _krig_fn = False
+    u_full = F.interpolate(u_lo[None, None], size=(h, w),
+                            mode="bilinear", align_corners=False)[0, 0]
+    v_full = F.interpolate(v_lo[None, None], size=(h, w),
+                            mode="bilinear", align_corners=False)[0, 0]
+    return u_full, v_full
+
+
 # =============================================================================
 # Color conversion math
 # =============================================================================
@@ -120,23 +193,24 @@ _MATRIX_FROM_PROP = {
 
 
 @torch.inference_mode()
-def yuv420p10_to_rgb(
+def yuv_p10_to_rgb(
     y_plane: torch.Tensor,          # (H, W) uint16, 10-bit data in [0, 1023]
-    u_plane: torch.Tensor,          # (H/2, W/2) uint16
-    v_plane: torch.Tensor,          # (H/2, W/2) uint16
+    u_plane: torch.Tensor,          # (cH, cW) uint16; cH/cW infer subsampling
+    v_plane: torch.Tensor,          # (cH, cW) uint16
     matrix: str,
     *,
     color_range: str = "limited",
     out_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    """Convert YUV420P10 to RGB float16/float32 in [0, 1].
+    """Convert 10-bit YUV planes (any subsampling) to RGB in [0, 1].
 
     Returns (1, 3, H, W) tensor on the same device as the inputs.
     `color_range` is "limited" (TV; default — matches streaming /
     Blu-ray) or "full" (PC; game streaming / screen recordings).
-    Uses bilinear chroma upsampling (4:2:0 → 4:4:4); a slight
-    softening vs. zimg's bicubic, but at 4K the difference is below
-    the typical noise floor of streaming sources.
+    Subsampling is inferred from u_plane.shape: shape == y_plane.shape
+    skips upsampling (4:4:4); otherwise the chroma planes are
+    upsampled via `_chroma_upsample` (krig with luma guide, bilinear
+    fallback).
     """
     device = y_plane.device
     y_scale, y_offset, uv_scale, uv_offset = _RANGE_CONSTS_10[color_range]
@@ -144,12 +218,13 @@ def yuv420p10_to_rgb(
     u = (u_plane.to(torch.float32) - uv_offset) / uv_scale
     v = (v_plane.to(torch.float32) - uv_offset) / uv_scale
 
-    # Chroma upsample 4:2:0 → 4:4:4. F.interpolate operates on (N, C, H, W).
+    # Chroma upsample to 4:4:4 only if input chroma is subsampled.
+    # 4:4:4 (cH==H, cW==W) hits the no-op fast path. Krig sees
+    # range-normalized inputs so its luma-similarity weights line up
+    # with the same color_range semantics applied to the matrix mul.
     h, w = y.shape
-    u = F.interpolate(u[None, None], size=(h, w),
-                      mode="bilinear", align_corners=False)[0, 0]
-    v = F.interpolate(v[None, None], size=(h, w),
-                      mode="bilinear", align_corners=False)[0, 0]
+    if u_plane.shape != y_plane.shape:
+        u, v = _chroma_upsample(y, u, v)
 
     # Matrix multiply. Stack into (H, W, 3) [Y, U, V], then dot.
     yuv = torch.stack([y, u, v], dim=-1)  # (H, W, 3)
@@ -168,41 +243,64 @@ def yuv420p10_to_rgb(
 
 
 @torch.inference_mode()
-def rgb_to_yuv420p10(
+def rgb_to_yuv_p10(
     rgb: torch.Tensor,           # (1, 3, H, W) float16/float32 in [0, 1]
     matrix: str,
     *,
     color_range: str = "limited",
+    sub_h: int = 1,              # chroma subsampling shift (1 = 4:2:0)
+    sub_w: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert RGB to YUV420P10 planes (int16, bit-equivalent to uint16
+    """Convert RGB to YUV 10-bit planes (int16, bit-equivalent to uint16
     for 10-bit values in [0, 1023]).
 
     Returns (y, u, v) tensors on the same device as `rgb`. Chroma
-    downsample is a 2×2 average pool (matches center-aligned chroma
-    siting closely enough — same approximation vapoursynth's bicubic
-    is making in the other direction). `color_range` should match
-    whatever the source had — limited stays limited, full stays full —
-    so mpv's downstream display path interprets it correctly."""
+    subsampling is configurable via (sub_h, sub_w):
+      (1, 1) — 4:2:0 (default; 2×2 avg pool)
+      (0, 1) — 4:2:2 (horizontal 1×2 avg pool)
+      (0, 0) — 4:4:4 (no chroma downsample — preserves full-res chroma)
+
+    The 4:4:4 path is useful when the consumer (e.g. FSRCNNX SR with
+    chroma_h_out == proc_h) will not need to upsample chroma back; it
+    avoids one lossy downsample-then-reupsample round-trip.
+
+    `color_range` should match whatever the source had — limited stays
+    limited, full stays full — so mpv's downstream display path
+    interprets it correctly."""
     device = rgb.device
     rgb_f = rgb[0].permute(1, 2, 0).to(torch.float32)  # (H, W, 3)
     m = _RGB2YUV_MATRIX[matrix].to(device)             # (3, 3) [Y,U,V] x [R,G,B]
     yuv = torch.einsum("hwc,rc->hwr", rgb_f, m)        # (H, W, 3)
     y, u, v = yuv[..., 0], yuv[..., 1], yuv[..., 2]
 
-    # Chroma downsample 4:4:4 → 4:2:0 via 2×2 mean pool.
-    u = F.avg_pool2d(u[None, None], kernel_size=2, stride=2)[0, 0]
-    v = F.avg_pool2d(v[None, None], kernel_size=2, stride=2)[0, 0]
+    if sub_h == 1 and sub_w == 1:
+        # 4:2:0 — 2×2 mean pool
+        u = F.avg_pool2d(u[None, None], kernel_size=2, stride=2)[0, 0]
+        v = F.avg_pool2d(v[None, None], kernel_size=2, stride=2)[0, 0]
+    elif sub_h == 0 and sub_w == 1:
+        # 4:2:2 — horizontal 1×2 mean pool only
+        u = F.avg_pool2d(u[None, None], kernel_size=(1, 2), stride=(1, 2))[0, 0]
+        v = F.avg_pool2d(v[None, None], kernel_size=(1, 2), stride=(1, 2))[0, 0]
+    elif sub_h == 0 and sub_w == 0:
+        # 4:4:4 — no downsample
+        pass
+    else:
+        raise ValueError(f"unsupported chroma subsampling ({sub_h}, {sub_w})")
 
-    # Quantize to 10-bit using the matching range's constants. Output
-    # dtype is int16, not uint16: 10-bit YUV values [0, 1023] fit
-    # comfortably under int16's 32767 ceiling, and int16 is what the
-    # int16-reinterpret trick in _planes_to_frame_yuv420p10 expects on
-    # the GPU side.
+    # Quantize to 10-bit using the matching range's constants.
     y_scale, y_offset, uv_scale, uv_offset = _RANGE_CONSTS_10[color_range]
     y_q = (y * y_scale  + y_offset ).round_().clamp_(0, 1023).to(torch.int16)
     u_q = (u * uv_scale + uv_offset).round_().clamp_(0, 1023).to(torch.int16)
     v_q = (v * uv_scale + uv_offset).round_().clamp_(0, 1023).to(torch.int16)
     return y_q, u_q, v_q
+
+
+# Backwards-compatibility alias — existing callers want the 4:2:0 default.
+def rgb_to_yuv420p10(
+    rgb: torch.Tensor, matrix: str, *, color_range: str = "limited",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return rgb_to_yuv_p10(rgb, matrix, color_range=color_range,
+                           sub_h=1, sub_w=1)
 
 
 # =============================================================================
@@ -392,6 +490,7 @@ def rife_yuv(
     factor_den: int = 1,
     device_index: int = 0,
     color_range: str = "limited",
+    target_subsample: str = "420",
 ) -> vs.VideoNode:
     """Frame-doubling RIFE with GPU color conversion. Drop-in for the
     sequence
@@ -402,12 +501,25 @@ def rife_yuv(
 
     with the two CPU bicubics moved onto the GPU. Engine selection +
     cache filename match vsrife exactly, so existing cached engines
-    (built by install.sh's warmup step) are reused as-is."""
+    (built by install.sh's warmup step) are reused as-is.
+
+    target_subsample ("420" default, "444" optional): when "444" the
+    output clip is YUV444P10 — chroma is kept at full luma resolution
+    instead of avg-pooled back to 4:2:0. Useful when the SR consumer
+    (apply_fsrcnnx with chroma_h_out == clip.height) can leverage the
+    fully-resolved chroma without a downsample-then-upsample round-trip.
+    """
     if clip.format is None or clip.format.color_family != vs.YUV:
         raise vs.Error("rife_yuv: input must be YUV")
     if clip.format.id != int(vs.YUV420P10):
         raise vs.Error("rife_yuv: only YUV420P10 supported "
                         f"(got {clip.format.name})")
+    if target_subsample not in ("420", "444"):
+        raise vs.Error(
+            f"rife_yuv: target_subsample must be '420' or '444' "
+            f"(got {target_subsample!r})")
+    _OUT_SUB = {"420": (1, 1), "444": (0, 0)}[target_subsample]
+    _OUT_FORMAT = {"420": vs.YUV420P10, "444": vs.YUV444P10}[target_subsample]
 
     # Don't sniff the matrix at init — mpv's vapoursynth integration
     # disallows frame requests before the filter graph is fully wired,
@@ -427,6 +539,34 @@ def rife_yuv(
     stream_inf = cfg["stream_inf"]; stream_io = cfg["stream_io"]
     lock_inf = cfg["lock_inf"]; lock_io = cfg["lock_io"]
 
+    # Engine cuDNN-graph warmup: feed zeros through flownet (+ encode
+    # head when present) once at construction time so the graph
+    # compile cost is paid here instead of on mpv's first inference
+    # request. Pure synthetic input — never touches mpv's source clip.
+    # Avoids the failure mode where mpv vf_vapoursynth returns
+    # uninitialised black frames during script load and a
+    # `clip.get_frame()`-based prewarm caches those.
+    import time as _warm_time
+    _t_warm0 = _warm_time.perf_counter()
+    with torch.inference_mode(), torch.cuda.stream(stream_inf):
+        _zero_rgb = torch.zeros(1, 3, ph, pw, dtype=torch.float16, device=device)
+        _zero_t = torch.zeros(1, 1, ph, pw, dtype=torch.float16, device=device)
+        _f0_warm = encode(_zero_rgb) if encode is not None else None
+        _f1_warm = encode(_zero_rgb) if encode is not None else None
+        if encode is not None:
+            flownet(_zero_rgb, _zero_rgb, _zero_t, tenFlow_div,
+                    backwarp_tenGrid, _f0_warm, _f1_warm)
+        else:
+            flownet(_zero_rgb, _zero_rgb, _zero_t, tenFlow_div,
+                    backwarp_tenGrid)
+        stream_inf.synchronize()
+    del _zero_rgb, _zero_t, _f0_warm, _f1_warm
+    import sys as _sys
+    _sys.stderr.write(
+        f"[rife_yuv] engine warm {model}@{w}x{h} (pad {pw}x{ph}) in "
+        f"{(_warm_time.perf_counter()-_t_warm0)*1000:.0f}ms\n")
+    _sys.stderr.flush()
+
     # Per-source-frame caches: rgb tensor (img0/img1 input to flownet),
     # f0 (encode output), and the matrix string (so the reverse RGB→YUV
     # uses the same matrix the input was decoded with). Keyed by
@@ -441,11 +581,11 @@ def rife_yuv(
     # stale-eviction race. cache_lock serialises mutation; reads are
     # safe under the GIL because dict access is atomic per-op.
     # Maximum cached source-frame entries. With factor_num=2 and mpv's
-    # buffered-frames=12 / concurrent-frames=4, at most ~12 distinct
-    # source frames are referenced concurrently; 64 leaves plenty of
-    # headroom. At 1080p RGB16 a single entry is ~12 MB → ~770 MB GPU
-    # cap (similar for f0_cache); fits well inside our 100+ GB unified
-    # memory budget.
+    # buffered-frames=12 / concurrent-frames=24 (saturates at ~20 in
+    # flight), at most ~20 distinct source frames are referenced
+    # concurrently; 64 leaves plenty of headroom. At 1080p RGB16 a
+    # single entry is ~12 MB → ~770 MB GPU cap (similar for f0_cache);
+    # fits well inside our 100+ GB unified memory budget.
     CACHE_MAX = 64
     rgb_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
     f0_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
@@ -517,7 +657,7 @@ def rife_yuv(
             matrix = _frame_matrix(src_frame)
             with lock_io, torch.cuda.stream(stream_io):
                 yp, up, vp = _frame_yuv420p10_to_planes(src_frame, device)
-                rgb = yuv420p10_to_rgb(yp, up, vp, matrix,
+                rgb = yuv_p10_to_rgb(yp, up, vp, matrix,
                                        color_range=color_range,
                                        out_dtype=torch.float16)
                 if need_pad:
@@ -558,13 +698,29 @@ def rife_yuv(
         t = (n * factor_den) % factor_num / factor_num
 
         # Pass-through real frames (t == 0): convert YUV → RGB just to
-        # cache (for subsequent interpolated frames), but copy the
-        # source frame straight to the output without RIFE.
+        # cache (for subsequent interpolated frames). For 4:2:0 output
+        # we can return the source frame directly; for 4:4:4 output
+        # we have to materialise a chroma-upsampled version because
+        # the source frame's YUV420P10 layout doesn't match the
+        # out_skeleton's YUV444P10. We synthesise it from the cached
+        # RGB (which already holds chroma at full luma resolution
+        # because yuv_p10_to_rgb upsampled it during the encoding
+        # pass) by running the reverse with sub_h=sub_w=0.
         if t == 0:
-            rgb, _, _ = _cache_get(real_n)
+            rgb, _, matrix = _cache_get(real_n)
             if rgb is None:
                 _convert_and_encode(real_n, f[0])
-            return f[0]   # vapoursynth allows returning the input frame
+                rgb, _, matrix = _cache_get(real_n)
+            if target_subsample == "420":
+                return f[0]
+            rgb_unpadded = rgb[:, :, :h, :w] if need_pad else rgb
+            with lock_inf, torch.cuda.stream(stream_inf):
+                yq, uq, vq = rgb_to_yuv_p10(rgb_unpadded, matrix,
+                                              color_range=color_range,
+                                              sub_h=_OUT_SUB[0],
+                                              sub_w=_OUT_SUB[1])
+                stream_inf.synchronize()
+            return _planes_to_frame_yuv420p10(yq, uq, vq, f[2])
 
         # Interpolated frame: ensure both source frames are in cache,
         # then take a strong reference to the cache entries before we
@@ -595,7 +751,8 @@ def rife_yuv(
             # Use the matrix the source frame came in with — videos with
             # mid-stream matrix changes are extremely rare; for the common
             # case both source frames share a matrix.
-            yq, uq, vq = rgb_to_yuv420p10(out, matrix, color_range=color_range)
+            yq, uq, vq = rgb_to_yuv_p10(out, matrix, color_range=color_range,
+                                          sub_h=_OUT_SUB[0], sub_w=_OUT_SUB[1])
             stream_inf.synchronize()
 
         # Write GPU result directly into the BlankClip dst frame (no
@@ -619,7 +776,24 @@ def rife_yuv(
         interleaved = interleaved[::factor_den]
         next_clip = next_clip[::factor_den]
 
-    out_skeleton = interleaved.std.BlankClip(keep=True)
+    # When target_subsample == "444", switch the output skeleton from
+    # YUV420P10 (inherited from interleaved) to YUV444P10 so the
+    # _planes_to_frame writer sees the correct plane dimensions.
+    #
+    # keep=False is mandatory here: keep=True makes BlankClip return
+    # the SAME VSFrame for every output index, and our _inference_pass
+    # writes through f[2] in-place. Under vapoursynth concurrent-frames
+    # > 1, two worker threads write through the same physical buffer
+    # at the same time → chroma drift across runs (Y often lands
+    # bit-identical because the GPU copy is plane-ordered Y→U→V and
+    # the last writer's Y often overlaps the first writer's Y at the
+    # same content, while U/V vary). Same root cause as the
+    # fsrcnnx-cudnn upstream fix e1344b8 — see [[fsrcnnx-runner-race-fix]]
+    # memory. Per-request fresh buffer eliminates the aliasing.
+    if target_subsample == "444":
+        out_skeleton = interleaved.std.BlankClip(keep=False, format=vs.YUV444P10)
+    else:
+        out_skeleton = interleaved.std.BlankClip(keep=False)
     out = out_skeleton.std.ModifyFrame(
         clips=[interleaved, next_clip, out_skeleton],
         selector=_inference_pass,

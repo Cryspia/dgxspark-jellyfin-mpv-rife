@@ -1,0 +1,24 @@
+[Unit]
+Description=DGX Spark dual-machine RIFE+FSRCNNX worker (rank 1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=@DUAL_CONFIG_FILE@
+ExecStart=@PYTHON_BIN@ -B @WORKER_PY@
+# `always` (not `on-failure`) — worker's SIGTERM handler calls
+# sys.exit(0) for graceful shm/NCCL cleanup, which on-failure would
+# interpret as "user wanted it stopped, don't restart". A long-running
+# daemon should stay up across stops; `systemctl --user stop` (or
+# disable) still works for taking it down explicitly.
+Restart=always
+RestartSec=5
+# Worker holds the GPU for the lifetime of a session; killing it
+# mid-session leaves cuDNN graph state allocated. Give systemd time
+# for the in-process SIGTERM handler to release shm + destroy NCCL pg.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

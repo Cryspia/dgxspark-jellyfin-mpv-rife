@@ -60,6 +60,7 @@ def apply_fsrcnnx(
     target_w: int | None = None,
     target_h: int | None = None,
     chroma_kernel: str = "Lanczos",
+    output_subsampling: tuple[int, int] | None = None,
 ):
     """Run FSRCNNX with F8 override support.
 
@@ -100,6 +101,7 @@ def apply_fsrcnnx(
             clip, weights_npz=str(weights_npz), variant=variant_full,
             target_width=target_w, target_height=target_h,
             chroma_kernel=chroma_kernel, min_ratio=0.0,
+            output_subsampling=output_subsampling,
         )
         _publish_active(override)
         return clip
@@ -113,6 +115,7 @@ def apply_fsrcnnx(
             clip, weights_dir=str(weights_dir),
             target_width=target_w, target_height=target_h,
             family=family, chroma_kernel=chroma_kernel,
+            output_subsampling=output_subsampling,
         )
 
     short = picked.replace("FSRCNNX_", "").replace("-0-4-1", "")
@@ -121,4 +124,5 @@ def apply_fsrcnnx(
         clip, weights_dir=str(weights_dir),
         target_width=target_w, target_height=target_h,
         family=family, chroma_kernel=chroma_kernel,
+        output_subsampling=output_subsampling,
     )
