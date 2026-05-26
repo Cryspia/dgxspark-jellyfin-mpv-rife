@@ -91,7 +91,7 @@ DEFAULT_VIDEO_MIMES=(
 # fsrcnnx-cudnn release tag pulled by install_configs. Bumping this
 # fetches a different bundle from
 # https://github.com/Cryspia/fsrcnnx-cudnn/releases/download/<tag>/fsrcnnx-cudnn-bundle.tar.gz
-FSRCNNX_CUDNN_VERSION="v0.1.1"
+FSRCNNX_CUDNN_VERSION="v0.2.2"
 
 # Dual-machine layout. The host's mpv reads DUAL_* from this file (via
 # the mpv-conda wrapper); the secondary box's systemd worker service
@@ -593,6 +593,34 @@ EOF
   # at runtime via /tmp/fsrcnnx_variant and /tmp/rife_disabled.
   cp -f "$PROJECT_DIR/dual_machine/rife.vpy" "$MPV_CFG_DIR/"
   log "wrote $MPV_CFG_DIR/rife.vpy"
+
+  # dual_machine/*.py — rife.vpy adds $MPV_CFG_DIR/dual_machine to
+  # sys.path and imports native_dispatcher / queue_mgr / etc. from
+  # it (the singleton + lua-hook plumbing). Mirror the project's
+  # dual_machine/ tree so the import resolves without depending on
+  # the source tree being in a fixed location. native_filter is a
+  # vapoursynth C++ filter; build it if the .so isn't there yet
+  # (a fresh clone has the sources but not the build/ output).
+  local native_so="$PROJECT_DIR/dual_machine/native_filter/build/libdgxspark_split_dual.so"
+  if [[ ! -f "$native_so" ]]; then
+    section "step 7b/10: cmake build native_filter"
+    in_env bash -c "
+      cd '$PROJECT_DIR/dual_machine/native_filter'
+      mkdir -p build && cd build
+      cmake -DCMAKE_BUILD_TYPE=Release .. >/tmp/native_filter_cmake.log 2>&1
+      make -j$(nproc) >>/tmp/native_filter_cmake.log 2>&1
+    " || fatal "native_filter build failed — see /tmp/native_filter_cmake.log"
+    [[ -f "$native_so" ]] || fatal "build claimed success but $native_so is missing"
+    log "built $(ls -la "$native_so" | awk '{print $5}') bytes"
+  fi
+  install -d "$MPV_CFG_DIR/dual_machine" "$MPV_CFG_DIR/dual_machine/native_filter"
+  rsync -a --delete --exclude='__pycache__' --exclude='native_filter' \
+        --exclude='*.sh' --exclude='*.md' --exclude='*.in' --exclude='rife.vpy' \
+        "$PROJECT_DIR/dual_machine/" "$MPV_CFG_DIR/dual_machine/"
+  rsync -a --delete --exclude='__pycache__' \
+        "$PROJECT_DIR/dual_machine/native_filter/" \
+        "$MPV_CFG_DIR/dual_machine/native_filter/"
+  log "wrote $MPV_CFG_DIR/dual_machine/ ($(ls "$MPV_CFG_DIR/dual_machine"/*.py 2>/dev/null | wc -l) py modules + native_filter/)"
 
   # Old per-band .vpy files / legacy FSRCNNX glsl shaders / in-tree
   # weights / old bundle location under scripts/ have all been
@@ -1323,7 +1351,8 @@ cmd_uninstall() {
   done
   rm -rf "$MPV_CFG_DIR/scripts" "$MPV_CFG_DIR/shaders" \
          "$MPV_CFG_DIR/weights" "$MPV_CFG_DIR/fsrcnnx_cudnn" \
-         "$MPV_CFG_DIR/fsrcnnx-cudnn"
+         "$MPV_CFG_DIR/fsrcnnx-cudnn" "$MPV_CFG_DIR/dual_machine" \
+         "$MPV_CFG_DIR/__pycache__"
   # Preserved (not deleted):
   #   $MPV_CFG_DIR/danmaku-credentials.json   ← dandanplay AppId/Secret
   #   $MPV_CFG_DIR/danmaku-settings.json      ← user's panel choices

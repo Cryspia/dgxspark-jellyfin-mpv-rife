@@ -120,22 +120,28 @@ kill_remote_worker() {
 }
 cleanup_all() { kill_local_mpv; kill_remote_worker; }
 
-# ─── worker launch (rsyncs current dual_machine + vs_gpu_helpers,
-#     reuses the same process across mode switches) ─────────────────
+# ─── worker launch ────────────────────────────────────────────────
+# By default rsyncs the current dual_machine + vs_gpu_helpers tree
+# to $WORKER_DIR so the bench tests the dev-tree code, not what the
+# guest has installed. Set BENCH_USE_INSTALLED=1 to skip the rsync
+# and launch the worker.py that install.sh put in place on the
+# guest — useful for verifying a clean install.
 _WORKER_STARTED=0
 start_worker() {
   [[ $_WORKER_STARTED = 1 ]] && return 0
   kill_remote_worker
-  rsync -azq \
-    "$DUAL_DIR/worker.py" "$DUAL_DIR/rdma_transport.py" \
-    "$DUAL_DIR/worker_3proc.py" "$DUAL_DIR/mp_pipeline.py" \
-    "$DUAL_DIR/cc_cache.py" "$DUAL_DIR/queue_mgr.py" \
-    "$MPV_CFG/vs_gpu_helpers.py" \
-    "$WORKER_USER@$WORKER_IP:$WORKER_DIR/"
-  ssh -n "$WORKER_USER@$WORKER_IP" "mkdir -p ~/.config/mpv/fsrcnnx-cudnn"
-  rsync -azq --delete --exclude='__pycache__' \
-    "$MPV_CFG/fsrcnnx-cudnn/fsrcnnx_cudnn/" \
-    "$WORKER_USER@$WORKER_IP:.config/mpv/fsrcnnx-cudnn/fsrcnnx_cudnn/"
+  if [[ "${BENCH_USE_INSTALLED:-0}" != "1" ]]; then
+    rsync -azq \
+      "$DUAL_DIR/worker.py" "$DUAL_DIR/rdma_transport.py" \
+      "$DUAL_DIR/worker_3proc.py" "$DUAL_DIR/mp_pipeline.py" \
+      "$DUAL_DIR/cc_cache.py" "$DUAL_DIR/queue_mgr.py" \
+      "$MPV_CFG/vs_gpu_helpers.py" \
+      "$WORKER_USER@$WORKER_IP:$WORKER_DIR/"
+    ssh -n "$WORKER_USER@$WORKER_IP" "mkdir -p ~/.config/mpv/fsrcnnx-cudnn"
+    rsync -azq --delete --exclude='__pycache__' \
+      "$MPV_CFG/fsrcnnx-cudnn/fsrcnnx_cudnn/" \
+      "$WORKER_USER@$WORKER_IP:.config/mpv/fsrcnnx-cudnn/fsrcnnx_cudnn/"
+  fi
   ssh -n "$WORKER_USER@$WORKER_IP" "
     cd $WORKER_DIR && \
     ( nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
