@@ -45,13 +45,13 @@ full 链路 GPU 使用率：
 
 GB10, 1080p 源，CF=24, INTERP_MULT=2.
 
-| task type | GPU kernel 平均 (ms) | idle_before 平均 (ms) |
+| task type | GPU kernel 平均 （ms） | idle_before 平均 （ms） |
 |---|---|---|
 | INTERP    | 5 – 7  | 0.3 – 0.8 |
 | SR_INTERP | 6 – 8  | 0.4 – 1.2 |
 | CCSR      | 9 – 12 | 0.2 – 0.6 |
 
-## RDMA 传输 (worker → host)
+## RDMA 传输 （worker → host）
 
 | task | post_send (ms) | wire RTT (ms) |
 |---|---|---|
@@ -63,8 +63,8 @@ GB10, 1080p 源，CF=24, INTERP_MULT=2.
 
 ## 理论上限
 
-RIFE 4.26 在 GB10 上 SM 饱和 = 单 GPU 跑 1 个 INTERP 全速,2 个并发
-就 cache thrash. 两块 GPU 各跑一个 INTERP + CCSR / SR / 线 完美
+RIFE 4.26 在 GB10 上 SM 饱和 = 单 GPU 跑 1 个 INTERP 全速，2 个并发
+就 cache thrash。 两块 GPU 各跑一个 INTERP + CCSR / SR / 线 完美
 pipeline ≈ 单机能跑到的 **108 fps** 上限。 当前稳态 96 fps = 上限的
 89 %.
 

@@ -6,7 +6,7 @@
 跑在 **NVIDIA DGX Spark** (GB10, ARM64, CUDA 13, Ubuntu 24.04, GNOME
 Wayland) 上。
 
-可选 **双机模式** (experimental):把链路切到两台 Spark 上通过 200 G
+可选 **双机模式** (experimental)：把链路切到两台 Spark 上通过 200 G
 RoCE 互联，稳态 fps 大约翻倍。
 
 ## 用法
@@ -30,14 +30,14 @@ RoCE 互联，稳态 fps 大约翻倍。
   conda-forge 上的 aarch64 mpv 是无显示后端的 headless library 版，所以
   脚本自己编一份。
 - **vsrife + TensorRT** 按源分辨率 + 帧率挑 RIFE 模型，每种组合的预算
-  正好够 GB10 的单帧 envelope. 完整表见 [默认配置]（#默认配置）。
+  正好够 GB10 的单帧 envelope。 完整表见 [默认配置](#默认配置)。
 - **GPU YUV↔RGB 色彩转换** (`vs_gpu_helpers.rife_yuv`) — 矩阵乘 + chroma
-  resample 都跑在 GPU 上，而不是 zimg 的 CPU 路径 (后者 4K 单帧 ~30 ms
-  在 Grace CPU 上). 支持 YUV 4:2:0 / 4:2:2 / 4:4:4 / 8 / 10 / 12 / 16 bit,
+  resample 都跑在 GPU 上，而不是 zimg 的 CPU 路径 （后者 4K 单帧 ~30 ms
+  在 Grace CPU 上）。 支持 YUV 4:2:0 / 4:2:2 / 4:4:4 / 8 / 10 / 12 / 16 bit,
   BT.709 / 601 / 2020 NCL,limited 或 full range.
 - **FSRCNNX cuDNN 超分** — 从上游
   [`Cryspia/fsrcnnx-cudnn`](https://github.com/Cryspia/fsrcnnx-cudnn)
-  release 包安装 (variants x2_8 / x2_16 / x3_16 / x4_16). 链路自动按
+  release 包安装 （variants x2_8 / x2_16 / x3_16 / x4_16）。 链路自动按
   源 ↔ 目标比挑。
 - **KrigBilateral chroma kriging** — luma 引导的 chroma 升采样，所有
   chroma resize 步骤都用。 内部 CUDA kernel 在 `fsrcnnx-cudnn` 里 +
@@ -57,20 +57,20 @@ RoCE 互联，稳态 fps 大约翻倍。
 | 任意 | > 30 fps | 关 | 比例值得才跑 |
 
 25 fps 阈值是预算切分：≤24 fps 源 × 2 → 48 fps 输出 → 20.8 ms/帧，重链
-(RIFE 4.26 + 16-layer FSRCNNX) 正好够；25+ fps 时输出预算降到 16.7 ms,
-重链就跑不动 — 所以 25/29.97/30 fps 内容用轻链 (4.6 + 8-layer).
+（RIFE 4.26 + 16-layer FSRCNNX） 正好够；25+ fps 时输出预算降到 16.7 ms，
+重链就跑不动 — 所以 25/29.97/30 fps 内容用轻链 （4.6 + 8-layer）.
 
-4K 源走 **mixed mode**: 真实帧原始 4K 直通 (bit-exact),只在合成的中间
+4K 源走 **mixed mode**： 真实帧原始 4K 直通 （bit-exact），只在合成的中间
 帧上走 降采样 → RIFE → SR 升采样路径。每帧预算大概翻倍，4.26 + 16-layer
 重链能跑。
 
-显示目标默认 4K. 屏幕小的设 `FSRCNNX_TARGET_W` / `FSRCNNX_TARGET_H` env
+显示目标默认 4K。 屏幕小的设 `FSRCNNX_TARGET_W` / `FSRCNNX_TARGET_H` env
 覆盖。
 
-## 双机模式 (experimental)
+## 双机模式 （experimental）
 
 两台 DGX Spark 通过 200 G RoCE 互联，把 CCSR / INTERP / SR_INTERP 切到
-两块 GB10 上跑。 稳态吞吐约单机 1.95×,真实帧 byte-identical,插帧视觉
+两块 GB10 上跑。 稳态吞吐约单机 1.95×，真实帧 byte-identical，插帧视觉
 上一致。
 
 安装：
@@ -85,8 +85,8 @@ RoCE 互联，稳态 fps 大约翻倍。
 两边都会提示输 cluster 网络配置 （RDMA 设备 / 端口 / 自身 IP / 对端 IP）；
 默认值从 `ip link` / `ip a` 取。 想脚本化安装就预设 `--help` 列出的 env.
 
-播放时：**Shift+F9** 开关双机 offload. 连不上自动回退到单机模式 (再按一
-次重试).
+播放时：**Shift+F9** 开关双机 offload。 连不上自动回退到单机模式 （再按一
+次重试）.
 
 → 完整设计 + 组件细节：[`dual_machine/README.zh-CN.md`](./dual_machine/README.zh-CN.md).
 
@@ -100,17 +100,17 @@ GPU 使用率，每任务耗时。
 ## Benchmark
 
 → [`bench/README.zh-CN.md`](./bench/README.zh-CN.md) — color / fps /
-per-task timing 脚本。 测试视频用 `bench/gen_clips.sh` 合成 (不依赖本机
-路径).
+per-task timing 脚本。 测试视频用 `bench/gen_clips.sh` 合成 （不依赖本机
+路径）.
 
 ## 按键
 
 - **F8** — 切 FSRCNNX 变体 （`16x4 → 16x3 → 16x2 → 8x2 → 关 → 循环`）；
   每按一次触发 vapoursynth filter reload （1–3 s 卡顿）。 下次文件加载重置
   回 auto.
-- **F9** — 单机：开关 RIFE. 双机：循环插帧倍数 (4 → 3 → 2 → 1 → off).
-- **Shift+F8** — 开关显示阶段 KrigBilateral chroma GLSL. 即时 (不 reload
-  vf); 跨文件 persist.
+- **F9** — 单机：开关 RIFE。 双机：循环插帧倍数 （4 → 3 → 2 → 1 → off）.
+- **Shift+F8** — 开关显示阶段 KrigBilateral chroma GLSL。 即时 （不 reload
+  vf）； 跨文件 persist.
 - **Shift+F9** — 开关双机 offload （未 `--dual-host` 安装时无效）。 连接失败
   自动回退。
 - 所有 mpv 默认键都在 （`i` 看 stats, `s` 截图，等等）。
