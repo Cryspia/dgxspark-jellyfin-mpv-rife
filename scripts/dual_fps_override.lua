@@ -8,9 +8,11 @@
 -- 30000/1001). rife.vpy's in-vpy heuristic then sees src_fps=0 and
 -- falls into the `≤ 24 → mult=3` branch — so a 30 fps source plays
 -- at mult=3 (≈ 89 fps output) instead of the intended mult=2, which
--- on a 60 Hz vo just stutters. ffprobe over the file path is the
+-- on a 60 Hz vo just stutters. ffprobe over the source path/URL is the
 -- reliable source of truth; we run it once at `on_load` and stamp
--- the right mult before vapoursynth init.
+-- the right mult before vapoursynth init. ffprobe reads local files and
+-- http(s) URLs alike, so this also covers Jellyfin streams (the primary
+-- use case — every Jellyfin source is an https stream URL).
 --
 -- DUAL_FPS_OVERRIDE_DISABLE=1 → no-op.
 
@@ -40,8 +42,12 @@ local function ffprobe_video(path)
     -- fields one at a time because ffprobe's csv emits fields in the
     -- container's declaration order, not in the order requested.
     local function one(field)
+        -- `timeout` caps the probe: ffprobe over an http(s) Jellyfin
+        -- stream URL fetches the container header over the network, so
+        -- a slow/unreachable server must not hang the on_load hook
+        -- (which blocks mpv's file load until it returns).
         local cmd = string.format(
-            "ffprobe -v error -select_streams v:0 "
+            "timeout 8 ffprobe -v error -select_streams v:0 "
             .. "-show_entries stream=%s -of csv=p=0 %q "
             .. "2>/dev/null < /dev/null",
             field, path)
@@ -88,8 +94,11 @@ local function on_load()
     if file_exists(DUAL_OFF_FLAG) then return end
     local path = mp.get_property("path")
     if not path then return end
-    -- Plain file paths only — skip http://, etc.
-    if path:match("^%a+://") then return end
+    -- ffprobe handles both local file paths and http(s) URLs. Jellyfin
+    -- (the primary use case) always streams over https, so we must NOT
+    -- skip network URLs — the stream URL carries its own auth token and
+    -- ffprobe reads the container header directly. The `timeout` in
+    -- ffprobe_video bounds the network probe.
     local num, den, h = ffprobe_video(path)
     if not num or not den or den == 0 then return end
     local src_fps = num / den
