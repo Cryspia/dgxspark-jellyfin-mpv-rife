@@ -205,11 +205,34 @@ def make_dispatcher(
                     f"[native_dispatcher] singleton INVALIDATE — params "
                     f"changed {_st.get('params_key')} → {_params_key}\n")
                 sys.stderr.flush()
-                for _key in ("queue_mgr", "host_mp"):
-                    _obj = _st.get(_key)
-                    if _obj is not None:
-                        try: _obj.shutdown()
-                        except Exception: pass
+                # Tear down in the same order as _do_shutdown(): stop the
+                # queue, close guest_mp's RDMA channel, stop host_mp, then
+                # close the liveness socket. Closing guest_mp + the
+                # liveness socket is essential — the liveness close is what
+                # trips the worker's watchdog ("liveness recv returned 0
+                # bytes"), so it resets its 3-proc session and returns to
+                # "waiting for host" and the rebuild below can hand-shake a
+                # fresh session. Tearing down only queue_mgr + host_mp (the
+                # old bug) left guest_mp's RDMA + the liveness socket open,
+                # so the worker kept serving the stale session and the
+                # rebuild's handshake hung → mpv froze on every F9 mult
+                # change.
+                _old_qm = _st.get("queue_mgr")
+                if _old_qm is not None:
+                    try: _old_qm.shutdown()
+                    except Exception: pass
+                _old_gmp = _st.get("guest_mp")
+                if _old_gmp is not None:
+                    try: _old_gmp.close()
+                    except Exception: pass
+                _old_hmp = _st.get("host_mp")
+                if _old_hmp is not None:
+                    try: _old_hmp.shutdown()
+                    except Exception: pass
+                _old_lsock = _st.get("liveness_sock")
+                if _old_lsock is not None:
+                    try: _old_lsock.close()
+                    except Exception: pass
                 _st.clear()
 
     dev = torch.device(device)
