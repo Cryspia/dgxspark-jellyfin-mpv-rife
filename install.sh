@@ -529,22 +529,22 @@ glsl-shaders=~~/shaders/KrigBilateral.glsl
 # `or 0` sentinel: at the first profile-cond evaluation (before the
 # demuxer fills video-params/h) the property is nil; defaulting to 0
 # fails the gate so the vf isn't briefly attached then ripped off.
-# `concurrent-frames=24 / buffered-frames=24` — must be ≥ ~16 or mpv's
+# `concurrent-frames=24 / buffered-frames=12` — must be ≥ ~16 or mpv's
 # vsapi per-call overhead (~16 ms gap between consecutive compute_callable
 # invocations) caps real-playback throughput at ~30 fps regardless of how
 # fast the filter chain itself is. With CF=24 mpv saturates at its
 # internal cap of 20 concurrent requests, which matches the bench config
 # the steady-state numbers in docs/performance.md were measured under.
-# bf=24 gives ~400 ms of completed-frame headroom in the vsapi done-queue
-# on top of the in-flight CF=24 — enough to absorb per-frame jitter when
-# individual compute pairs spike above the per-frame budget. Tradeoff:
-# at 4K source bf>16 costs ~6 fps of steady throughput (scheduler
-# over-prefetches and pressures GPU memory); accepted for the smoother
-# playback at 1080p where jitter is more visible.
+# bf=12 (not 24): a higher buffered-frames pushes more dual-pipeline
+# slots in flight, which pressures GPU memory and (empirically) makes
+# the dual chain's intermittent mpv crash fire sooner; bf=12 was the
+# stable value. At 4K source bf>16 also costs ~6 fps of steady
+# throughput. bf=12 keeps a healthy ~200 ms pre-buffer for smoothness
+# without those downsides.
 [rife]
 profile-cond=0<(p["video-params/h"] or 0) and (p["video-params/h"] or 0)<=2160
 profile-restore=copy-equal
-vf=vapoursynth=~~/rife.vpy:buffered-frames=24:concurrent-frames=24
+vf=vapoursynth=~~/rife.vpy:buffered-frames=12:concurrent-frames=24
 EOF
   log "wrote $MPV_CFG_DIR/mpv.conf"
 
