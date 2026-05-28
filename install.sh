@@ -928,6 +928,12 @@ install_launchers() {
 # so DUAL_WORKER_HOST + DUAL_RDMA_* are visible to rife.vpy at
 # playback time without any per-user env setup.
 export PYTHONHOME="$ENV_PREFIX"
+# Put the env's bin first on PATH so torch's cpp_extension JIT finds
+# \`ninja\` (conda-installed) when it (re)compiles the chroma_krig CUDA
+# kernel on first frame; without it the build aborts with "Ninja is
+# required" and krig falls back to a slow per-frame path. nvcc comes
+# from the system CUDA toolkit already on PATH.
+export PATH="$ENV_PREFIX/bin:\$PATH"
 if [[ -f "$DUAL_CFG_FILE" ]]; then
   set -a; . "$DUAL_CFG_FILE"; set +a
 fi
@@ -948,6 +954,11 @@ EOF
 SYS_GIR="/usr/lib/aarch64-linux-gnu/girepository-1.0"
 export GI_TYPELIB_PATH="\${GI_TYPELIB_PATH:+\$GI_TYPELIB_PATH:}\$SYS_GIR"
 export PYTHONHOME="$ENV_PREFIX"
+# Env bin first on PATH so mpv's embedded torch cpp_extension finds
+# \`ninja\` for the chroma_krig CUDA-kernel JIT (same reason as the
+# mpv-conda wrapper); also makes the shim's ffprobe sidecar use the
+# env's ffmpeg.
+export PATH="$ENV_PREFIX/bin:\$PATH"
 # Source the dual-machine cluster config so DUAL_WORKER_HOST + DUAL_RDMA_*
 # are visible to rife.vpy when the shim spawns mpv; without these in env,
 # rife.vpy short-circuits to single-machine mode (see rife.vpy:155).
