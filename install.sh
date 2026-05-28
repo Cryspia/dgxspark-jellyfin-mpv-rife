@@ -479,6 +479,11 @@ profile=gpu-hq
 
 # Frame timing — RIFE generates the extra frames, so mpv's own temporal
 # interpolation must be off (otherwise we double-interpolate).
+# video-sync=display-resample is the safe default; `install.sh --dual-host`
+# post-edits this to `display-desync`, which keeps display-paced frame
+# scheduling but skips audio resampling — recovers ~1.6 fps under the
+# dual chain's CUDA-vs-Vulkan SM contention on a single GB10. Any drift
+# is sub-perceptible at 1-3h sessions and resets to zero on every seek.
 video-sync=display-resample
 interpolation=no
 tscale=oversample
@@ -546,6 +551,16 @@ profile-cond=0<(p["video-params/h"] or 0) and (p["video-params/h"] or 0)<=2160
 profile-restore=copy-equal
 vf=vapoursynth=~~/rife.vpy:buffered-frames=12:concurrent-frames=24
 EOF
+  # --dual-host only: switch video-sync from the safe display-resample
+  # default to display-desync. Bench shows ~+1.6 fps display under the
+  # dual chain's GPU contention (audio resample skipped). Drift is
+  # imperceptible at 1-3 h and resets on every seek. Single-machine
+  # and dual-secondary boxes keep display-resample.
+  if (( INSTALL_DUAL_HOST )); then
+    sed -i 's/^video-sync=display-resample$/video-sync=display-desync/' \
+      "$MPV_CFG_DIR/mpv.conf"
+    log "dual-host: mpv.conf video-sync → display-desync"
+  fi
   log "wrote $MPV_CFG_DIR/mpv.conf"
 
   # input.conf — F8 / F9 are bound by scripts/sr_keys.lua (cycle FSRCNNX
