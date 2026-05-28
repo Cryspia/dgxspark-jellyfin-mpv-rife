@@ -410,7 +410,9 @@ class RDMAChannel:
 def dst_bundle_layout(out_h: int, out_w: int, oc_h: int, oc_w: int,
                        *,
                        pH: int = 1088, pW: int = 1920,
-                       enc_ch: int = 4) -> tuple[int, list]:
+                       enc_ch: int = 4,
+                       interp_overlay_bytes: int = 0
+                       ) -> tuple[int, list]:
     """Result planes the worker sends back.
 
     Layout: 4K SR output (yao/uao/vao) + CCSR mid-output (rgb_padded
@@ -430,6 +432,13 @@ def dst_bundle_layout(out_h: int, out_w: int, oc_h: int, oc_w: int,
     computed by callers (see worker_3proc / host_3proc) using the
     returned layout dict.
 
+    `interp_overlay_bytes` reserves enough tail capacity for the
+    dense-pack INTERP overlay (max_mult * rgb_interp_size). When the
+    no_sr path makes output dim equal to source dim, the named-region
+    total can fall below mult × rgb_interp_size and the dense-pack
+    would assert in mp_pipeline.task_dst_ranges. Pad the total so
+    INTERP always fits; named offsets are unaffected.
+
     Returns (total_bytes, [(name, offset, nbytes, shape, dtype), ...]).
     """
     layout = []
@@ -445,7 +454,8 @@ def dst_bundle_layout(out_h: int, out_w: int, oc_h: int, oc_w: int,
     add("vao", (1, 1, oc_h, oc_w))
     add("rgb_padded",    (1, 3,      pH, pW), dtype=torch.float16)
     add("rife_features", (1, enc_ch, pH, pW), dtype=torch.float16)
-    return off, layout
+    total = max(off, interp_overlay_bytes)
+    return total, layout
 
 _ZC_HEADER_INT64 = 16   # 128-byte header (16 × int64)
 
