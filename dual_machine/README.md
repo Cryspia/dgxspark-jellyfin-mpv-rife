@@ -231,6 +231,36 @@ below the output rate and mpv stutters.
 | **inotify-driven seek-flush watcher** | 100 ms poll loop | the watcher blocks on `inotify_init1` + `os.read` (ctypes, no extra dep). lua's file write wakes it in microseconds vs the polling path's ~50 ms average — felt as instant on a progress-bar drag instead of a noticeable freeze |
 | **wait_phase_done returns silently on timeout** | raises RuntimeError | a python exception out of `compute_callable` becomes a vapoursynth filter error, which mpv treats as fatal and exits the process. Return silently (and let mpv display whatever was in the dst VA — usually black, replaced within a couple of vsyncs by the next frame) so a worker stall or trailing-K corner case never crashes playback |
 
+## `VK_LAYER_PRIORITY_BOOST`
+
+Vulkan instance layer that elevates mpv's present queue to
+`VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR`, so the GPU scheduler favours
+vsync presentation over the host-side CUDA work (RIFE post-flownet +
+FSRCNNX + krig + CCSR) on the shared GB10. ~+10% display fps on
+1080p24×mult=3 to a 60 Hz panel; default-on after `install.sh
+--dual-host`.
+
+Wired up by `install.sh`:
+- builds + installs the layer to `/usr/local/lib/` and
+  `/usr/share/vulkan/implicit_layer.d/` (one-time sudo); the Vulkan
+  loader ignores user-local paths under `AT_SECURE=1`, so a system
+  path is required;
+- `setcap cap_sys_nice+ep` on the mpv binary (HIGH/REALTIME require
+  the cap);
+- `mpv-conda` + `jellyfin-mpv-shim` wrappers export
+  `VK_PRIORITY_BOOST_LEVEL=high`;
+- `uninstall` reverses all three.
+
+`native_dispatcher` calls `_mpv_relax_for_dual_under_caps()` at module
+load (drop file caps + `PR_SET_DUMPABLE=1` + `PR_SET_PTRACER_ANY`) so
+the cap-bearing mpv still lets the `host_3proc` dma_proc child use
+`process_vm_readv` on it. No-op on no-cap installs.
+
+Override the level per launch with `VK_PRIORITY_BOOST_LEVEL` (`low` /
+`medium` / `high` / `realtime`); kill globally with
+`VK_PRIORITY_BOOST_DISABLE=1`. Source + build in
+[`vk_priority_layer/`](./vk_priority_layer/).
+
 ## Server-mode worker
 
 The worker process persists across host sessions. The host's

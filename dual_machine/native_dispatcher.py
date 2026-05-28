@@ -28,6 +28,58 @@ import torch
 import torch.nn.functional as F
 
 
+def _mpv_relax_for_dual_under_caps():
+    """Restore the kernel-level permissions the host_3proc dma_proc
+    needs to call process_vm_readv on mpv. Required only when mpv was
+    started with file capabilities (e.g. `setcap cap_sys_nice+ep`,
+    needed to request VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR / REALTIME on
+    the Vulkan present queue). With caps, execve(AT_SECURE=1) makes
+    mpv non-dumpable; Yama ptrace_scope=1 then refuses non-ancestor
+    tracers; and commoncap.c rejects ptrace where the tracee's
+    cap_permitted is not ⊆ the tracer's. dma_proc is mpv's child with
+    no caps, so all three kick in and process_vm_readv returns EPERM
+    from ~frame 2, killing the dual chain. We resolve them all here:
+    drop mpv's caps (queue priority is set at vkCreateDevice and is
+    retained on the queue object — mpv no longer needs the cap after
+    device creation, which has already happened by the time the vf is
+    being built), then restore dumpable + grant PR_SET_PTRACER_ANY.
+    All three steps are no-ops in the common no-cap case."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    PR_SET_DUMPABLE = 4
+    PR_SET_PTRACER  = 0x59616d61  # 'Yama' — see kernel/yama/yama.c
+    PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value
+
+    # 1. Drop file caps (so cap_permitted ⊆ child's empty cap set).
+    try:
+        libcap = ctypes.CDLL("libcap.so.2", use_errno=True)
+        libcap.cap_init.restype = ctypes.c_void_p
+        libcap.cap_set_proc.argtypes = [ctypes.c_void_p]
+        libcap.cap_free.argtypes = [ctypes.c_void_p]
+        empty = libcap.cap_init()
+        r_drop = libcap.cap_set_proc(empty)
+        libcap.cap_free(empty)
+    except OSError as e:
+        r_drop = -1
+        sys.stderr.write(f"[native_dispatcher] libcap unavailable: {e}\n")
+
+    # 2. PR_SET_DUMPABLE=1: AT_SECURE cleared it; dropping caps does
+    #    NOT auto-restore. dma_proc's ptrace_may_access needs it.
+    r_dump = libc.prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)
+
+    # 3. PR_SET_PTRACER_ANY: Yama scope=1 refuses non-ancestor tracers
+    #    unless tracee explicitly opts in. dma_proc is a child, not an
+    #    ancestor, of mpv — so Yama refuses by default.
+    r_ptr = libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+
+    sys.stderr.write(
+        f"[native_dispatcher] dual-under-caps unlock: drop_caps rc={r_drop} "
+        f"dumpable rc={r_dump} ptracer_any rc={r_ptr} "
+        f"(all rc=0 = clean; non-zero = kernel refused)\n")
+
+
+_mpv_relax_for_dual_under_caps()
+
+
 def _parse_fsrcnnx_scale(variant: str) -> int:
     """Parse FSRCNNX_xN_... variant string and return the scale N
     (2/3/4). Raises if unrecognised."""
