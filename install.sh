@@ -411,6 +411,24 @@ apply_patches() {
       else
         log "shim player.py already patched (or different version)"
       fi
+
+      # Shim 2.10.0's bundled trickplay-osc.lua does not work on mpv 0.41
+      # (its mouse-area "input" key-binding section never arms, so the
+      # OSC renders but play/pause/seek/audio/sub are unclickable). The
+      # shim unconditionally force-disables mpv's working built-in OSC
+      # whenever trickplay is active (`thumbnail_enable and self.trickplay`),
+      # so the only OSC available is the broken one. Gate that force-disable
+      # on `thumbnail_osc_builtin` so that with thumbnail_osc_builtin=False
+      # (set in install_shim_config) the built-in OSC stays enabled while
+      # thumbfast.lua still provides seek-preview thumbnails. Two sites:
+      # __init__ and enable_osc().
+      if grep -q 'if settings.thumbnail_enable and self.trickplay:' "$f"; then
+        cp -n "$f" "${f}.bak2"
+        sed -i 's|if settings.thumbnail_enable and self.trickplay:|if settings.thumbnail_enable and self.trickplay and settings.thumbnail_osc_builtin:|g' "$f"
+        log "patched $f to keep built-in OSC when thumbnail_osc_builtin=False"
+      else
+        log "shim player.py trickplay-osc gate already patched (or different version)"
+      fi
     fi
 
     # Patch vsrife for mixed-precision TRT compile. Default vsrife passes
@@ -847,6 +865,12 @@ if os.path.exists(p):
         data = {}
 data["mpv_ext"] = True
 data["mpv_ext_path"] = "$ENV_PREFIX/bin/mpv"
+# Use mpv's built-in OSC, not the bundled trickplay-osc.lua: the latter
+# is broken on our mpv 0.41 build (clickable controls never arm). With
+# this False, the player.py patch keeps the built-in OSC enabled and
+# thumbfast.lua still draws seek-preview thumbnails. enable_osc left at
+# its default (True) so the OSC shows.
+data["thumbnail_osc_builtin"] = False
 with open(p, "w") as f:
     json.dump(data, f, indent=2)
 print("wrote", p)
