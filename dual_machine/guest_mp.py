@@ -197,9 +197,16 @@ class GuestMP:
         self._pH = pH
         self._pW = pW
         self._enc_ch = enc_ch
+        # Mirror SlotRingLayout's INTERP-overlay padding so host and
+        # guest agree on dst_size (the value crosses the wire as part
+        # of the shm sizing handshake). max_mult=4 = the largest value
+        # the F9 cycle can produce.
+        _MAX_INTERP_MULT = 4
+        _interp_overlay = _MAX_INTERP_MULT * 3 * H * W * 2
         self.dst_size, self.dst_layout = dst_bundle_layout(
             self.oH, self.oW, self.ocH, self.ocW,
-            pH=pH, pW=pW, enc_ch=enc_ch)
+            pH=pH, pW=pW, enc_ch=enc_ch,
+            interp_overlay_bytes=_interp_overlay)
         self.src_size, self.src_layout = zc_src_bundle_layout(
             H, W, self.cH, self.cW,
             pH=pH, pW=pW, enc_ch=enc_ch)

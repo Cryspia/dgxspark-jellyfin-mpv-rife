@@ -287,8 +287,15 @@ class SlotRingLayout:
 
         self.src_size, self.src_layout = zc_src_bundle_layout(
             H, W, cH, cW, pH=pH, pW=pW, enc_ch=enc_ch)
+        # max_mult=4 reserves room for the F9 cycle's largest INTERP
+        # dense-pack (frame_sz = 3 * H * W * 2 bytes fp16 RGB). Pads
+        # dst_size up so no_sr (output dim = source dim, smaller
+        # named-region total) still admits mult ≥ 3.
+        _MAX_INTERP_MULT = 4
+        _interp_overlay = _MAX_INTERP_MULT * 3 * H * W * 2
         self.dst_size, self.dst_layout = dst_bundle_layout(
-            oH, oW, ocH, ocW, pH=pH, pW=pW, enc_ch=enc_ch)
+            oH, oW, ocH, ocW, pH=pH, pW=pW, enc_ch=enc_ch,
+            interp_overlay_bytes=_interp_overlay)
 
         self.src_size_a = _align_up(self.src_size)
         self.dst_size_a = _align_up(self.dst_size)
