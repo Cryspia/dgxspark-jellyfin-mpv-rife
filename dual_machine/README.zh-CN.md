@@ -215,6 +215,32 @@ SR 管线。 `mult=4` 只能在 ≤ 720p 源上跑得动，因为更高分辨率
 | **inotify 驱动的 seek-flush watcher** | 100 ms 轮询 | watcher 用 `inotify_init1` + `os.read` 阻塞 （ctypes，不加依赖）。 lua 写文件，kernel μs 级唤醒 vs 轮询路径平均 ~50 ms — 拖动进度条手感是"即时"而不是"明显卡一下" |
 | **wait_phase_done 超时静默返回** | 抛 RuntimeError | python exception 从 `compute_callable` 抛出来会被 pybind11 / vapoursynth 当成 filter error,mpv 会当致命错误退出整个进程。 直接静默返回 （让 mpv 显示 dst VA 里原本的内容 —— 通常是黑色，几个 vsync 后被下一帧覆盖） — worker 卡死或尾帧 corner case 永远不会让播放崩溃 |
 
+## `VK_LAYER_PRIORITY_BOOST`
+
+Vulkan instance layer，把 mpv 的 present queue 升到
+`VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR`，让 GPU 调度器更倾向把 vsync 抓住，
+而不是被 host 侧 CUDA 任务 （RIFE 后段、 FSRCNNX、 krig、 CCSR） 抢光。
+1080p24×mult=3 投 60 Hz 面板 +~10% display fps；`install.sh --dual-host`
+之后默认开启。
+
+`install.sh` 自动接好：
+- 把 layer 安装到 `/usr/local/lib/` + `/usr/share/vulkan/implicit_layer.d/`
+  （一次性 sudo）；用户本地路径在 `AT_SECURE=1` 下被 Vulkan loader 忽略，
+  所以必须放系统路径；
+- 给 mpv 二进制 `setcap cap_sys_nice+ep` （HIGH/REALTIME 需要这个 cap）；
+- `mpv-conda` 和 `jellyfin-mpv-shim` wrapper 都 export
+  `VK_PRIORITY_BOOST_LEVEL=high`；
+- `uninstall` 把上面三步都撤掉。
+
+`native_dispatcher` 在 module 加载时调 `_mpv_relax_for_dual_under_caps()`
+（drop file caps + `PR_SET_DUMPABLE=1` + `PR_SET_PTRACER_ANY`），让带
+cap 的 mpv 仍允许 `host_3proc` 的 dma_proc 用 `process_vm_readv` 读自己。
+没有 cap 的安装下三个调用都是 no-op。
+
+单次启动想换档：`VK_PRIORITY_BOOST_LEVEL` 取
+`low` / `medium` / `high` / `realtime`； 一键关：`VK_PRIORITY_BOOST_DISABLE=1`。
+源码 + build 脚本在 [`vk_priority_layer/`](./vk_priority_layer/)。
+
 ## Server-mode worker
 
 worker 进程跨 session 持续。 host 的 `native_dispatcher.cleanup()`

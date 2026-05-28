@@ -1,0 +1,17 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_PRIORITY_BOOST",
+        "type": "GLOBAL",
+        "library_path": "/usr/local/lib/libVkLayer_priority_boost.so",
+        "api_version": "1.3.275",
+        "implementation_version": "1",
+        "description": "Injects VkDeviceQueueGlobalPriorityCreateInfoKHR at vkCreateDevice (default HIGH; level via VK_PRIORITY_BOOST_LEVEL).",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+        },
+        "disable_environment": {
+            "VK_PRIORITY_BOOST_DISABLE": "1"
+        }
+    }
+}

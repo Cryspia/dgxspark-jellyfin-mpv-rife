@@ -655,12 +655,37 @@ EOF
     fi
     install -d "$MPV_CFG_DIR/dual_machine" "$MPV_CFG_DIR/dual_machine/native_filter"
     rsync -a --delete --exclude='__pycache__' --exclude='native_filter' \
+          --exclude='vk_priority_layer' \
           --exclude='*.sh' --exclude='*.md' --exclude='*.in' --exclude='rife.vpy' \
           "$PROJECT_DIR/dual_machine/" "$MPV_CFG_DIR/dual_machine/"
     rsync -a --delete --exclude='__pycache__' \
           "$PROJECT_DIR/dual_machine/native_filter/" \
           "$MPV_CFG_DIR/dual_machine/native_filter/"
     log "wrote $MPV_CFG_DIR/dual_machine/ ($(ls "$MPV_CFG_DIR/dual_machine"/*.py 2>/dev/null | wc -l) py modules + native_filter/)"
+
+    # step 7c: VK_LAYER_PRIORITY_BOOST. On a single GB10 the Vulkan
+    # present pass time-shares the GPU with the dual chain's CUDA work
+    # (RIFE post-flownet + FSRCNNX + krig + CCSR) and loses enough
+    # vsyncs to drag a 60 Hz panel down to ~50 fps on 1080p24-x3
+    # content. mpv/libplacebo doesn't expose VK_EXT_global_priority,
+    # so we ship a small instance layer that injects
+    # VkDeviceQueueGlobalPriorityCreateInfoKHR=HIGH at vkCreateDevice;
+    # combined with `setcap cap_sys_nice+ep` on the mpv binary this
+    # restores ~+10% display fps. Layer manifest + .so go to
+    # /usr/local/lib + /usr/share/vulkan because the Vulkan loader
+    # ignores user-local paths under AT_SECURE=1. Both are reverted
+    # in dual_uninstall_pieces.
+    section "step 7c/10: VK_LAYER_PRIORITY_BOOST (Vulkan present-queue priority)"
+    if command -v sudo >/dev/null \
+       && [[ -x "$PROJECT_DIR/dual_machine/vk_priority_layer/build.sh" ]]; then
+      MPV_BIN="$ENV_PREFIX/bin/mpv" \
+      VK_INC="$ENV_PREFIX/include" \
+        bash "$PROJECT_DIR/dual_machine/vk_priority_layer/build.sh" install \
+          2>&1 | sed 's/^/  /' \
+        || warn "vk_priority_layer install failed — playback will still work, just at the baseline contended fps"
+    else
+      warn "skipping vk_priority_layer (no sudo or build.sh missing)"
+    fi
   fi
 
   # Old per-band .vpy files / legacy FSRCNNX glsl shaders / in-tree
@@ -937,6 +962,11 @@ export PATH="$ENV_PREFIX/bin:\$PATH"
 if [[ -f "$DUAL_CFG_FILE" ]]; then
   set -a; . "$DUAL_CFG_FILE"; set +a
 fi
+# VK_LAYER_PRIORITY_BOOST opt-in (installed system-wide by --dual-host).
+# Requests VK_QUEUE_GLOBAL_PRIORITY_HIGH on mpv's Vulkan present queue
+# so it preempts CUDA on the shared GB10. No-op when the layer or the
+# binary's cap_sys_nice are absent.
+export VK_PRIORITY_BOOST_LEVEL=high
 exec "$ENV_PREFIX/bin/mpv" "\$@"
 EOF
   chmod +x "$WRAPPER_DIR/mpv-conda"
@@ -965,6 +995,9 @@ export PATH="$ENV_PREFIX/bin:\$PATH"
 if [[ -f "$DUAL_CFG_FILE" ]]; then
   set -a; . "$DUAL_CFG_FILE"; set +a
 fi
+# Match mpv-conda: opt into VK_LAYER_PRIORITY_BOOST=high so the mpv
+# subprocess the shim launches gets HIGH-priority Vulkan present.
+export VK_PRIORITY_BOOST_LEVEL=high
 exec "$ENV_PREFIX/bin/jellyfin-mpv-shim" "\$@"
 EOF
   chmod +x "$WRAPPER_DIR/jellyfin-mpv-shim"
@@ -1816,6 +1849,17 @@ dual_uninstall_pieces() {
   # uninstall doesn't leave breadcrumbs behind.
   local dual_share_parent; dual_share_parent="$(dirname "$DUAL_WORKER_DIR")"
   [[ -d $dual_share_parent && -z "$(ls -A "$dual_share_parent" 2>/dev/null)" ]] && rmdir "$dual_share_parent"
+
+  # Mirror of step 7c: drop the cap from mpv + remove the system layer
+  # manifest + .so. The build.sh uninstall path is sudo-aware. Safe even
+  # when the layer was never installed (uninstall is idempotent).
+  if [[ -x "$PROJECT_DIR/dual_machine/vk_priority_layer/build.sh" ]] \
+     && command -v sudo >/dev/null; then
+    log "reverting vk_priority_layer (setcap + system manifest + .so)"
+    MPV_BIN="$ENV_PREFIX/bin/mpv" \
+      bash "$PROJECT_DIR/dual_machine/vk_priority_layer/build.sh" uninstall \
+        2>&1 | sed 's/^/  /' || true
+  fi
   log "removed dual config + service + tray autostart + worker dir."
 }
 
