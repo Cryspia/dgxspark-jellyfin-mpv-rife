@@ -54,10 +54,13 @@ local function finish(reason)
   if state.finished then return end
   state.finished = true
   state.active = false
-  -- Restore to the file-loaded position. Jellyfin resume hands mpv
-  -- `loadfile … start=<pos>`, so time-pos at file-loaded is the resume
-  -- point; defaulting to 0 here used to drag resumed playback back to
-  -- the start of the file. exact seek so we land deterministically.
+  -- Restore to the resume position. jellyfin-mpv-shim's play() does
+  -- `loadfile <url>` (no start=) and then sets `playback_time=offset`
+  -- once mpv reports `duration`. The property assignment fires after
+  -- our `file-loaded` captured saved_pos at 0, so without the seek
+  -- listener below we'd rewind to 0. on_seek() catches the shim's
+  -- late seek during warmup and updates saved_pos in-flight; here we
+  -- just restore to whatever the latest external seek targeted.
   mp.commandv("seek", tostring(state.saved_pos or 0), "absolute", "exact")
   -- Tiny delay so the seek's resulting frame request flushes before
   -- we unpause (otherwise the unpause race can show 1 stale frame).
@@ -168,5 +171,26 @@ local function on_file_loaded()
   end)
 end
 
+-- Catch external seeks during warmup so we restore to the actual
+-- resume target rather than the file-loaded 0. mpv's `seek` event
+-- fires on user/script `seek` commands and on `playback-time=`
+-- property assignment (= the shim's resume path); it does NOT fire
+-- on frame-step, so our own warmup advances don't trigger this.
+local function on_seek()
+  if not state.active or state.finished then return end
+  local p = mp.get_property_number("time-pos")
+  if p == nil then return end
+  -- Ignore tiny advances from frame-step that happen to bracket the
+  -- event-loop tick (just in case): only treat as resume if the jump
+  -- is larger than what a few frame-steps could account for.
+  local prev = state.saved_pos or 0
+  if math.abs(p - prev) > 0.5 then
+    state.saved_pos = p
+    msg.info(string.format(
+      "warmup: external seek caught at %.2fs → updated resume target", p))
+  end
+end
+
 mp.observe_property("time-pos", "number", on_time_pos)
 mp.register_event("file-loaded", on_file_loaded)
+mp.register_event("seek", on_seek)
