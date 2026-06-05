@@ -895,7 +895,13 @@ data["thumbnail_osc_builtin"] = True
 # by this by default. Mirror local_kbps's effective-unlimited 2147483
 # (= 2 Tbps) so direct-play decides the bitrate, not the device
 # profile. (Cross-pollinated from windows-jellyfin-mpv-rife.)
-data["remote_kbps"] = 2147483
+#
+# setdefault: respect a user-chosen cap if one is already in conf.json
+# from a previous in-mpv menu pick (c → Video Preferences → Remote
+# Transcode Quality writes to this same file). Only seeds on first
+# install or when no prior setting exists; user-set caps survive
+# reinstalls.
+data.setdefault("remote_kbps", 2147483)
 with open(p, "w") as f:
     json.dump(data, f, indent=2)
 print("wrote", p)
