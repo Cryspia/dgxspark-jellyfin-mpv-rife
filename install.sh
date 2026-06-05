@@ -884,6 +884,18 @@ data["mpv_ext_path"] = "$ENV_PREFIX/bin/mpv"
 # With shim's original `mpv_options["osc"] = False` restored, the
 # built-in OSC is genuinely disabled and trickplay-osc clicks work again.
 data["thumbnail_osc_builtin"] = True
+# Shim's default remote_kbps=10000 (= 10 Mbps cap) is sent to the
+# Jellyfin server as MaxStreamingBitrate in the device profile and
+# forces transcode for any > 10 Mbps remote content — typical
+# 1080p BD remux is 30-40 Mbps, 4K is 60-100 Mbps; the cap blows
+# them all and loses HDR/HDR10+/DV metadata in the process. The
+# detection in shim's is_local_domain() flips to "remote" whenever
+# Jellyfin is reached via a public domain (reverse proxy / hairpin
+# NAT miss), so anyone with `https://jellyfin.example.com` is hit
+# by this by default. Mirror local_kbps's effective-unlimited 2147483
+# (= 2 Tbps) so direct-play decides the bitrate, not the device
+# profile. (Cross-pollinated from windows-jellyfin-mpv-rife.)
+data["remote_kbps"] = 2147483
 with open(p, "w") as f:
     json.dump(data, f, indent=2)
 print("wrote", p)
