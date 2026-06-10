@@ -28,11 +28,11 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-MPV="/home/spark/miniforge3/envs/vsmpv/bin/mpv"
-DUAL_CONF="/home/spark/.config/dgxspark-mpv/dual.conf"
+MPV="${MPV:-$HOME/miniforge3/envs/vsmpv/bin/mpv}"
+DUAL_CONF="${DUAL_CONF:-$HOME/.config/dgxspark-mpv/dual.conf}"
 PROBE="$HERE/display_fps_probe.lua"
 
-CLIP="${CLIP:-/tmp/sample-1080p24-hdr10.mp4}"
+CLIP="${CLIP:-/tmp/sample-1080p24-hdr10.mp4}"   # NOT produced by gen_clips.sh — supply your own HDR10 clip via CLIP=
 DURATION="${DURATION:-26}"
 WARMUP_S="${WARMUP_S:-6}"
 KRIG="${KRIG:-on}"
@@ -47,8 +47,8 @@ export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 # Replicate the mpv-conda wrapper environment.
-export PYTHONHOME="/home/spark/miniforge3/envs/vsmpv"
-export PATH="/home/spark/miniforge3/envs/vsmpv/bin:$PATH"
+export PYTHONHOME="$HOME/miniforge3/envs/vsmpv"
+export PATH="$HOME/miniforge3/envs/vsmpv/bin:$PATH"
 set -a; . "$DUAL_CONF"; set +a
 
 export DUAL_REPORT_FPS="${DUAL_REPORT_FPS:-120}"

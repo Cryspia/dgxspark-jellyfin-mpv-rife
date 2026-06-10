@@ -325,6 +325,18 @@ class QueueManager:
         # real cc_cache slot ids (small integers).
         self._synthetic_slot_id = itertools.count(1_000_000)
 
+        # DUAL_INTERP_MULT snapshot. The env var is written by
+        # native_dispatcher before this manager is constructed and is
+        # fixed for the manager's lifetime (an F9 mult change resets the
+        # dispatcher singleton and builds a fresh QueueManager), so the
+        # submit/pop hot paths read this once instead of os.environ per
+        # call. Clamping to a valid set stays at the use sites because
+        # different paths accept different ranges (1 vs 2 minimum).
+        self._interp_mult_env = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+        # Same launch-time snapshot for the refcount debug switch —
+        # it gated an os.environ read on every state transition.
+        self._refcount_dbg = os.environ.get("DUAL_REFCOUNT_DBG", "0") == "1"
+
         # Lifecycle.
         self._closed = False
 
@@ -569,8 +581,9 @@ class QueueManager:
             return
         self._make_ready_locked(node)
 
-    def _make_ready_locked(self, node: TaskNode) -> None:
-        if os.environ.get("DUAL_REFCOUNT_DBG", "0") == "1":
+    def _make_ready_locked(self, node: TaskNode, *,
+                            notify: bool = True) -> None:
+        if self._refcount_dbg:
             import traceback as _tb
             frames = _tb.extract_stack(limit=4)
             caller = frames[-2] if len(frames) >= 2 else None
@@ -597,7 +610,12 @@ class QueueManager:
         else:  # "interp"
             heapq.heappush(self._interp_heap, entry)
             self._interp_present.add(node.id)
-        self._cv.notify_all()
+        # notify=False is the cc_cache-exhausted re-queue path: waking
+        # the other dispatcher would only make it fail the same alloc
+        # (notify ping-pong). The wake for that case comes from
+        # _cc_free_slot_locked when a slot actually frees.
+        if notify:
+            self._cv.notify_all()
 
     # ── DAG indexing helpers ───────────────────────────────────
 
@@ -773,7 +791,7 @@ class QueueManager:
             # INTERP's final (task_done). N-stage allows each
             # SR_INTERP to start as soon as its specific frame is
             # ready, instead of all waiting on the last flownet.
-            _mult = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+            _mult = self._interp_mult_env
             if _mult not in (1, 2, 3, 4):
                 _mult = 2
             # mult=1 (no_interp dual): skip INTERP + SR_INTERP entirely
@@ -965,7 +983,7 @@ class QueueManager:
             # stage (p-1) for p < mult-1; phase (mult-1) gates on INTERP
             # final (task_done). All SR_INTERPs can dispatch to either
             # machine in parallel.
-            _mult = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+            _mult = self._interp_mult_env
             if _mult not in (1, 2, 3, 4):
                 _mult = 2
             cc_k = self._ensure_node_locked(
@@ -1175,7 +1193,7 @@ class QueueManager:
                     rec["max_ms"] = dt
 
     def _dbg(self, msg: str) -> None:
-        if os.environ.get("DUAL_REFCOUNT_DBG", "0") == "1":
+        if self._refcount_dbg:
             self._log(f"[ref] {msg}")
 
     def _initialise_refcounts_locked(self, node: TaskNode) -> None:
@@ -1214,7 +1232,7 @@ class QueueManager:
             if slot < 0:
                 self._dbg(f"init CCSR tid={node.id} frame={node.frame_idx} slot=-1 (SKIP)")
                 return
-            _mult = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+            _mult = self._interp_mult_env
             if _mult <= 1:
                 # No INTERP / SR_INTERP consumes the cc_cache rgb_padded
                 # / rife_features. Without explicit free here, the slot
@@ -1224,10 +1242,7 @@ class QueueManager:
                 # [[server-mode-worker-robustness]].
                 self._dbg(f"init CCSR tid={node.id} frame={node.frame_idx} "
                            f"slot={slot} mult=1 → free immediately")
-                self._cc.pop(slot, None)
-                if self._cc_cache is not None and slot >= 0:
-                    self._cc_cache.free(slot)
-                self._stats["cc_evictions"] += 1
+                self._cc_free_slot_locked(slot)
                 return
             # Count actual live (non-DONE/FAILED) INTERP children
             # — this handles three cases the old hardcoded 2 leaked on:
@@ -1256,10 +1271,7 @@ class QueueManager:
                 # cumulative drain on the 32-slot pool.
                 self._dbg(f"init CCSR tid={node.id} frame={node.frame_idx} "
                            f"slot={slot} → no consumers, free immediately")
-                self._cc.pop(slot, None)
-                if self._cc_cache is not None and slot >= 0:
-                    self._cc_cache.free(slot)
-                self._stats["cc_evictions"] += 1
+                self._cc_free_slot_locked(slot)
                 return
             self._dbg(f"init CCSR tid={node.id} frame={node.frame_idx} "
                        f"slot={slot} → refs={n_consumers}/{n_consumers}/0")
@@ -1296,10 +1308,7 @@ class QueueManager:
                     _have_consumer = True
                     break
                 if not _have_consumer:
-                    self._cc.pop(_s, None)
-                    if self._cc_cache is not None and _s >= 0:
-                        self._cc_cache.free(_s)
-                    self._stats["cc_evictions"] += 1
+                    self._cc_free_slot_locked(_s)
                     continue
                 self._cc_set_producer_locked(_s, sr_yuv_consumers=1)
 
@@ -1390,14 +1399,59 @@ class QueueManager:
             ev = self._frame_done.pop(K, None)
             if ev is not None:
                 ev.set()
+
+        # ── cc_cache slot reclamation ─────────────────────────────
+        # Deleting DONE producers above used to orphan their _cc
+        # refcounts: the PENDING/READY consumers that would have
+        # decremented them were deleted too, so each seek leaked 1-4
+        # slots — and under the dispatcher-singleton lifetime a dozen
+        # progress-bar drags drained the whole 32-slot pool and hung
+        # dispatch. Sweep the table: a slot stays only while a RUNNING
+        # node still references it (a RUNNING producer frees via the
+        # dynamic-consumer-count path in _initialise_refcounts_locked;
+        # a RUNNING consumer frees via _consume_inputs_locked at its
+        # task_done). FAILED nodes never decrement (task_done(ok=False)
+        # skips _consume_inputs), so they don't keep slots alive
+        # either. Everything unreferenced is freed right here.
+        live_slots: set[int] = set()
+        for n in self._dag.values():
+            if n.state != TaskState.RUNNING:
+                continue
+            for pkey in ("dst_cc_slot", "dst_cc_slot_2", "dst_cc_slot_3",
+                         "src_cc_slot_a", "src_cc_slot_b"):
+                s = n.payload.get(pkey, -1)
+                if isinstance(s, int) and s >= 0:
+                    live_slots.add(s)
+        slots_freed = 0
+        for slot in list(self._cc.keys()):
+            if slot in live_slots:
+                continue
+            self._dbg(f"flush_seek: freeing orphaned cc slot={slot} "
+                       f"(frame_idx={self._cc[slot].frame_idx})")
+            self._cc_free_slot_locked(slot)
+            slots_freed += 1
+
         self._stats["seek_flushes"] = self._stats.get(
             "seek_flushes", 0) + 1
         self._cv.notify_all()
         return {
             "failed": len(to_delete),
             "K_count": len(flushed_K),
-            "slots_freed": 0,  # CLAIMED tasks free via task_done; nothing direct
+            "slots_freed": slots_freed,
         }
+
+    def requeue(self, node: TaskNode) -> None:
+        """Return a popped (RUNNING) node to its READY queue — used
+        when a dispatcher claimed a task but can no longer run it
+        (e.g. the guest dispatcher noticing the worker connection died
+        between pop and submit). The other dispatcher is notified and
+        picks it up."""
+        with self._cv:
+            if self._closed:
+                return
+            if node.state != TaskState.RUNNING:
+                return
+            self._make_ready_locked(node)
 
     # ── worker-side fetch ──────────────────────────────────────
 
@@ -1414,7 +1468,7 @@ class QueueManager:
             if node is None:
                 return None
             if not self._post_pop_locked(node):
-                self._make_ready_locked(node)
+                self._make_ready_locked(node, notify=False)
                 return None
             return node
 
@@ -1430,7 +1484,7 @@ class QueueManager:
             if node is None:
                 return None
             if not self._post_pop_locked(node):
-                self._make_ready_locked(node)
+                self._make_ready_locked(node, notify=False)
                 return None
             return node
 
@@ -1445,7 +1499,7 @@ class QueueManager:
             if node is None:
                 return None
             if not self._post_pop_locked(node):
-                self._make_ready_locked(node)
+                self._make_ready_locked(node, notify=False)
                 return None
             return node
 
@@ -1485,7 +1539,7 @@ class QueueManager:
             if node is not None:
                 if not self._post_pop_locked(node):
                     # cc_cache full — push back and try next priority.
-                    self._make_ready_locked(node)
+                    self._make_ready_locked(node, notify=False)
                     continue
                 return node
         return None
@@ -1493,8 +1547,9 @@ class QueueManager:
     def pop_for_host(self, *, blocking: bool = True,
                       timeout: Optional[float] = 0.5
                       ) -> Optional[TaskNode]:
-        """Host's view: cc > sr > interp. Returns highest-priority
-        ready task. If all three empty and blocking, waits on _cv;
+        """Host's view: sr > cc > interp (_HOST_PRIORITY). Returns
+        highest-priority ready task. If all three empty and blocking,
+        waits on _cv;
         wakes on any submit_frame / task_done that may have made a
         new task ready, then re-checks ALL three queues in order."""
         deadline = (_time.perf_counter() + timeout) if blocking and timeout else None
@@ -1729,7 +1784,7 @@ class QueueManager:
             # frame. Allocate progressively — if any fails we keep
             # the earlier ones (retry will skip re-allocating them;
             # slots are owned by the _cc table until task_done).
-            _mult = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+            _mult = self._interp_mult_env
             if _mult not in (2, 3, 4):
                 _mult = 2
             _slot_keys = ("dst_cc_slot", "dst_cc_slot_2", "dst_cc_slot_3")
@@ -1980,7 +2035,7 @@ class QueueManager:
         rec = CCResult(slot=slot, frame_idx=frame_idx)
         self._cc[slot] = rec
         self._stats["cc_allocs"] += 1
-        if os.environ.get("DUAL_REFCOUNT_DBG", "0") == "1":
+        if self._refcount_dbg:
             self._log(f"[ref] alloc slot={slot} frame_idx={frame_idx}")
         return slot
 
@@ -2009,6 +2064,21 @@ class QueueManager:
             rec.has_rgb_4K = True
             rec.rgb_4K_refs = rgb_4K_consumers
 
+    def _cc_free_slot_locked(self, slot: int) -> None:
+        """Return a cc_cache slot to the pool and WAKE cv waiters.
+        The notify matters: dispatchers whose _post_pop alloc failed
+        re-queued their node without notifying (see _make_ready_locked
+        notify=False) and now sleep on _cv — a freed slot is exactly
+        the event they're waiting for. Without it, the old code had
+        the two dispatchers ping-ponging notify_all at each other on
+        every failed alloc (busy-wait) while actual frees were
+        silent."""
+        self._cc.pop(slot, None)
+        if self._cc_cache is not None and slot >= 0:
+            self._cc_cache.free(slot)
+        self._stats["cc_evictions"] += 1
+        self._cv.notify_all()
+
     def _cc_drop_slot_field_locked(self, slot: int, field_name: str
                                     ) -> None:
         """Consumer-side decrement. When all field refcounts reach 0,
@@ -2035,10 +2105,7 @@ class QueueManager:
                 and not rec.has_rife_features
                 and not rec.has_sr_yuv
                 and not rec.has_rgb_4K):
-            del self._cc[slot]
-            if self._cc_cache is not None and slot >= 0:
-                self._cc_cache.free(slot)
-            self._stats["cc_evictions"] += 1
+            self._cc_free_slot_locked(slot)
 
     # ── stats ───────────────────────────────────────────────────
 
@@ -2061,10 +2128,21 @@ def _self_test() -> None:
     # Manually inject three tasks bypassing submit_frame (which is a
     # stub at this stage). Confirms heap ordering, READY transitions,
     # parent/child wiring.
+    #
+    # Publish-time gating (_node_publishable_locked) requires CCSR
+    # nodes to carry an mpv src VA payload and their frame to have a
+    # registered dst VA — fake both with non-zero sentinels.
+    _fake_src = {"src_y": 0x1000, "src_u": 0x2000, "src_v": 0x3000}
+    for k in (0, 1, 2):
+        mgr.update_frame_va(k, FrameVA(pair_k=k, dst_a_y=0x4000,
+                                       dst_i_y=0x5000))
     with mgr._lock:
-        cc0 = mgr._new_node(task_type=TaskType.CCSR, frame_idx=0)
-        cc1 = mgr._new_node(task_type=TaskType.CCSR, frame_idx=1)
-        cc2 = mgr._new_node(task_type=TaskType.CCSR, frame_idx=2)
+        cc0 = mgr._new_node(task_type=TaskType.CCSR, frame_idx=0,
+                            payload=dict(_fake_src))
+        cc1 = mgr._new_node(task_type=TaskType.CCSR, frame_idx=1,
+                            payload=dict(_fake_src))
+        cc2 = mgr._new_node(task_type=TaskType.CCSR, frame_idx=2,
+                            payload=dict(_fake_src))
 
         # Dependent INTERP — should NOT become ready (CC parents
         # haven't been marked done yet).
@@ -2111,22 +2189,29 @@ def _self_test() -> None:
     assert not mgr.wait_frame_done(99, timeout=0.05)
     mgr.reset_frame_event(0)
 
-    # Stats sanity
+    # Stats sanity. pop_color bumps the legacy color_pops alias;
+    # pop_compute routes INTERP pops through pop_interp → interp_pops.
     s = mgr.stats()
     assert s["submitted_tasks"] == 4
-    assert s["color_pops"] == 3
-    assert s["compute_pops"] == 1
+    assert s["color_pops"] == 3, s
+    assert s["interp_pops"] == 1, s
 
     # Blocking pop wakes up on submit
     barrier = threading.Event()
     def _producer():
         barrier.wait()
+        # SR_INTERP publish gate needs the phase-1 dst VA registered.
+        mgr.update_frame_va(5, FrameVA(pair_k=5, dst_i_y=0x5000))
         with mgr._lock:
             mgr._new_node(task_type=TaskType.SR_INTERP, frame_idx=5)
     t = threading.Thread(target=_producer, daemon=True)
     t.start()
     barrier.set()
-    n_sr = mgr.pop_compute(blocking=True, timeout=2.0)
+    # Production path: pop_for_guest re-checks ALL queues on each cv
+    # wake (the legacy pop_compute wrapper only blocks on the interp
+    # heap and would miss an SR task published after its initial
+    # non-blocking sr check).
+    n_sr = mgr.pop_for_guest(blocking=True, timeout=2.0)
     assert n_sr is not None and n_sr.frame_idx == 5
 
     # Shutdown unblocks waiters
@@ -2141,99 +2226,66 @@ def _self_test() -> None:
     assert waiter_result == [None], \
         f"shutdown should yield None pop, got {waiter_result}"
 
-    # ── submit_frame decomposition ──────────────────────────────
-    mgr_sf = QueueManager()
-    # Submitting frame 0 should create CC(0), CC(1), SR_SRC(0),
-    # INTERP(0), SR_INTERP(0). CC are immediately READY (no parents);
-    # SR/INTERP/SR_INTERP are PENDING.
-    mgr_sf.submit_frame(0)
-    s = mgr_sf.stats()
-    assert s["submitted_tasks"] == 5, s
-    # color_q should have CC(0) and CC(1) ready; compute_q empty.
-    n0 = mgr_sf.pop_color()
-    n1 = mgr_sf.pop_color()
-    assert n0 is not None and n0.type == TaskType.CCSR and n0.frame_idx == 0
-    assert n1 is not None and n1.type == TaskType.CCSR and n1.frame_idx == 1
-    assert mgr_sf.pop_color() is None
-    assert mgr_sf.pop_compute() is None
+    # ── submit_frame decomposition (CCSR architecture) ────────────
+    # submit_frame(K) creates CCSR(K), CCSR(K+1), INTERP(K) and, with
+    # mult=2, one SR_INTERP(K, phase 1). CCSR(M) is publishable only
+    # once its src VA payload is present AND frame M's dst VA is
+    # registered (update_frame_va / the va= kwarg).
+    def _va(k: int) -> FrameVA:
+        return FrameVA(pair_k=k,
+                       sa_y=0x1000, sa_u=0x1100, sa_v=0x1200,
+                       sb_y=0x2000, sb_u=0x2100, sb_v=0x2200,
+                       dst_a_y=0x3000, dst_a_u=0x3100, dst_a_v=0x3200,
+                       dst_i_y=0x4000, dst_i_u=0x4100, dst_i_v=0x4200)
 
-    # Submitting frame 1 should re-use CC(1) (already in DAG) and
-    # only add CC(2), SR_SRC(1), INTERP(1), SR_INTERP(1) — 4 new.
+    mgr_sf = QueueManager()
+    mgr_sf.submit_frame(0, va=_va(0))
+    s = mgr_sf.stats()
+    assert s["submitted_tasks"] == 4, s
+
+    # Submitting frame 1 reuses CCSR(1) (already in DAG) and adds
+    # CCSR(2), INTERP(1), SR_INTERP(1) — 3 new.
     before = mgr_sf.stats()["submitted_tasks"]
-    mgr_sf.submit_frame(1)
+    mgr_sf.submit_frame(1, va=_va(1))
     after = mgr_sf.stats()["submitted_tasks"]
-    assert after - before == 4, f"reuse failed: added {after - before}"
-    # The single new CC is CC(2); pop_color returns it.
-    n2 = mgr_sf.pop_color()
-    assert n2.type == TaskType.CCSR and n2.frame_idx == 2
-    assert mgr_sf.pop_color() is None
+    assert after - before == 3, f"reuse failed: added {after - before}"
     mgr_sf.shutdown()
 
     # ── end-to-end DAG drain ────────────────────────────────────
-    # No cc_cache — mgr uses synthetic negative slot ids, refcount
-    # bookkeeping still exercised.
+    # No cc_cache — mgr uses synthetic slot ids, refcount bookkeeping
+    # still exercised. Submit pairs 0..2; CCSR(3) (created by pair 2)
+    # stays unpublishable (frame 3's VA never registered), so INTERP(2)
+    # and SR_INTERP(2) stay pending — pairs 0 and 1 must complete.
     mgr_e2e = QueueManager()
-    mgr_e2e.submit_frame(0)
-    mgr_e2e.submit_frame(1)
-    # CC(0), CC(1), CC(2) are READY. SR_SRC and INTERP and SR_INTERP
-    # are PENDING.
+    for k in (0, 1, 2):
+        mgr_e2e.submit_frame(k, va=_va(k))
     completed = []
-
-    # Drain via tight loop: pop_color (host preference) then pop_compute.
     while True:
-        node = mgr_e2e.pop_color()
-        if node is None:
-            node = mgr_e2e.pop_compute()
+        node = mgr_e2e.pop_for_host(blocking=False, timeout=None)
         if node is None:
             break
         mgr_e2e.task_done(node.id)
         completed.append((node.type, node.frame_idx))
 
-    # Validate: every node ran; refcount table is empty.
     expected_types = {
         TaskType.CCSR, TaskType.INTERP, TaskType.SR_INTERP}
     got_types = {c[0] for c in completed}
     assert expected_types <= got_types, \
         f"missing task types: {expected_types - got_types}"
 
-    # With the fixed refcount=2 convention, stream edges leak the
-    # unused INTERP refcount: CC(0) has no INTERP(-1, 0) so 1 ref
-    # never decrements; same for the trailing CC. Expected leak is
-    # 2 slots (one per stream edge in this 3-frame submit).
-    leaked = list(mgr_e2e._cc.keys())
-    assert len(leaked) <= 2, \
-        f"cc table leaked more than 2 slots: {leaked}"
-
-    # frame_done signals for both K=0 and K=1.
+    # frame_done signals for pairs 0 and 1; pair 2 is blocked on the
+    # never-published CCSR(3).
     assert mgr_e2e.wait_frame_done(0, timeout=0.5)
     assert mgr_e2e.wait_frame_done(1, timeout=0.5)
+    assert not mgr_e2e.wait_frame_done(2, timeout=0.05)
 
     s = mgr_e2e.stats()
     print(f"e2e drain stats: {s}")
-    assert s["submitted_tasks"] == 9   # 3 CC + 2 SR_SRC + 2 INTERP + 2 SR_INTERP
-    assert s["completed_tasks"] == 9
-    # Edge frames leak one CC slot each per stream end. Within 2 is
-    # the expected upper bound for this submit pattern.
-    assert s["cc_allocs"] - s["cc_evictions"] <= 2, \
-        f"cc_cache leak >2: allocs={s['cc_allocs']} evictions={s['cc_evictions']}"
-
-    # Refcount sanity: CC(0) had only INTERP(0) consuming its rgb_1080p
-    # (CC(0) is the first frame, no preceding INTERP(-1, 0)). So
-    # CC(0).rgb_1080p_consumers = 1, not 2. Verify by re-running a
-    # single-frame submission and inspecting state.
-    mgr_check = QueueManager()
-    mgr_check.submit_frame(0)
-    # Pop CC(0): it should get a slot allocated and have only 1 child
-    # in the DAG (INTERP(0)).
-    cc0 = mgr_check.pop_color()
-    assert cc0.type == TaskType.CCSR and cc0.frame_idx == 0
-    # CC(0)'s children are SR_SRC(0) and INTERP(0). INTERP(0) is the
-    # only rgb_1080p consumer.
-    rgb_consumers = sum(
-        1 for cid in cc0.children
-        if mgr_check._dag.get(cid).type == TaskType.INTERP)
-    assert rgb_consumers == 1, f"expected 1 INTERP child, got {rgb_consumers}"
-    mgr_check.shutdown()
+    # 4 + 3 + 3 nodes total; everything except CCSR(3), INTERP(2),
+    # SR_INTERP(2) completes.
+    assert s["submitted_tasks"] == 10, s
+    assert s["completed_tasks"] == 7, s
+    mgr_e2e.shutdown()
 
     print("queue_mgr self-test OK")
 

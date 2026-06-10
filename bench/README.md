@@ -68,7 +68,7 @@ bench/robustness.sh                # N=60 frames, RECOVERY_SLA=5 s
 RECOVERY_SLA=3 N=40 bench/robustness.sh
 ```
 
-Four scenarios, each asserting the dual chain recovers (or cleanly
+Nine scenarios, each asserting the dual chain recovers (or cleanly
 falls back to single) within `RECOVERY_SLA` seconds:
 
 1. `worker_down`   — stop worker.service before mpv. Expect fast
@@ -97,6 +97,9 @@ falls back to single) within `RECOVERY_SLA` seconds:
    recompile from scratch (~30-60 s on this stack). Asserts dual
    eventually reaches active + frames render. Caches restored on
    exit. Tunable via `TRT_BENCH_TIMEOUT` (default 300 s).
+9. `seek_storm` — rapid IPC seeks against a live dual session; asserts
+   playback recovers within the SLA. Also exercises the seek-flush
+   cc_cache slot reclamation (heavy seeking must not drain the pool).
 
 Requires the worker systemd service running on the guest box before
 the bench launches. The bench stops/starts the service as part of

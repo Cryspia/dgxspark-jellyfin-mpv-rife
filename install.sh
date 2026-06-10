@@ -39,12 +39,29 @@ ENV_PREFIX="$FORGE_DIR/envs/$ENV_NAME"
 MPV_SRC_DIR="$HOME/src/mpv"
 MPV_VERSION="v0.41.0"
 
+# Python stack pins. Bumping any of these is a deliberate act: re-run
+# install, re-check that apply_patches() still reports "patched … for
+# TRT mixed-precision" (it hard-fails if the patch context vanished),
+# and re-run bench/fps.sh + bench/color.sh.
+TORCH_VERSION="2.12.0"
+VSRIFE_VERSION="5.7.0"
+TENSORRT_VERSION="10.16.1.11"
+TORCH_TRT_VERSION="2.12.0"
+SHIM_VERSION="2.10.0"
+CUDNN_FE_VERSION="1.24.0"
+
+# Miniforge installer pin + checksum (aarch64). `releases/latest` made
+# every fresh install a moving target. Find sha256 values in the
+# release's *.sha256 assets when bumping.
+MINIFORGE_VERSION="26.3.2-3"
+MINIFORGE_SHA256="2c113a69297e612b01ca0f320c22a3107a11f2ab9b573d79ac868a175945ce29"
+
 # Danmaku plugin — fetched from a sibling project, installed via its own
-# install.py. We pin to main; bump DANMAKU_REF to a tag/commit if you
-# want a reproducible build.
+# install.py. Pinned to a commit for reproducibility (an upstream push
+# used to change what a re-install produced); bump after testing.
 DANMAKU_REPO_URL="https://github.com/Cryspia/mpv-dandanplay-danmaku.git"
 DANMAKU_SRC_DIR="$HOME/src/mpv-dandanplay-danmaku"
-DANMAKU_REF="main"
+DANMAKU_REF="1d0e5061ebfce3ca3a2a0c65d95797509dc027b2"
 
 # User-visible install locations
 MPV_CFG_DIR="$HOME/.config/mpv"
@@ -92,6 +109,8 @@ DEFAULT_VIDEO_MIMES=(
 # fetches a different bundle from
 # https://github.com/Cryspia/fsrcnnx-cudnn/releases/download/<tag>/fsrcnnx-cudnn-bundle.tar.gz
 FSRCNNX_CUDNN_VERSION="v0.2.2"
+# sha256 of the release asset above — recompute when bumping the tag.
+FSRCNNX_CUDNN_SHA256="b32bd5c7ec668f31e27d3daa7091f3596706078d6ecad135bd3773ca64b2708a"
 
 # Dual-machine layout. The host's mpv reads DUAL_* from this file (via
 # the mpv-conda wrapper); the secondary box's systemd worker service
@@ -138,7 +157,10 @@ section() { printf "\n\033[1;34m=== %s ===\033[0m\n" "$*"; }
 in_env() {
   # shellcheck disable=SC1091
   source "$FORGE_DIR/etc/profile.d/conda.sh"
-  conda activate "$ENV_NAME" >/dev/null 2>&1
+  # A missing env must be loud — silently falling through used to run
+  # the command against base/system python instead.
+  conda activate "$ENV_NAME" >/dev/null 2>&1 \
+    || fatal "conda env '$ENV_NAME' not found — run install first"
   "$@"
 }
 
@@ -202,12 +224,15 @@ install_miniforge() {
   if [[ -x "$FORGE_DIR/bin/conda" ]]; then
     log "miniforge already present at $FORGE_DIR"
   else
-    log "downloading + installing miniforge to $FORGE_DIR"
+    log "downloading + installing miniforge $MINIFORGE_VERSION to $FORGE_DIR"
     cd /tmp
+    local mf_installer="Miniforge3-${MINIFORGE_VERSION}-Linux-aarch64.sh"
     curl -fL --retry 3 -O \
-      https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh
-    bash Miniforge3-Linux-aarch64.sh -b -p "$FORGE_DIR"
-    rm -f Miniforge3-Linux-aarch64.sh
+      "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/${mf_installer}"
+    echo "$MINIFORGE_SHA256  $mf_installer" | sha256sum -c - \
+      || fatal "miniforge installer checksum mismatch — refusing to run it"
+    bash "$mf_installer" -b -p "$FORGE_DIR"
+    rm -f "$mf_installer"
   fi
 
   if (( USE_MIRRORS )); then
@@ -259,8 +284,9 @@ create_conda_env() {
   log "  channel: $fchannel"
   mamba create -n "$ENV_NAME" -y -c "$fchannel" \
     python=3.12 \
-    `# media + filter chain` \
-    vapoursynth ffmpeg \
+    `# media + filter chain (pinned: the vapoursynth C ABI + ffmpeg` \
+    `#  major drive the whole vf chain; bump deliberately + re-bench)` \
+    'vapoursynth=72' 'ffmpeg=8.1' \
     `# GTK stack for shim's tray icon (PyGObject loads system AppIndicator typelib at runtime)` \
     pygobject gtk3 librsvg gobject-introspection pillow \
     `# mpv from-source build deps` \
@@ -279,11 +305,16 @@ build_mpv() {
   source "$FORGE_DIR/etc/profile.d/conda.sh"
   conda activate "$ENV_NAME"
 
-  # If a previous build already produced mpv with the right features, skip.
-  if "$ENV_PREFIX/bin/mpv" -v 2>&1 | sed -n 's/.*enabled features:[[:space:]]*//p' | head -1 \
+  # If a previous build already produced mpv at the pinned version with
+  # the right features, skip. The version gate matters: without it,
+  # bumping MPV_VERSION and re-running install silently kept the old
+  # binary (the feature list alone always matched).
+  if "$ENV_PREFIX/bin/mpv" --version 2>/dev/null | head -1 \
+       | grep -q "mpv ${MPV_VERSION#v}" && \
+     "$ENV_PREFIX/bin/mpv" -v 2>&1 | sed -n 's/.*enabled features:[[:space:]]*//p' | head -1 \
        | { read -r feats; for f in vapoursynth wayland x11 vulkan lua; do
              grep -qw "$f" <<<"$feats" || exit 1; done; } 2>/dev/null; then
-    log "mpv already built with vapoursynth + wayland + x11 + vulkan + lua"
+    log "mpv ${MPV_VERSION} already built with vapoursynth + wayland + x11 + vulkan + lua"
     return
   fi
 
@@ -292,6 +323,13 @@ build_mpv() {
     log "cloning mpv $MPV_VERSION"
     git clone --depth 1 --branch "$MPV_VERSION" \
       https://github.com/mpv-player/mpv.git "$MPV_SRC_DIR"
+  else
+    # Existing shallow checkout may predate a bumped MPV_VERSION —
+    # fetch the pinned tag and hard-switch to it.
+    log "updating mpv checkout to $MPV_VERSION"
+    git -C "$MPV_SRC_DIR" fetch --depth 1 origin tag "$MPV_VERSION" || true
+    git -C "$MPV_SRC_DIR" checkout --quiet "$MPV_VERSION" || \
+      fatal "cannot checkout mpv $MPV_VERSION in $MPV_SRC_DIR"
   fi
 
   cd "$MPV_SRC_DIR"
@@ -346,20 +384,42 @@ install_pip_packages() {
   # PyTorch — its CUDA wheels live on pytorch.org (not mirrored on USTC).
   if ! python -c "import torch" 2>/dev/null; then
     log "installing torch (CUDA 13 wheel from pytorch.org)"
-    pip install torch --index-url "$PYTORCH_INDEX" || \
+    pip install "torch==$TORCH_VERSION" --index-url "$PYTORCH_INDEX" || \
       pip install --pre torch --index-url "$PYTORCH_NIGHTLY_INDEX"
   else
     log "torch already installed: $(python -c 'import torch; print(torch.__version__)')"
   fi
 
-  # vsrife + jellyfin-mpv-shim (from USTC PyPI mirror, default in pip.conf)
-  pip install vsrife "jellyfin-mpv-shim[gui]"
-
-  # TensorRT for the high-perf RIFE backend
-  pip install tensorrt torch_tensorrt
-  # fsrcnnx-cudnn imports the Python frontend (`import cudnn`) at
-  # runtime — distinct from the runtime library `nvidia-cudnn-cu*`.
-  pip install nvidia-cudnn-frontend
+  # Pinned application stack, one resolver run. Pins matter doubly here:
+  # (a) reproducible installs; (b) apply_patches() sed-patches vsrife by
+  # exact text match — an unpinned re-run could silently float vsrife to
+  # a release where the patch no longer applies (= fp16 flow overflow
+  # flicker with only a soft log line to show for it). Skip entirely
+  # when every pin is already satisfied so re-runs are offline-fast.
+  # Bump deliberately, re-test, and re-verify the vsrife patch context.
+  if python - <<PY
+import importlib.metadata as md, sys
+pins = {"vsrife": "$VSRIFE_VERSION", "tensorrt": "$TENSORRT_VERSION",
+        "torch_tensorrt": "$TORCH_TRT_VERSION",
+        "jellyfin-mpv-shim": "$SHIM_VERSION",
+        "nvidia-cudnn-frontend": "$CUDNN_FE_VERSION"}
+try:
+    sys.exit(0 if all(md.version(p) == v for p, v in pins.items()) else 1)
+except md.PackageNotFoundError:
+    sys.exit(1)
+PY
+  then
+    log "python stack already at pinned versions — skipping pip"
+  else
+    pip install \
+      "vsrife==$VSRIFE_VERSION" \
+      "jellyfin-mpv-shim[gui]==$SHIM_VERSION" \
+      "tensorrt==$TENSORRT_VERSION" \
+      "torch_tensorrt==$TORCH_TRT_VERSION" \
+      `# fsrcnnx-cudnn imports the Python frontend ('import cudnn') at` \
+      `# runtime — distinct from the runtime library nvidia-cudnn-cu*.` \
+      "nvidia-cudnn-frontend==$CUDNN_FE_VERSION"
+  fi
 
   log "verifying versions:"
   python - <<'PY'
@@ -429,9 +489,16 @@ apply_patches() {
         cp -n "$f" "${f}.bak"
         sed -i 's|use_explicit_typing=True,|use_explicit_typing=False, enabled_precisions={torch.float16, torch.float32},|g' "$f"
         log "patched $f for TRT mixed-precision"
-      else
-        log "vsrife __init__.py already patched (or different version)"
       fi
+      # Verify the patch actually landed. The old "already patched (or
+      # different version)" message conflated success with a vsrife
+      # release where the sed context no longer matches — and a missing
+      # patch means fp16 flow-vector overflow flicker at playback time
+      # with nothing pointing back here. Fail loudly instead.
+      grep -q 'enabled_precisions={torch.float16, torch.float32}' "$f" \
+        || fatal "vsrife mixed-precision patch did NOT apply to $f — \
+vsrife $VSRIFE_VERSION layout changed; update apply_patches()"
+      log "vsrife mixed-precision patch verified in $f"
     fi
   done
 }
@@ -459,8 +526,16 @@ hidpi-window-scale=yes
 # do SSD and mpv 0.41 has no libdecor → window has no title bar / min /
 # close. Switch to `x11vk` if you want GNOME-drawn decorations back.
 gpu-context=waylandvk
-hwdec=auto-safe
-profile=gpu-hq
+# auto-copy-safe (not auto-safe): the [rife] profile keeps a vapoursynth
+# filter attached for ≤4K sources, and vf chains need software frames —
+# under auto-safe mpv silently falls back to pure software decode in
+# that configuration. copy-back NVDEC keeps the decoder on the GPU; on
+# GB10 unified memory the copy is cheap, and the freed CPU/membw goes
+# to the RIFE chain (matters most for 4K HEVC/AV1 sources).
+hwdec=auto-copy-safe
+# gpu-hq is a deprecated alias since mpv 0.40 — high-quality is the
+# successor profile (same intent; scale/dscale/deband overridden below).
+profile=high-quality
 
 # Frame timing — RIFE generates the extra frames, so mpv's own temporal
 # interpolation must be off (otherwise we double-interpolate).
@@ -478,6 +553,16 @@ deband=yes
 
 target-colorspace-hint=yes
 dither-depth=auto
+
+# Network streaming (Jellyfin via shim): deeper demuxer cache than the
+# ~150 MiB default. The filter chain makes seeks/underruns expensive
+# (vf rebuild = 1-3 s freeze), and 4K remux bitrates (60-100 Mbps)
+# drain the default forward window in seconds. ~1 GiB resident worst
+# case — noise against 128 GB unified memory.
+cache=yes
+demuxer-max-bytes=768MiB
+demuxer-max-back-bytes=256MiB
+demuxer-readahead-secs=30
 
 # Danmaku: our generated ASS encodes every comment with explicit \move
 # \pos \1c overrides. mpv's secondary-sub-ass-override defaults to
@@ -639,10 +724,16 @@ EOF
       log "built $(ls -la "$native_so" | awk '{print $5}') bytes"
     fi
     install -d "$MPV_CFG_DIR/dual_machine" "$MPV_CFG_DIR/dual_machine/native_filter"
+    # --exclude='vs_gpu_helpers.py': a dev checkout may carry a
+    # local absolute-path symlink there (gitignored); rsync -a would
+    # ship the symlink itself, which dangles on any other machine.
+    # The real module is installed from the repo root right below.
     rsync -a --delete --exclude='__pycache__' --exclude='native_filter' \
-          --exclude='vk_priority_layer' \
+          --exclude='vk_priority_layer' --exclude='vs_gpu_helpers.py' \
           --exclude='*.sh' --exclude='*.md' --exclude='*.in' --exclude='rife.vpy' \
           "$PROJECT_DIR/dual_machine/" "$MPV_CFG_DIR/dual_machine/"
+    install -m 0644 "$PROJECT_DIR/vs_gpu_helpers.py" \
+            "$MPV_CFG_DIR/dual_machine/vs_gpu_helpers.py"
     rsync -a --delete --exclude='__pycache__' \
           "$PROJECT_DIR/dual_machine/native_filter/" \
           "$MPV_CFG_DIR/dual_machine/native_filter/"
@@ -711,6 +802,8 @@ EOF
     local tmp_bundle="/tmp/fsrcnnx-cudnn-bundle-$$.tar.gz"
     curl -fsSL -o "$tmp_bundle" "$fsrcnnx_bundle_url" || \
       fatal "failed to download $fsrcnnx_bundle_url"
+    echo "$FSRCNNX_CUDNN_SHA256  $tmp_bundle" | sha256sum -c - \
+      || fatal "fsrcnnx-cudnn bundle checksum mismatch — refusing to extract"
     rm -rf "$fsrcnnx_dir"
     tar -xzf "$tmp_bundle" -C "$MPV_CFG_DIR/"
     rm -f "$tmp_bundle"
@@ -740,7 +833,7 @@ EOF
 # detects existing cache files and skips re-compile.
 # ============================================================================
 warm_trt_cache() {
-  section "step 8/10: warm TRT engine cache (4.26 + 4.6 @ 720p / 1080p)"
+  section "step 8/10: warm TRT engine cache (480p / 720p / 1080p shapes)"
   # shellcheck disable=SC1091
   source "$FORGE_DIR/etc/profile.d/conda.sh"
   conda activate "$ENV_NAME"
@@ -753,9 +846,28 @@ warm_trt_cache() {
   # filename matches; only a forced rebuild fixes it.
   local cache_dir
   cache_dir=$(ls -d "$ENV_PREFIX"/lib/python*/site-packages/vsrife/models 2>/dev/null | head -1)
-  if (( REBUILD_TRT )) && [[ -d "$cache_dir" ]]; then
+  # Engine backup outside the conda env. uninstall deletes the whole
+  # env — taking 4-7 min of TRT compiles with it while carefully
+  # preserving credentials; vsrife upgrades change site-packages paths
+  # with the same effect. Engine filenames embed GPU model + TRT
+  # version, so a flat dir is safe: non-matching engines are simply
+  # never opened.
+  local engine_backup_dir="$HOME/.cache/dgxspark-mpv/trt-engines"
+  if (( REBUILD_TRT )); then
     log "wiping existing TRT engine cache (--rebuild-trt)"
-    find "$cache_dir" -maxdepth 1 -name "*.ts" -print -delete | sed 's/^/  removed: /'
+    [[ -d "$cache_dir" ]] &&       find "$cache_dir" -maxdepth 1 -name "*.ts*" -print -delete | sed 's/^/  removed: /'
+    [[ -d "$engine_backup_dir" ]] &&       find "$engine_backup_dir" -maxdepth 1 -name "*.ts*" -print -delete | sed 's/^/  removed backup: /'
+  fi
+  # Restore any backed-up engines before warming — turns a post-
+  # uninstall reinstall's warm step into a <1 s cache hit per shape.
+  if [[ -d "$engine_backup_dir" && -d "$cache_dir" ]]; then
+    local n_restored=0 ef
+    for ef in "$engine_backup_dir"/*.ts*; do
+      [[ -e "$ef" ]] || continue
+      [[ -e "$cache_dir/$(basename "$ef")" ]] && continue
+      cp "$ef" "$cache_dir/" && n_restored=$((n_restored + 1))
+    done
+    (( n_restored )) && log "restored $n_restored TRT engine file(s) from $engine_backup_dir"
   fi
 
   # vsrife's TRT static-shape mode uses the input clip's actual dimensions
@@ -764,8 +876,8 @@ warm_trt_cache() {
   # padded shape (e.g. 1920x1088, 3840x2176) so 1080p and 4K engines
   # coexist independently.
   #
-  # Total disk: ~250 MB for all 5 engines. Total time on a clean install:
-  # ~3-5 minutes (each engine ~30-60s); cache hits return in <1s.
+  # Total disk: ~350 MB for all 7 engines. Total time on a clean install:
+  # ~4-7 minutes (each engine ~30-60s); cache hits return in <1s.
   python - <<'PY'
 import time, vapoursynth as vs
 from vsrife import rife
@@ -785,15 +897,38 @@ def warm(label, model, width, height, scale=1.0):
     clip.get_frame(0)
     print(f"  {label}: ready in {time.time()-t0:.1f}s")
 
+# 480p sources — bucket 0 runs 4.26 at the source's own resolution,
+# so each common SD shape needs its own static-shape engine. Without
+# these, the first SD file blocks mpv's filter init for the 30-60 s
+# TRT compile with no OSD feedback (looks like a hang).
+warm("RIFE 4.26 @ 854x480 (SD 16:9)",  "4.26",  854, 480)
+warm("RIFE 4.26 @ 720x480 (NTSC DVD)", "4.26",  720, 480)
+warm("RIFE 4.26 @ 640x480 (4:3)",      "4.26",  640, 480)
+
 # 720p / 540p sources — auto-band uses 4.26 (rife.vpy heavy branch).
 warm("RIFE 4.26 @ 720p",  "4.26", 1280,  720)
 
-# 1080p sources — auto-band uses 4.6.
+# 1080p sources — cinema rates (<25 fps) use 4.26, 25-30 fps uses 4.6.
+warm("RIFE 4.26 @ 1080p", "4.26", 1920, 1080)
 warm("RIFE 4.6  @ 1080p", "4.6",  1920, 1080)
 
-# 4K sources — mixed mode downsamples to 1080p then runs 4.26.
-warm("RIFE 4.26 @ 1080p (for 4K mixed-mode interp)", "4.26", 1920, 1080)
+# 4K sources — mixed mode downsamples to 1080p then reuses the
+# 4.26 @ 1080p engine above (and 4.6 @ 1080p for 25-30 fps sources);
+# no separate 4K engine is built or needed.
 PY
+
+  # Back up freshly-warmed engines so they survive uninstall / env
+  # rebuild / vsrife path changes.
+  if [[ -d "$cache_dir" ]]; then
+    mkdir -p "$engine_backup_dir"
+    local n_backed=0 ef
+    for ef in "$cache_dir"/*.ts*; do
+      [[ -e "$ef" ]] || continue
+      [[ -e "$engine_backup_dir/$(basename "$ef")" ]] && continue
+      cp "$ef" "$engine_backup_dir/" && n_backed=$((n_backed + 1))
+    done
+    (( n_backed )) && log "backed up $n_backed TRT engine file(s) → $engine_backup_dir"
+  fi
 
   # Pre-compile the chroma kriging CUDA extension. Without this the
   # first frame using KrigBilateral chroma (yuv_p10_to_rgb in
@@ -841,12 +976,16 @@ install_danmaku() {
   if [[ -d "$DANMAKU_SRC_DIR/.git" ]]; then
     log "updating existing $DANMAKU_SRC_DIR"
     git -C "$DANMAKU_SRC_DIR" fetch --quiet origin "$DANMAKU_REF"
-    git -C "$DANMAKU_SRC_DIR" checkout --quiet "$DANMAKU_REF"
-    git -C "$DANMAKU_SRC_DIR" pull --ff-only --quiet
+    git -C "$DANMAKU_SRC_DIR" fetch --quiet origin || true
+    git -C "$DANMAKU_SRC_DIR" checkout --quiet "$DANMAKU_REF" || \
+      fatal "cannot checkout danmaku ref $DANMAKU_REF"
   else
     log "cloning $DANMAKU_REPO_URL → $DANMAKU_SRC_DIR"
-    git clone --quiet --branch "$DANMAKU_REF" \
-        "$DANMAKU_REPO_URL" "$DANMAKU_SRC_DIR"
+    # DANMAKU_REF is a commit SHA — clone the default branch, then
+    # detach to the pin (git clone --branch doesn't accept SHAs).
+    git clone --quiet "$DANMAKU_REPO_URL" "$DANMAKU_SRC_DIR"
+    git -C "$DANMAKU_SRC_DIR" checkout --quiet "$DANMAKU_REF" || \
+      fatal "cannot checkout danmaku ref $DANMAKU_REF"
   fi
   log "  HEAD: $(git -C "$DANMAKU_SRC_DIR" rev-parse --short HEAD)"
 
@@ -923,7 +1062,10 @@ PY
               danmaku-config.json danmaku-credentials.json danmaku-settings.json; do
     src="$MPV_CFG_DIR/$name"
     dst="$SHIM_CFG_DIR/$name"
-    [[ -L "$dst" ]] && continue
+    # Idempotency must compare the link TARGET — a dangling or stale
+    # link from an older layout used to be skipped just for being a
+    # symlink.
+    [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]] && continue
     [[ -e "$src" ]] || continue
     rm -f "$dst"
     ln -s "$src" "$dst"
@@ -932,7 +1074,7 @@ PY
   for name in scripts shaders; do
     src="$MPV_CFG_DIR/$name"
     dst="$SHIM_CFG_DIR/$name"
-    [[ -L "$dst" ]] && continue
+    [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]] && continue
     [[ -d "$src" ]] || continue
     rmdir "$dst" 2>/dev/null || rm -rf "$dst"
     ln -s "$src" "$dst"
@@ -1131,17 +1273,20 @@ print_install_summary() {
   Log out and back in (or run 'gtk-update-icon-cache' + restart GNOME
   Shell) so the new launchers + autostart + icons are picked up.
 
-  TensorRT engines pre-compiled at install time (instant F9 cycling /
-  first playback at 1080p and 4K):
-    - RIFE 4.26 + scale=1.0 @ 1080p  (default)
-    - RIFE 4.26 + scale=1.0 @ 4K     (default, UHD content)
-    - RIFE 4.6  + scale=1.0 @ 1080p  (light fallback)
-    - RIFE 4.6  + scale=1.0 @ 4K     (light fallback, UHD content)
+  TensorRT engines pre-compiled at install time (instant first
+  playback for the common source shapes):
+    - RIFE 4.26 @ 854x480 / 720x480 / 640x480  (SD bucket)
+    - RIFE 4.26 @ 720p                          (HD bucket)
+    - RIFE 4.26 @ 1080p  (cinema-rate 1080p + 4K mixed-mode interp)
+    - RIFE 4.6  @ 1080p  (25-30 fps 1080p + 4K mixed-mode interp)
+  4K sources reuse the 1080p engines (mixed mode runs RIFE at the
+  downsampled dim) — no separate 4K engine exists.
   Cache lives at:
     $ENV_PREFIX/lib/python*/site-packages/vsrife/models/
 
-  Other shapes (720p, 1440p) or different scales will JIT-compile a
-  matching engine on first use (~30-60s once).
+  Other shapes (non-standard SD, 1440p, …) or different scales will
+  JIT-compile a matching engine on first use (~30-60s once; mpv shows
+  a "compiling TRT engine" OSD note while it runs).
 
   Verify status with: $0 status
 ================================================================
@@ -1548,6 +1693,10 @@ cmd_uninstall() {
     - ~/.config/jellyfin-mpv-shim/cred.json   (Jellyfin server URL + token)
     - ~/.config/jellyfin-mpv-shim/conf.json   (shim preferences — fullscreen,
                                                audio device, key bindings...)
+    - ~/.cache/dgxspark-mpv/trt-engines/      (compiled TRT engines — the
+                                               next install's warm step
+                                               restores these instead of
+                                               recompiling 4-7 minutes)
 
   Re-run \`$0 install\` to rebuild from scratch — these are picked back up.
 ================================================================
@@ -1691,13 +1840,13 @@ dual_install_worker_files() {
     rm -rf "$DUAL_WORKER_DIR_LEGACY"
   fi
   mkdir -p "$DUAL_WORKER_DIR"
-  install -m 0644 "$PROJECT_DIR/dual_machine/worker.py"          "$DUAL_WORKER_DIR/"
-  install -m 0644 "$PROJECT_DIR/dual_machine/worker_3proc.py"    "$DUAL_WORKER_DIR/"
-  install -m 0644 "$PROJECT_DIR/dual_machine/rdma_transport.py"  "$DUAL_WORKER_DIR/"
-  install -m 0644 "$PROJECT_DIR/dual_machine/mp_pipeline.py"     "$DUAL_WORKER_DIR/"
-  install -m 0644 "$PROJECT_DIR/dual_machine/cc_cache.py"        "$DUAL_WORKER_DIR/"
-  install -m 0644 "$PROJECT_DIR/dual_machine/queue_mgr.py"       "$DUAL_WORKER_DIR/"
-  install -m 0644 "$PROJECT_DIR/dual_machine/common.py"          "$DUAL_WORKER_DIR/"
+  # Module list shared with bench/_common.sh — edit
+  # dual_machine/WORKER_MODULES, not this loop.
+  local _wm
+  while IFS= read -r _wm; do
+    [[ -z "$_wm" || "$_wm" == \#* ]] && continue
+    install -m 0644 "$PROJECT_DIR/dual_machine/$_wm" "$DUAL_WORKER_DIR/"
+  done < "$PROJECT_DIR/dual_machine/WORKER_MODULES"
   install -m 0644 "$PROJECT_DIR/vs_gpu_helpers.py"               "$DUAL_WORKER_DIR/"
   log "installed worker files: $(ls $DUAL_WORKER_DIR/*.py | wc -l) modules"
 }

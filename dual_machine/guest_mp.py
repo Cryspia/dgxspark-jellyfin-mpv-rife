@@ -56,6 +56,8 @@ import struct
 import sys
 import threading
 import time
+
+import numpy as np
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -145,6 +147,7 @@ class GuestMP:
                  cc_cache_writeback_fn: Optional[
                      Callable[[int, "memoryview"], None]] = None,
                  task_done_fn: Optional[Callable[[int], None]] = None,
+                 task_fail_fn: Optional[Callable[[int, str], None]] = None,
                  task_stage_done_fn: Optional[
                      Callable[[int, int], None]] = None,
                  log=lambda m: None):
@@ -181,6 +184,13 @@ class GuestMP:
         self.log = log
         self.cc_cache_writeback_fn = cc_cache_writeback_fn
         self.task_done_fn = task_done_fn
+        # (task_id, reason) → None; the dispatcher wires this to
+        # queue_mgr.task_done(ok=False) so a dead-worker / QP-error
+        # slot doesn't leave its task RUNNING forever.
+        self.task_fail_fn = task_fail_fn
+        # Set by register_cc_cache(); None = zero-copy sends unavailable.
+        self._cc_mr = None
+        self.cc_lkey: "int | None" = None
         # Optional callback (task_id, stage_idx) → None. Fires when
         # the mid SEND for a two-stage producer arrives. Lets queue_mgr
         # unblock downstream INTERP before the FULL stage completes.
@@ -188,6 +198,10 @@ class GuestMP:
         self.task_stage_done_fn = task_stage_done_fn
         # Mid-delivery gating env. When set both worker and host post
         # the split sends/recvs (early delivery of mid stages).
+        # Default OFF: stage-race long fixed, but 2026-06 A/B benches
+        # measured ON as bit-clean yet throughput-neutral at mult=2 AND
+        # mult=3 (the per-task wire-size shrink removed the latency it
+        # hid) — full rationale at worker_3proc's twin flag.
         self._mid_delivery_enabled = os.environ.get(
             "DUAL_MID_DELIVERY", "0") == "1"
 
@@ -234,22 +248,6 @@ class GuestMP:
         for name, off, nbytes, shape, dtype in self.dst_layout:
             self._sr_dst_offs[name] = (off, nbytes, shape, dtype)
 
-        # Cache (mid_off, mid_size, full_off, full_size) per task_type
-        # so notify_submit / _cq_loop don't recompute. The fields refer
-        # to the FIRST mid stage (stage 0) and the FINAL stage; for
-        # INTERP mult ≥ 4 the worker computes intermediate stage
-        # offsets (k * frame_sz) on the fly from DUAL_INTERP_MULT.
-        #
-        # Per task_type:
-        #   CCSR:    mid = rgb_padded + rife_features (single mid stage 0).
-        #            final = yao + uao + vao (single final).
-        #   INTERP:  dense-pack layout — frame k at offset k * frame_sz.
-        #            mid_off/size describe stage 0 only; final_off/size
-        #            describe the LAST frame (k = mult - 2). Worker
-        #            derives stages 1..mult-3 from mult + frame_sz.
-        #   SR_INTERP: single-stage, no mid.
-        _o = {n: off for n, off, *_ in self.dst_layout}
-        _s = {n: sz for n, _, sz, *_ in self.dst_layout}
         self._interp_mult = int(os.environ.get("DUAL_INTERP_MULT", "2"))
         if self._interp_mult not in (1, 2, 3, 4):
             self._interp_mult = 2
@@ -262,26 +260,25 @@ class GuestMP:
                 f"{_interp_total} B but slot.dst is {self.dst_size} B "
                 f"(proc_h={self._proc_h}, proc_w={self._proc_w}); "
                 f"reduce DUAL_INTERP_MULT or use a smaller source")
-        _frame_sz = self._interp_dst_rgb_bytes
-        if self._interp_mult >= 3:
-            # Dense pack: stage 0 = frame 0; final = last frame.
-            _interp_ranges = (
-                0, _frame_sz,
-                (self._interp_mult - 2) * _frame_sz, _frame_sz)
-        elif self._interp_mult == 2:
-            # mult=2 single-stage: skip mid. Worker writes the whole
-            # slot.dst — the bytes past frame 0 are unused dst_bundle
-            # space but the WRITE is uniform.
-            _interp_ranges = (0, 0, 0, self.dst_size)
-        else:
-            # mult=1 (no_interp): no INTERP task scheduled. Ranges unused.
-            _interp_ranges = (0, 0, 0, 0)
-        self._task_dst_ranges_map = {
-            TT_CCSR: (_o["rgb_padded"],
-                      _s["rgb_padded"] + _s["rife_features"],
-                      0, _o["rgb_padded"]),
-            TT_INTERP: _interp_ranges,
-            TT_SR_INTERP:   (0, 0, 0, self.dst_size),
+
+        # Per-task SEND lengths (host → worker). slot.src is sized for
+        # the worst case (the INTERP overlay), but each task type only
+        # fills a prefix of it; an RDMA SEND shorter than the worker's
+        # pre-posted fixed-size recv is legal, and the worker routes by
+        # the header's task_type, not byte_len. Sending the live bytes
+        # only cuts CCSR / SR_INTERP wire traffic to roughly a quarter.
+        #   CCSR:      header + ya/ua/va (the single source frame).
+        #   INTERP:    header + 2 × (rgb_padded + rife_features) — the
+        #              full overlay, no saving available.
+        #   SR_INTERP: header + rgb_interp at proc dims.
+        _src_off = {n: off for n, off, *_ in self.src_layout}
+        _src_sz  = {n: sz for n, _, sz, *_ in self.src_layout}
+        self._task_send_len = {
+            TT_CCSR: _src_off["va"] + _src_sz["va"],
+            TT_INTERP: (self._hdr_bytes
+                        + 2 * (self._rgb_padded_bytes
+                               + self._rife_features_bytes)),
+            TT_SR_INTERP: self._hdr_bytes + self._interp_dst_rgb_bytes,
         }
 
         # ── RDMA setup ──────────────────────────────────────────────
@@ -436,6 +433,28 @@ class GuestMP:
         st.dst_y_stride  = dst_y_stride
         st.dst_uv_stride = dst_uv_stride
 
+    def register_cc_cache(self, addr: int, length: int) -> bool:
+        """Register the host cc_cache shm region as an MR so INTERP /
+        SR_INTERP payloads can be gathered straight out of it by the
+        NIC (notify_submit with payload_sges) instead of the dispatch
+        thread memmoving ~58 MB per INTERP through the CPU's slow
+        (~5 GB/s) cudaHostRegister'd read path. Returns True on
+        success; on failure callers keep using the memmove path."""
+        try:
+            self._cc_mr = self.ctx.register_region(addr, length)
+            self.cc_lkey = self._cc_mr.lkey
+            self.log(f"[guest_mp] cc_cache region registered for "
+                      f"zero-copy sends ({length/1e6:.0f} MB, "
+                      f"lkey={self.cc_lkey})")
+            return True
+        except Exception as e:
+            self._cc_mr = None
+            self.cc_lkey = None
+            self.log(f"[guest_mp] cc_cache MR registration failed "
+                      f"({type(e).__name__}: {e}) — falling back to "
+                      f"staged sends")
+            return False
+
     def get_send_buffer_addr(self, slot: int) -> int:
         """Return the GPU/CPU address of the slot's send buffer.
         Header is at off 0..128. Caller writes payload starting at
@@ -447,7 +466,8 @@ class GuestMP:
         begins (i.e. just past the 128-B header)."""
         return self._hdr_bytes
 
-    def notify_submit(self, slot: int) -> None:
+    def notify_submit(self, slot: int,
+                      payload_sges: "list | None" = None) -> None:
         """post_send the slot's SRC bundle (host → worker direction).
         Worker → host direction is exclusively WRITE_WITH_IMM:
         worker RDMA WRITEs the dst bundle straight into recv_bufs[slot]
@@ -455,21 +475,38 @@ class GuestMP:
         recv WR pool catches the IMM events; no per-slot recv posting
         here.
 
-        We post the FULL src_size regardless of task type — RDMA cost
-        is dominated by transfer size, and a fixed wire length lets
-        the worker pre-post fixed-size recvs for the SRC direction.
-        """
+        Two payload modes:
+          payload_sges=None — classic staged path: the dispatcher
+            already memmoved the payload into send_buf behind the
+            header; SEND length is per-task (see _task_send_len).
+          payload_sges=[(addr, len, lkey), ...] — zero-copy path: the
+            wire message is the gather of [header (send_buf, 128 B)]
+            + the given SGEs (typically cc_cache fields registered via
+            register_cc_cache). Wire bytes are identical to the staged
+            layout, so the worker can't tell the difference.
+
+        Either way a SEND shorter than the worker's pre-posted
+        src_size recv is legal, and the worker routes by the header's
+        task_type."""
         with self._cv:
             assert self._state[slot] == ST_FILLED, (
                 f"notify_submit on slot {slot} but state={self._state[slot]}")
             self._state[slot] = ST_IN_FLIGHT
+            send_len = self._task_send_len.get(
+                self._task[slot].task_type, self.src_size)
         # WRITE_WITH_IMM unified protocol: worker writes directly into
         # recv_bufs[slot] at the correct offset; the dummy-recv pool
         # pre-posted at __init__ catches IMM events. notify_submit
         # only needs to post the SRC SEND (host → worker direction).
         with self._io_lock:
-            self.ch.post_send(self.send_bufs[slot], self.src_size,
-                               wr_id=_WR_SEND_DONE | slot)
+            if payload_sges is None:
+                self.ch.post_send(self.send_bufs[slot], send_len,
+                                   wr_id=_WR_SEND_DONE | slot)
+            else:
+                sges = [(self.send_bufs[slot].addr, self._hdr_bytes,
+                         self.send_bufs[slot].lkey)]
+                sges.extend(payload_sges)
+                self.ch.post_send_sgl(sges, wr_id=_WR_SEND_DONE | slot)
 
     # ── CQ poll thread + writeback ─────────────────────────────────
 
@@ -480,7 +517,15 @@ class GuestMP:
         invoke task_done callback, re-post recv, return slot to free.
 
         Mirrors RDMAChannel.poll_cq_blocking's `ctx.cq.poll(n) → (n,wcs)`
-        contract, but as a non-blocking spin so we react to self._closed."""
+        contract, but as a non-blocking spin so we react to self._closed.
+
+        Idle backoff: while tasks are in flight, completions arrive
+        every few ms, so the tight 100 µs poll keeps latency low. With
+        nothing in flight (pause, single-mode fallback, idle player),
+        the same spin needlessly burns a core inside the mpv process —
+        back off to 1 ms after ~2 ms of consecutive empties; the first
+        completion resets to the tight cadence."""
+        idle_polls = 0
         while True:
             if self._closed:
                 return
@@ -491,12 +536,26 @@ class GuestMP:
                 time.sleep(0.001)
                 continue
             if n == 0:
-                time.sleep(0.0001)
+                idle_polls += 1
+                time.sleep(0.0001 if idle_polls < 20 else 0.001)
                 continue
+            idle_polls = 0
             for wc in wcs[:n]:
                 if wc.status != 0:
+                    # A failed SEND (QP error / flush) means the slot's
+                    # task will never produce a response — recover the
+                    # slot and report the task failed so queue_mgr
+                    # doesn't leave it RUNNING forever (the old code
+                    # just logged; 4 such errors leaked every slot and
+                    # wedged the guest dispatcher). RECV_IMM flushes
+                    # carry no slot of their own.
                     self.log(f"[guest_mp-cq] wc.status={wc.status} "
                               f"wr_id={hex(wc.wr_id)}")
+                    op = wc.wr_id & ~_WR_MASK_SLOT
+                    if op == _WR_SEND_DONE:
+                        self._fail_slot(int(wc.wr_id & _WR_MASK_SLOT),
+                                        "rdma send error "
+                                        f"status={wc.status}")
                     continue
                 op = wc.wr_id & ~_WR_MASK_SLOT
                 if op == _WR_SEND_DONE:
@@ -718,10 +777,56 @@ class GuestMP:
         if dst_stride_bytes == 0 or dst_stride_bytes == row_bytes:
             ctypes.memmove(dst_addr, src_addr, row_bytes * rows)
         else:
-            for r in range(rows):
-                ctypes.memmove(dst_addr + r * dst_stride_bytes,
-                                src_addr + r * row_bytes,
-                                row_bytes)
+            # Strided destination: one vectorised numpy copy instead of
+            # `rows` Python-level memmoves (~2 ms of call overhead for a
+            # 4K Y plane). ctypes arrays expose a writable buffer, so
+            # the frombuffer views are writable; both views only live
+            # for the duration of this call.
+            src = np.frombuffer(
+                (ctypes.c_char * (row_bytes * rows)).from_address(src_addr),
+                dtype=np.uint8).reshape(rows, row_bytes)
+            dst_buf = (ctypes.c_char * (
+                dst_stride_bytes * (rows - 1) + row_bytes)
+            ).from_address(dst_addr)
+            dst = np.lib.stride_tricks.as_strided(
+                np.frombuffer(dst_buf, dtype=np.uint8),
+                shape=(rows, row_bytes), strides=(dst_stride_bytes, 1))
+            np.copyto(dst, src)
+
+    def _fail_slot(self, slot: int, reason: str) -> None:
+        """Recover one slot whose task can no longer complete: report
+        the task failed (so queue_mgr doesn't leave it RUNNING and the
+        frame falls back to its timeout path exactly once) and return
+        the slot to the free list."""
+        if not (0 <= slot < len(self._state)):
+            return
+        tid = 0
+        with self._cv:
+            t = self._task[slot]
+            if self._state[slot] != ST_FREE:
+                tid = t.task_id
+                t.task_id = 0
+                self._state[slot] = ST_FREE
+                self._free.append(slot)
+                self._cv.notify()
+        if tid > 0:
+            self.log(f"[guest_mp] slot {slot} task {tid} failed: {reason}")
+            if self.task_fail_fn is not None:
+                try:
+                    self.task_fail_fn(tid, reason)
+                except Exception as e:
+                    self.log(f"[guest_mp] task_fail_fn({tid}) raised: {e}")
+
+    def fail_inflight(self, reason: str) -> int:
+        """Worker connection lost: fail every slot still carrying an
+        unfinished task and free it. Returns the number of recovered
+        tasks. Called by the dispatcher's liveness watchdog."""
+        n = 0
+        for slot in range(len(self._state)):
+            if self._state[slot] != ST_FREE:
+                self._fail_slot(slot, reason)
+                n += 1
+        return n
 
     def close(self):
         with self._cv:

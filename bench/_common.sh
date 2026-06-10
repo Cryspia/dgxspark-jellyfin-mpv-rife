@@ -40,7 +40,6 @@ WORKER_USER="${WORKER_USER:-${DUAL_WORKER_USER:-ubuntu}}"
 WORKER_DIR="${WORKER_DIR:-${DUAL_WORKER_DIR:-.local/share/dgxspark-mpv/worker}}"
 RDMA_DEV="${RDMA_DEV:-${DUAL_RDMA_DEV:-rocep1s0f0}}"
 RDMA_PORT="${RDMA_PORT:-${DUAL_RDMA_PORT:-29900}}"
-MASTER_PORT="${MASTER_PORT:-$((30000 + (RANDOM ^ $$) % 5000))}"
 
 # ─── default clips (override via env) ────────────────────────────────
 CLIP_24="${CLIP_24:-$REPO_ROOT/bench/clips/sample-1080p-24.mp4}"
@@ -131,11 +130,19 @@ start_worker() {
   [[ $_WORKER_STARTED = 1 ]] && return 0
   kill_remote_worker
   if [[ "${BENCH_USE_INSTALLED:-0}" != "1" ]]; then
+    # Module list shared with install.sh's --dual-secondary step —
+    # edit dual_machine/WORKER_MODULES, not an inline list (the two
+    # used to drift; this rsync was missing common.py).
+    # vs_gpu_helpers.py comes from the repo root (dev tree), matching
+    # what the host-side bench run imports.
+    local _wm _mods=()
+    while IFS= read -r _wm; do
+      [[ -z "$_wm" || "$_wm" == \#* ]] && continue
+      _mods+=("$DUAL_DIR/$_wm")
+    done < "$DUAL_DIR/WORKER_MODULES"
     rsync -azq \
-      "$DUAL_DIR/worker.py" "$DUAL_DIR/rdma_transport.py" \
-      "$DUAL_DIR/worker_3proc.py" "$DUAL_DIR/mp_pipeline.py" \
-      "$DUAL_DIR/cc_cache.py" "$DUAL_DIR/queue_mgr.py" \
-      "$MPV_CFG/vs_gpu_helpers.py" \
+      "${_mods[@]}" \
+      "$DUAL_DIR/../vs_gpu_helpers.py" \
       "$WORKER_USER@$WORKER_IP:$WORKER_DIR/"
     ssh -n "$WORKER_USER@$WORKER_IP" "mkdir -p ~/.config/mpv/fsrcnnx-cudnn"
     rsync -azq --delete --exclude='__pycache__' \

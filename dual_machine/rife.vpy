@@ -116,12 +116,14 @@ try:
         _sw, _sh = 1, 1
 
     def _rife(c, model, scale=1.0, factor_num=2, target_subsample="420"):
-        """4:2:0: rife_yuv (GPU YUV↔RGB, fast path). 4:2:2: vsrife
-        direct with zimg YUV↔RGB. Both produce a YUV clip with the
-        subsampling controlled by `target_subsample` ("420" matches
-        input, "444" keeps RIFE-decoded chroma at full luma res so
-        downstream SR can skip the round-trip)."""
-        if c.format.id == int(vs.YUV420P10):
+        """4:2:0 / 4:4:4: rife_yuv (GPU YUV↔RGB, fast path — the 4:4:4
+        form carries the 4K-DS downsample, which lands at 1080p 4:4:4
+        to preserve chroma). 4:2:2: vsrife direct with zimg YUV↔RGB.
+        All produce a YUV clip with the subsampling controlled by
+        `target_subsample` ("420" matches input, "444" keeps
+        RIFE-decoded chroma at full luma res so downstream SR can skip
+        the round-trip)."""
+        if c.format.id in (int(vs.YUV420P10), int(vs.YUV444P10)):
             return rife_yuv(c, model=model, scale=scale,
                             factor_num=factor_num, factor_den=1,
                             color_range=color_range,
@@ -448,15 +450,34 @@ try:
             # 4K-like mode keeps factor=2 — the src_4k/interp_4k
             # Interleave only handles 1:1 patterns cleanly. Higher
             # factors would need bespoke frame-mapping logic.
-            rife_low = _rife(down, rife_model, factor_num=2)
+            # target_subsample="444": rife_yuv keeps the whole 1080p
+            # 4:4:4 interp chain on the GPU (the default "420" target
+            # used to push the 4:4:4 input down vsrife's CPU-zimg
+            # branch — the very round-trip this file's GPU CC exists
+            # to avoid) and hands SR full-res chroma, mirroring the
+            # ≤1080p buckets' 4:4:4 trick.
+            rife_low = _rife(down, rife_model, factor_num=2,
+                             target_subsample="444")
             rife_interp_1080p = rife_low.std.SelectEvery(2, [1])
             # SR target = src dim. apply_sr's min_ratio gate refuses SR
             # when target/in ≤ 1.2 (e.g. src very close to 1080p); when
             # that happens interp_sr stays at 1080p and we zimg-resize
             # it up to src dim before interleaving.
+            # For the common 4:2:0 source, fold the 4:4:4 → 4:2:0
+            # chroma resize into FSRCNNX's fused GPU pass (identity
+            # when src chroma is already at 1080p, i.e. native 4K
+            # 4:2:0) — same wiring as buckets 0-2. Non-4:2:0 sources
+            # keep the default path; the format coercion below handles
+            # their chroma layout.
+            _sr_kw_4k = {}
+            if (src_4k.format.subsampling_w,
+                    src_4k.format.subsampling_h) == (1, 1):
+                _sr_kw_4k["chroma_kernel"] = _SR_CHROMA_KERNEL
+                _sr_kw_4k["output_subsampling"] = _SR_OUT_SUB
             interp_sr = apply_sr(rife_interp_1080p, family=sr_family_4k,
                                  target_w=src_4k.width,
-                                 target_h=src_4k.height)
+                                 target_h=src_4k.height,
+                                 **_sr_kw_4k)
             if (interp_sr.width != src_4k.width
                     or interp_sr.height != src_4k.height):
                 interp_sr = core.resize.Bicubic(interp_sr,

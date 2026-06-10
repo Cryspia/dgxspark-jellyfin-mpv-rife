@@ -1,107 +1,118 @@
-# Bench results — DGX Spark reference machine
+# Bench results — DGX Spark reference machines
 
-Snapshot of the most recent run on the development primary box, kept
-under version control so it doubles as a regression baseline.
+Snapshot of the most recent full run, kept under version control so it
+doubles as a regression baseline.
 
-- **Date:** 2026-05-23
+- **Date:** 2026-06-10
 - **Hardware:** 2 × DGX Spark (GB10, ARM64, CUDA 13), 200 G RoCE link
-- **Software:** `dual-machine-ib-baseline` branch, post-lessons commit
-- **Test clips:** `/tmp/sample-1080p-24-loop.mp4` (1080p HEVC, 24 fps,
-  60 s; user-provided real video) for color, `bench/clips/sample-1080p-120.mp4`
-  (synthesised by `bench/gen_clips.sh`) for fps.
+- **Software:** `main`
+- **Test clips:** `bench/clips/sample-1080p-24.mp4` for color,
+  `bench/clips/sample-1080p-120.mp4` for fps — both committed in-repo
+  (synthesised by `bench/gen_clips.sh`), so anyone can reproduce.
 
 Reproduce with:
 ```bash
-CLIP_24=/tmp/sample-1080p-24-loop.mp4 bench/color.sh
+bench/color.sh
 bench/fps.sh
 MODE=dual bench/timing.sh
+bench/robustness.sh
 ```
 
 ## bench/color.sh — single vs dual PSNR
 
 `N=20`, `CF=2`, comparing the FFV1-encoded outputs of each pair.
 
-| pair | single bytes | dual bytes | Y avg | U avg | V avg | min Y | max Y |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| full        (RIFE + FSRCNNX) | 119,136,942 | 118,861,772 | 54.87 | 67.36 | 65.76 | 50.91 | inf |
-| no\_sr      (RIFE only)       |  51,616,572 |  33,891,969 | 56.25 | 59.78 | 58.15 | 51.80 | inf |
-| no\_interp  (FSRCNNX only)    | 115,059,539 | 120,394,538 | 69.15 | 59.14 | 56.37 | 60.98 | 62.41 |
+| pair | single bytes | dual bytes | Y avg | U avg | V avg | overall avg |
+|---|---:|---:|---:|---:|---:|---:|
+| full        (RIFE + FSRCNNX) | 53,356,785 | 53,331,494 | 58.31 | 49.93 | 49.03 | 53.22 |
+| no\_sr      (RIFE only)       | 26,235,552 | 12,739,136 | 61.46 | 47.14 | 47.38 | 51.71 |
+| no\_interp  (FSRCNNX only)    | 52,623,730 | 54,733,061 | 63.79 | 37.69 | 36.56 | 41.84 |
 
-`SR_SRC` (real-frame) outputs are byte-identical between single and
-dual (`psnr_y=inf` every frame). `SR_INTERP` frames carry RIFE
-cross-GPU non-determinism: 49–72 dB Y on full / no\_sr.
+`SR_SRC` (real-frame) outputs are **byte-identical** between single
+and dual (`psnr_y=inf` every frame). `SR_INTERP` frames carry RIFE
+cross-GPU non-determinism: 54–61 dB Y on the full pair in this run.
 
-Determinism: three back-to-back runs produce byte-identical outputs
-in every mode (file sizes above repeat exactly).
+PSNR here measures single-vs-dual *consistency* and is strongly
+content-dependent — the synthetic clip's sharp, saturated chroma reads
+much lower on U/V than real video does. Numbers are only comparable
+across runs of the **same** clip; re-baseline whenever the clip
+changes.
 
 ## bench/fps.sh — sustained throughput
 
-`N=400`, `CF=24`, 1080p120 source → 4K output. `wall` includes ~3 s
-of engine / cuDNN warm overhead; `dispatcher` is the worker's rolling
-30-frame estimate (steady state).
+`N=400`, `CF=24`, bf=2, 1080p source → 4K output. `wall` includes
+~3 s of engine / cuDNN warm overhead (reads low); `dispatcher` is the
+rolling 30-frame estimate (steady state). Run-to-run noise is ±3 %;
+the very first dual session after a worker cold start can read far
+lower — discard the first run when benchmarking.
 
 | chain | mode | wall fps | dispatcher fps |
 |---|---|---:|---:|
-| single | single          | 35.2 | — |
-| single | single\_no\_sr   | 51.1 | — |
-| single | single\_no\_rife | 71.0 | — |
-| dual   | dual            | 33.6 |  96.0 |
-| dual   | dual\_no\_sr     | 43.4 | 148.8 |
-| dual   | dual\_no\_interp | 37.0 | 113.7 |
-
-Steady-state speedup vs single (full chain): **96 / 50 ≈ 1.95×**.
+| single | single          | 29.7 | — |
+| single | single\_no\_sr   | 43.8 | — |
+| single | single\_no\_rife | 53.0 | — |
+| dual   | dual            | 26.2 |  94.6 – 96.4 |
+| dual   | dual\_no\_sr     | 31.9 | 152.8 – 156.1 |
+| dual   | dual\_no\_interp | 29.1 | 145.1 – 146.6 |
 
 ### dual at higher interp_mult
 
-`N=200`, `CF=24`, 1080p120 source → 4K output. mult is forced by
-env (`DUAL_INTERP_MULT=N`) for this comparison; production
-auto-defaults are listed in dual_machine/README.md.
+`N=300`, `CF=24`, mult forced via env (`DUAL_INTERP_MULT=N`);
+production auto-defaults are listed in dual_machine/README.md.
 
-| `DUAL_INTERP_MULT` | output rate | dispatcher fps (steady) | mult × source budget |
-|---|---|---:|---:|
-| 2 | 2× source | 98.4 | 240 fps target | well within budget |
-| 3 | 3× source | 95.1 | 360 fps target — INTERP fan-out adds 0–3 fps overhead |
-| 4 | 4× source | 98.6 | 480 fps target — same envelope as mult=2 at 1080p |
+| `DUAL_INTERP_MULT` | dispatcher fps (steady) |
+|---|---:|
+| 2 | 94.6 – 96.4 |
+| 3 | 86.7 |
 
-mult=3 is slightly slower than mult=2/4 because the approach-A INTERP
-runs single-task + dual-flownet (the secondary SR_INTERP fans out
-from one INTERP task), so a partial extra dispatcher hop adds 0.5–3
-fps overhead. mult=4's dispatcher fps matches mult=2 because the
-INTERP task does 3 flownets in one call (single task overhead amortised).
+`DUAL_MID_DELIVERY=1` (stage early-delivery) measures bit-clean but
+throughput-neutral at both mult=2 (94.2 vs 96.4) and mult=3 (86.6 vs
+86.7); it stays off by default — see the flag comments in
+`worker_3proc.py`.
 
-For ≤720p source these numbers go higher (mult=4 at 720p hits ~140
-fps dispatcher, the M8 design target).
+## bench/timing.sh — per-task GPU + comm (MODE=dual, N=600)
 
-## bench/timing.sh — per-task GPU + comm (mode=dual, N=600)
+Numbers below are with full instrumentation enabled
+(`DUAL_PROFILE=1`, `DUAL_GPU_IDLE_DBG`, `DUAL_RDMA_PROF`), which
+costs ~13 % steady-state fps (83 vs 95) — compare within this table,
+not against fps.sh. Measured with an idle desktop: no shim, no other
+GPU clients on either box.
 
 Worker side per task type (last `PROFILE` sample, GB10):
 
 | task type | kernel (ms) | idle\_before (ms) |
 |---|---:|---:|
-| INTERP    | 5–7  | 0.3–0.8 |
-| SR\_INTERP | 6–8  | 0.4–1.2 |
-| CCSR      | 9–12 | 0.2–0.6 |
+| INTERP    | 17.6 | 0.3 |
+| SR\_INTERP | 8.5  | 0.6 – 6 |
+| CCSR      | 11.4 | 7.7 |
 
-Worker GPU utilisation (rolling): **kernel ≈ 94 %**, idle ≈ 6 %.
+Worker GPU stream utilisation (rolling): **80 – 88 %**.
 
 Worker RDMA per task (`DUAL_RDMA_PROF=1`):
 
 | task | send (ms) | recv-rtt (ms) |
 |---|---:|---:|
-| INTERP    | 5.7 | 16 |
-| SR\_INTERP | 3.1 | 11 |
-| CCSR      | 4.2 | 13 |
+| INTERP    | 4.3 | 15.1 |
+| SR\_INTERP | 4.6 | 17.3 |
+| CCSR      | 6.4 | 41.3 |
+
+`recv-rtt` is **not** wire latency: it measures "previous send-CQ on
+this slot → next recv on this slot", attributed to the *incoming*
+task's type — i.e. slot-reuse cadence including all host-side think
+time. Task types the guest receives rarely (CCSR is mostly consumed
+host-side) therefore read high by construction. Transit pipelines
+behind the next task's compute; effective critical-path cost ≈ 0 ms.
 
 Host queue depth + lock-hold (`DUAL_PROFILE=1`):
-- HOST pops: `cc` ≈ 30 / s, `sr` ≈ 60 / s, `interp` ≈ 0; `wait_avg < 0.1 ms`.
-- GUEST pops: `interp` ≈ 30 / s, `cc` ≈ 0, `sr` ≈ 0; `wait_avg < 0.1 ms`.
-- Pop lock-hold: ≈ 0.05 ms / call.
+- HOST pops ≈ 69 / s (cc 29, sr 33, interp 6); GUEST ≈ 57 / s
+  (interp 35, cc 13, sr 8). `wait_avg ≈ 4 ms` (dispatchers wait on
+  work, not slots).
+- Queue depth at pop ≈ 0.6 – 1.5; DAG size ≈ 38 (peak 51).
+- Lock-hold: pops ≈ 0.05 ms, task_done ≈ 0.15 ms, submit ≈ 0.08 ms.
 
-## Notes
+## bench/robustness.sh
 
-- Dispatcher fps (`96`) is the trustworthy steady-state number; the
-  wall figures for dual underrepresent because mpv has to drain the
-  source pipeline before the dispatcher's steady-state kicks in.
-- All numbers above are with `DUAL_INTERP_MULT=2` (the production
-  default for 1080p / 24 fps source). For higher multipliers see
-  the [`dual_machine/README.md`](../dual_machine/README.md#default-interp_mult-per-source).
+All **9/9 scenarios PASS**: worker_down (clean single fallback),
+clean_restart ×2, force_kill_restart, two_mpvs, host_child_crash,
+queue_saturation, repeated_vf_reload, trt_cache_miss (full recompile,
+118.9 s wall), seek_storm.
