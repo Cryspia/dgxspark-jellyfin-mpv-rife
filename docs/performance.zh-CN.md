@@ -76,9 +76,9 @@ gather 直接从注册为 MR 的 cc_cache 区域取数，不再由派发线程�
 被派 CCSR，所以该项天然偏大。传输完全流水在下一个任务的计算后面，
 关键路径有效成本 ≈ 0 ms。）
 
-`DUAL_MID_DELIVERY`（stage 早投递）默认关闭：mult=2 与 mult=3 实测
-画质干净但吞吐持平 —— 依据见 `dual_machine/worker_3proc.py` 的
-flag 注释。
+`DUAL_MID_DELIVERY`（stage 早投递）默认开启，并随握手下发以保证
+两端一致；交错 A/B 实测画质干净、mult=2 下略快（host 侧设
+`DUAL_MID_DELIVERY=0` 可关闭对比）。
 
 ## 容错行为
 

@@ -81,15 +81,16 @@ def rdma_proc_main():
     # producers emit a separate mid SEND followed by a FULL-range
     # SEND.
     #
-    # Default OFF on measurement, not suspicion: the historical 8-17 dB
-    # stage race was fixed (state-machine encoding, see sync_worker),
-    # and 2026-06 A/B benches show ON is bit-clean but throughput-
-    # neutral at BOTH mult=2 (94 vs 96 fps) and mult=3 (86.6 vs 86.7)
-    # — the per-task wire-size reduction (task_dst_ranges) removed the
-    # latency early delivery used to hide. Not worth the extra WRITE+
-    # IMM per stage until a workload shows a real win.
+    # Default ON: this is the designed pipeline behaviour (downstream
+    # tasks unblock per stage instead of per task). The historical
+    # 8-17 dB stage race was fixed (state-machine encoding, see
+    # sync_worker); 2026-06 interleaved A/B (3+3 runs, mult=2) measures
+    # ON at 97.4 vs OFF at 94.8 fps mean, bit-clean PSNR, neutral at
+    # mult=3. The value arrives via the handshake (host decides), so
+    # both sides always agree; DUAL_MID_DELIVERY=0 on the HOST disables
+    # for A/B.
     _mid_delivery_enabled = os.environ.get(
-        "DUAL_MID_DELIVERY", "0") == "1"
+        "DUAL_MID_DELIVERY", "1") == "1"
     log(f"opening RDMA ctx dev={rdma_dev} gid={rdma_gid}"
         f"{' [mid-delivery=on]' if _mid_delivery_enabled else ''}")
     ctx = RDMAContext(dev_name=rdma_dev, port=1, gid_index=rdma_gid,
@@ -1066,10 +1067,10 @@ def compute_proc_main():
 
     # Gating env. When enabled both worker and host post the early-
     # delivery mid SEND (see DUAL_MID_DELIVERY plumbing in guest_mp.py).
-    # Default OFF — measured throughput-neutral; rationale at the
-    # rdma_proc twin of this flag above.
+    # Default ON — handshake-propagated; rationale at the rdma_proc
+    # twin of this flag above.
     _mid_delivery_enabled = os.environ.get(
-        "DUAL_MID_DELIVERY", "0") == "1"
+        "DUAL_MID_DELIVERY", "1") == "1"
 
     # Per-slot helper for N-stage producers to mark an intermediate
     # stage done. CCSR uses stage_idx=0 at the CC+features/SR boundary;
@@ -1955,6 +1956,7 @@ def run_worker_3proc_pipeline(*, H, W, scale, sub_w, sub_h, n_slots,
                                 enc_ch: int = 4,
                                 interp_mult: int = 2,
                                 no_sr: int = 0,
+                                mid_delivery: int = 1,
                                 wmp_out: dict | None = None):
     # Override env so compute_proc / buffer_mgr_proc / rdma_proc (which
     # all read DUAL_INTERP_MULT + DUAL_NO_SR via env) see the session's
@@ -1966,6 +1968,7 @@ def run_worker_3proc_pipeline(*, H, W, scale, sub_w, sub_h, n_slots,
         interp_mult = 2
     os.environ["DUAL_INTERP_MULT"] = str(interp_mult)
     os.environ["DUAL_NO_SR"] = "1" if no_sr else "0"
+    os.environ["DUAL_MID_DELIVERY"] = "1" if mid_delivery else "0"
     """Spawns rdma_proc + buffer_mgr_proc + compute_proc, waits for
     compute to pre-warm, then calls signal_ready_cb (which sends the
     NCCL 'ready' signal to the host). Finally blocks on .join() until

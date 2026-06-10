@@ -198,12 +198,13 @@ class GuestMP:
         self.task_stage_done_fn = task_stage_done_fn
         # Mid-delivery gating env. When set both worker and host post
         # the split sends/recvs (early delivery of mid stages).
-        # Default OFF: stage-race long fixed, but 2026-06 A/B benches
-        # measured ON as bit-clean yet throughput-neutral at mult=2 AND
-        # mult=3 (the per-task wire-size shrink removed the latency it
-        # hid) — full rationale at worker_3proc's twin flag.
+        # Default ON (the designed pipeline behaviour; A/B-verified
+        # bit-clean and slightly faster) — native_dispatcher snapshots
+        # the value into the env before the handshake and ships it to
+        # the worker, so both sides always agree. Full rationale at
+        # worker_3proc's twin flag.
         self._mid_delivery_enabled = os.environ.get(
-            "DUAL_MID_DELIVERY", "0") == "1"
+            "DUAL_MID_DELIVERY", "1") == "1"
 
         # Per-slot dst layout: 4K SR output (yao/uao/vao) plus CCSR
         # mid-out (rgb_padded + rife_features).

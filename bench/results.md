@@ -65,10 +65,11 @@ production auto-defaults are listed in dual_machine/README.md.
 | 2 | 94.6 – 96.4 |
 | 3 | 86.7 |
 
-`DUAL_MID_DELIVERY=1` (stage early-delivery) measures bit-clean but
-throughput-neutral at both mult=2 (94.2 vs 96.4) and mult=3 (86.6 vs
-86.7); it stays off by default — see the flag comments in
-`worker_3proc.py`.
+`DUAL_MID_DELIVERY` (stage early-delivery) is **on** by default and
+carried in the handshake so both sides always agree. Interleaved A/B
+(3+3 runs, mult=2): on 97.4 vs off 94.8 fps mean, bit-clean PSNR;
+neutral at mult=3 (86.6 vs 86.7). Set `DUAL_MID_DELIVERY=0` on the
+host to disable for A/B.
 
 ## bench/timing.sh — per-task GPU + comm (MODE=dual, N=600)
 
