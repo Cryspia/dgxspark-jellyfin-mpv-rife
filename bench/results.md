@@ -51,7 +51,7 @@ lower — discard the first run when benchmarking.
 | single | single          | 29.7 | — |
 | single | single\_no\_sr   | 43.8 | — |
 | single | single\_no\_rife | 53.0 | — |
-| dual   | dual            | 26.2 |  94.6 – 96.4 |
+| dual   | dual            | 26.2 |  94.9 – 99.8 |
 | dual   | dual\_no\_sr     | 31.9 | 152.8 – 156.1 |
 | dual   | dual\_no\_interp | 29.1 | 145.1 – 146.6 |
 
@@ -62,7 +62,7 @@ production auto-defaults are listed in dual_machine/README.md.
 
 | `DUAL_INTERP_MULT` | dispatcher fps (steady) |
 |---|---:|
-| 2 | 94.6 – 96.4 |
+| 2 | 94.9 – 99.8 (mean ≈ 97) |
 | 3 | 86.7 |
 
 `DUAL_MID_DELIVERY` (stage early-delivery) is **on** by default and
