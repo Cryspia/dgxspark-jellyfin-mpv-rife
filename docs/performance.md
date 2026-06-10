@@ -78,9 +78,10 @@ wire latency; rarely-guest-dispatched types like CCSR read high by
 construction. Transit is fully pipelined behind the next task's
 compute, so effective critical-path cost ≈ 0 ms.)
 
-`DUAL_MID_DELIVERY` (stage early-delivery) is off by default:
-measured bit-clean but throughput-neutral at mult=2 and mult=3 — see
-the flag comments in `dual_machine/worker_3proc.py`.
+`DUAL_MID_DELIVERY` (stage early-delivery) is on by default and
+carried in the handshake so host and worker always agree; A/B-verified
+bit-clean and slightly faster at mult=2 (`DUAL_MID_DELIVERY=0` on the
+host disables it).
 
 ## Fault behaviour
 

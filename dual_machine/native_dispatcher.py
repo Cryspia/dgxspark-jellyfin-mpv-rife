@@ -370,8 +370,13 @@ def make_dispatcher(
     _MATRIX_PROP = {"709": 1, "470bg": 5, "170m": 6, "240m": 7,
                     "2020ncl": 9, "2020cl": 10}
     _RIFE_IDX = {"4.26": 0, "4.6": 1}
+    # Stage early-delivery (mid SEND) switch — ON by default; carried
+    # in the handshake so host and worker can never disagree.
+    # DUAL_MID_DELIVERY=0 disables for A/B.
+    _mid_delivery_on = os.environ.get("DUAL_MID_DELIVERY", "1") == "1"
+    os.environ["DUAL_MID_DELIVERY"] = "1" if _mid_delivery_on else "0"
     handshake_bytes = _struct.pack(
-        "<19q",
+        "<20q",
         2, H, W, output_scale,
         _VARIANT_IDX[variant],
         _CHROMA_IDX[chroma_kernel],
@@ -389,8 +394,11 @@ def make_dispatcher(
         # while dual is pinned to 4.26, silent slot-layout divergence
         # the day a 4.6 dual session ships. Field [18].
         int(rife_cfg.get("encode_channel", 0) or 0),
+        # mid_delivery: field [19]. Host decides; worker mirrors into
+        # its children's env (same pattern as interp_mult / no_sr).
+        1 if _mid_delivery_on else 0,
     )
-    sys.stderr.write("[native_dispatcher] sending handshake (152 B)…\n")
+    sys.stderr.write("[native_dispatcher] sending handshake (160 B)…\n")
     sys.stderr.flush()
     try:
         _liveness_sock.sendall(handshake_bytes)

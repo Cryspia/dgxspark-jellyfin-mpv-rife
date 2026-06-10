@@ -343,10 +343,10 @@ class SlotRingLayout:
         0..dst_size WRITE used to ship up to ~40 MB of dead bytes per
         task over the wire.
 
-        mid_delivery=False (DUAL_MID_DELIVERY off, the current
-        default) collapses everything into one terminal WRITE: the
-        union of the mid + final regions, since the single response
-        carries both.
+        mid_delivery=False (DUAL_MID_DELIVERY=0; default is on)
+        collapses everything into one terminal WRITE: the union of
+        the mid + final regions, since the single response carries
+        both.
         """
         off = {name: o for (name, o, *_) in self.dst_layout}
         sz  = {name: n for (name, _, n, *_) in self.dst_layout}
