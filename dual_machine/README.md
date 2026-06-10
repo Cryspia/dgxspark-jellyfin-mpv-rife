@@ -39,16 +39,21 @@ overlapping work. See [§ Components](#components) for the breakdown.
 
 ## Why dual
 
-Steady-state at 1080p / 24 fps source → 4K / 48 fps output:
+Steady-state at 1080p / 24 fps source → 4K / 48 fps output
+(dispatcher steady fps — full tables in
+[`bench/results.md`](../bench/results.md)):
 
-| mode | sustained fps | rough speedup |
-|---|---|---|
-| single | 48 – 50 | 1.00× |
-| dual   | 95 – 97 | ~1.95× |
+| mode | dispatcher fps (steady) |
+|---|---|
+| dual, mult=2 | 95 – 96 |
+| dual, mult=3 | 87 |
+| dual, RIFE only (no SR) | 153 – 156 |
+| dual, SR only (mult=1) | 145 – 147 |
 
-Quality matches single (real frames byte-identical; interpolated
-frames carry RIFE cross-GPU non-determinism on luma, ~50–70 dB Y-PSNR
-vs single, well above visible threshold).
+Roughly 2× the single-machine steady state. Quality matches single
+(real frames byte-identical; interpolated frames carry RIFE cross-GPU
+non-determinism on luma, ~50–70 dB Y-PSNR vs single, well above
+visible threshold).
 
 ## Design philosophy
 
@@ -61,12 +66,20 @@ Three principles drove every architectural choice:
    the other queues when its preferred one drains, so neither GPU
    waits.
 
-2. **Hide transit behind compute.** RDMA WRITE_WITH_IMM moves frames
-   in parallel with the next task's kernel. Worker posts the next
-   mid-stage SEND while the host is still running the previous CCSR
-   kernel; the wire is never the critical path. NCCL handles only the
-   one-time handshake (an int64[18] tensor describing dims / formats /
-   variant / interp_mult); all per-frame data is RDMA.
+2. **Hide transit behind compute — and ship only live bytes.** RDMA
+   WRITE_WITH_IMM moves frames in parallel with the next task's
+   kernel; the wire is never the critical path. Every task sends and
+   returns only the byte ranges its type actually uses (an INTERP
+   mult=2 response is 12.4 MB, not the slot's 54 MB worst case; a
+   CCSR/SR_INTERP request is ~12.5 MB, not 58.5 MB), and INTERP /
+   SR_INTERP request payloads are zero-copy: the cc_cache region is
+   registered as an MR and the NIC gathers the fields via an SGE
+   list — the dispatch thread never memmoves payloads through the
+   slow (~5 GB/s) cudaHostRegister'd CPU read path. The one-time
+   handshake (an
+   int64[19] struct describing dims / formats / variant / interp_mult
+   / encode channels) goes over the liveness TCP socket; all
+   per-frame data is RDMA.
 
 3. **Granular tasks, auto-assigned.** CCSR / INTERP / SR_INTERP are
    small enough (~2–12 ms on GB10) that the priority scheduler can
@@ -113,7 +126,7 @@ flowchart LR
     end
     GMP ==>|"RDMA WRITE (src bundle)<br/>data + imm-encoded control"| WSHM
     WSHM ==>|"RDMA WRITE_WITH_IMM (rgb_interp)<br/>data + imm-encoded control"| GMP
-    ND <-.->|"liveness TCP (29905)<br/>handshake 144 B + ready 'R'<br/>+ FIN-watchdog"| WP
+    ND <-.->|"liveness TCP (29905)<br/>handshake 152 B + ready 'R'<br/>+ FIN-watchdog"| WP
 ```
 
 `cc_cache` is passive cuda-pinned shm — it stores intermediate task
@@ -132,7 +145,7 @@ arriving via WRITE_WITH_IMM.
 | `queue_mgr.py` | DAG (CCSR → INTERP → SR_INTERP per pair) + 3 priority heaps; `pop_for_host` and `pop_for_guest` enforce host/guest preference with cross-fallback |
 | `host_3proc.py` | host-side 3-process wrapper (HostMP). `dma_proc` does `process_vm_readv` from mpv into shm; `compute_proc` runs the host GPU kernels; `buffer_mgr_proc` mediates the shared state machine |
 | `guest_mp.py` | host-resident RDMA client. Packs frames into pinned RDMA buffers, posts WRITE\_WITH\_IMM to the worker, drains completion queue, calls `cc_cache_writeback_fn` + `task_done_fn` |
-| `worker.py` | worker entry point. Accepts the host's liveness TCP connection, reads the 144-byte handshake, spawns the 3-process pipeline. Persists across sessions; FIN/RST on the liveness socket trips the per-session watchdog and returns to accept-loop |
+| `worker.py` | worker entry point. Accepts the host's liveness TCP connection, reads the 152-byte handshake, spawns the 3-process pipeline. Persists across sessions; FIN/RST on the liveness socket trips the per-session watchdog and returns to accept-loop |
 | `worker_3proc.py` | worker-side 3-process pipeline (WorkerMP). `rdma_proc` polls the CQ; `compute_proc` runs the worker GPU kernels; `buffer_mgr_proc` runs the slot state machine |
 | `rdma_transport.py` | pyverbs wrapper. WRITE\_WITH\_IMM with the slot/stage encoded in the imm field; recv MR is the slot.dst region itself (zero-copy) |
 | `cc_cache.py` | cuda-pinned shm pool shared between host's `compute_proc` and `guest_mp`. Holds intermediate `rgb_padded` / `rife_features` / `rgb_interp` / `sr_yuv` per slot; lifecycle reference-counted by queue_mgr |
@@ -218,7 +231,7 @@ below the output rate and mpv stutters.
 | choice | alternative | why |
 |---|---|---|
 | **RDMA WRITE_WITH_IMM** for per-frame data | NCCL collectives | NCCL on Grace can't use GPUDirect (peermem won't load, dmabuf export fails) — has a ~14 ms transit floor. Pyverbs WRITE_WITH_IMM bypasses NCCL entirely; effective transit ~0 ms when fully pipelined behind compute |
-| **All control over a single TCP socket** | NCCL + TCP split | the entire control plane (handshake bytes, ready signal, FIN-watchdog) goes over one liveness TCP socket on port 29905. NCCL is gone — it only ever carried a 144-byte handshake, and its per-collective deadline (3 s) made cold TRT compile on the worker impossible to wait for. One socket + `struct.pack` removes ~80 lines of glue, kills the `TORCH_NCCL_*` env zoo, and drops the TCPStore port (29500) |
+| **All control over a single TCP socket** | NCCL + TCP split | the entire control plane (handshake bytes, ready signal, FIN-watchdog) goes over one liveness TCP socket on port 29905. NCCL is gone — it only ever carried a small handshake, and its per-collective deadline (3 s) made cold TRT compile on the worker impossible to wait for. One socket + `struct.pack` removes ~80 lines of glue, kills the `TORCH_NCCL_*` env zoo, and drops the TCPStore port (29500) |
 | **3-process worker** | single process | separates RDMA poll (latency-sensitive, busy-loop on CQ), GPU compute (latency-tolerant, batched), and slot state machine (CPU-bound bookkeeping). Each can be pinned to a different core; GIL contention disappears |
 | **`process_vm_readv` host → shm** | DMA from mpv VA | mpv frames live in mpv's heap, not a shared mapping; readv crosses the address-space boundary in one syscall. Throughput ~30 GB/s on Grace — enough for 4K 4:2:0 at 100+ fps |
 | **mpv-side `memmove` for writeback** | `process_vm_writev` from dma_proc | shm is mapped in both mpv and dma_proc, so mpv can memcpy locally at ~30 GB/s; cross-process writev is ~2.5 GB/s (page-fault overhead). Saves ~8 ms per SR task at 4K |
@@ -271,6 +284,18 @@ to `listener.accept_session()` waiting for the next host. A new
 host playback session reattaches without a daemon restart — typically
 under 3 s end-to-end. There is no NCCL group to re-init; the entire
 control plane is a single TCP socket.
+
+The watchdog is symmetric: the **host** also parks a thread on the
+same socket for the session's lifetime. If the worker dies
+mid-session (crash, power, link), the host detects it in ~3 s, fails
+the in-flight guest tasks (instead of letting each pending pair eat a
+1 s black-frame timeout), requeues claimed work to the host
+dispatcher, and playback continues single-machine. Shift+F9 retries
+dual from a single keypress, same as a connect failure.
+
+Seeks are cheap on a long-lived session: the seek-flush sweep frees
+any cc_cache slots whose consumers were flushed, so heavy
+progress-bar dragging never drains the 32-slot pool.
 
 ## See also
 

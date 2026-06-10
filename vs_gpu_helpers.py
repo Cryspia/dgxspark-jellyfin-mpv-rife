@@ -32,8 +32,10 @@ Public API
 
 Limitations
 -----------
-- Input must be YUV420P10. Other YUV bit-depths and subsamplings
-  (YUV420P8/16, YUV422, YUV444) should be normalised upstream via
+- Input must be YUV420P10 or YUV444P10 (the 4:4:4 form feeds the
+  4K-DS mixed-mode path, whose downsample lands at 1080p 4:4:4 to
+  preserve chroma). Other YUV bit-depths and subsamplings (YUV420P8/16,
+  YUV422) should be normalised upstream via
   `core.resize.Bicubic(format=vs.YUV420P10)` — rife.vpy does this
   before calling us, so the function stays strict on its own input.
 - Color matrices supported: BT.709, BT.2020 NCL, BT.601 (smpte170m).
@@ -53,6 +55,7 @@ import os
 import sys
 from pathlib import Path
 from collections import OrderedDict
+import threading
 from threading import Condition, Lock
 
 import numpy as np
@@ -88,9 +91,9 @@ _krig_fn: "callable | None | bool" = None    # None = not tried, False = unavail
 
 
 def _chroma_upsample(
-    y_full: torch.Tensor,    # (H, W) fp32, range-normalised luma in [0, 1]
-    u_lo:   torch.Tensor,    # (cH, cW) fp32, range-normalised chroma
-    v_lo:   torch.Tensor,    # (cH, cW) fp32, range-normalised chroma
+    y_full: torch.Tensor,    # (H, W) fp16, range-normalised luma in [0, 1]
+    u_lo:   torch.Tensor,    # (cH, cW) fp16, range-normalised chroma
+    v_lo:   torch.Tensor,    # (cH, cW) fp16, range-normalised chroma
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Upsample (u_lo, v_lo) to y_full's shape. Tries kriging (~3 ms
     on GB10, +6-7 dB U/V over bilinear) first; falls back to bilinear
@@ -98,7 +101,10 @@ def _chroma_upsample(
     JIT-compile fails. Inputs are range-normalised per the source's
     _ColorRange (limited stretches Y to [0,1]; chroma sits in ~[-0.5,
     0.5]); krig is linear in chroma, so negative values pass through
-    correctly. Returns (u_full, v_full) in the same range as inputs."""
+    correctly. fp16 end-to-end — the krig kernel computes in fp16
+    anyway, and the old fp32 interface just bounced every plane
+    through two extra full-frame dtype conversions. Returns (u_full,
+    v_full) fp16 in the same range as inputs."""
     global _krig_fn
     h, w = y_full.shape
     if _krig_fn is None:
@@ -116,13 +122,12 @@ def _chroma_upsample(
                                   device=y_full.device, dtype=torch.float16)
             v_out = torch.empty_like(u_out)
             _krig_fn(
-                y_full[None, None].to(torch.float16),
-                u_lo[None, None].to(torch.float16),
-                v_lo[None, None].to(torch.float16),
+                y_full[None, None],
+                u_lo[None, None],
+                v_lo[None, None],
                 u_out=u_out, v_out=v_out,
             )
-            return (u_out[0, 0].to(torch.float32),
-                    v_out[0, 0].to(torch.float32))
+            return u_out[0, 0], v_out[0, 0]
         except Exception as _e:
             sys.stderr.write(
                 f"[vs_gpu_helpers] krig launch failed "
@@ -163,6 +168,10 @@ _YUV2RGB_MATRIX = {
 # RGB → YUV: inverse of the above, computed once at import.
 _RGB2YUV_MATRIX = {k: torch.linalg.inv(v) for k, v in _YUV2RGB_MATRIX.items()}
 
+# NB: both converters below consume the 3×3 coefficients as Python
+# floats baked into the kernel launch arguments (torch.mul/add alpha),
+# so no device-resident matrix tensor is needed on these paths.
+
 
 # 10-bit YUV scale/offset constants by `_ColorRange` semantics.
 # Tuple layout: (y_scale, y_offset, uv_scale, uv_offset).
@@ -186,7 +195,9 @@ _MATRIX_FROM_PROP = {
     1: "709",        # BT.709, the default for HD/SDR
     5: "170m",       # BT.470 BG (PAL) — close enough to 170m
     6: "170m",       # smpte170m, NTSC SD
-    7: "240m",       # smpte240m — fallback to 709 (rare in 2025)
+    7: "709",        # smpte240m — fallback to 709 (rare in 2025; the
+                     #   240m coefficients are within 0.7% of 709 and
+                     #   _YUV2RGB_MATRIX has no native 240m entry)
     9: "2020ncl",    # BT.2020 non-constant-luminance, HDR/UHD
     10: "2020ncl",   # BT.2020 constant — extremely rare; same matrix
 }
@@ -214,6 +225,13 @@ def yuv_p10_to_rgb(
     """
     device = y_plane.device
     y_scale, y_offset, uv_scale, uv_offset = _RANGE_CONSTS_10[color_range]
+    # Arithmetic stays fp32. An all-fp16 variant of this path measured
+    # ~25% faster but accumulated ~4 ulp (≈2×10⁻³) — past the 10-bit
+    # half-LSB — which broke the documented byte-identical round-trip
+    # for real frames (single-vs-dual SR_SRC dropped from inf to
+    # ~94 dB). With fp32 math the only rounding is the single fp16
+    # cast on store, < 0.5 LSB, and the inverse matrix recovers Y
+    # exactly.
     y = (y_plane.to(torch.float32) - y_offset)  / y_scale
     u = (u_plane.to(torch.float32) - uv_offset) / uv_scale
     v = (v_plane.to(torch.float32) - uv_offset) / uv_scale
@@ -222,24 +240,39 @@ def yuv_p10_to_rgb(
     # 4:4:4 (cH==H, cW==W) hits the no-op fast path. Krig sees
     # range-normalized inputs so its luma-similarity weights line up
     # with the same color_range semantics applied to the matrix mul.
+    # The krig kernel itself computes in fp16 (as it always has) —
+    # cast at its boundary only.
     h, w = y.shape
     if u_plane.shape != y_plane.shape:
-        u, v = _chroma_upsample(y, u, v)
+        u16, v16 = _chroma_upsample(y.to(torch.float16),
+                                    u.to(torch.float16),
+                                    v.to(torch.float16))
+        u = u16.to(torch.float32)
+        v = v16.to(torch.float32)
 
-    # Matrix multiply. Stack into (H, W, 3) [Y, U, V], then dot.
-    yuv = torch.stack([y, u, v], dim=-1)  # (H, W, 3)
-    m = _YUV2RGB_MATRIX[matrix].to(device)  # (3, 3) [R,G,B] x [Y,U,V]
-    rgb = torch.einsum("hwc,rc->hwr", yuv, m)  # (H, W, 3)
-
+    # Per-channel linear combination written straight into the NCHW
+    # output — replaces the old stack → fp32 einsum → .to(fp16) →
+    # permute().contiguous() chain, which materialised the full frame
+    # as HWC twice plus a packing copy per call. Coefficients ride
+    # along as kernel scalars (alpha); no matrix tensor or H2D upload.
+    #
     # Don't clamp here. Wide-gamut BT.709/BT.2020 chroma legitimately
     # produces RGB outside [0, 1]; the CPU path (vs.RGBH = fp16 RGB)
     # preserves these negatives and the inverse matrix recovers Y
     # exactly. RIFE itself does an internal `clamp(0, 1)`, so we don't
     # need to enforce it here. The fp16 storage caps the range at
     # roughly ±65k which is far outside any plausible color value.
-    rgb = rgb.to(out_dtype)
-    # vsrife/RIFE want NCHW.
-    return rgb.permute(2, 0, 1).unsqueeze(0).contiguous()
+    m = _YUV2RGB_MATRIX[matrix]   # CPU 3×3; scalars only
+    out = torch.empty((1, 3, h, w), device=device, dtype=out_dtype)
+    for ch in range(3):
+        c_y, c_u, c_v = (float(m[ch, 0]), float(m[ch, 1]), float(m[ch, 2]))
+        o32 = torch.mul(y, c_y) if c_y != 1.0 else y.clone()
+        if c_u != 0.0:
+            o32.add_(u, alpha=c_u)
+        if c_v != 0.0:
+            o32.add_(v, alpha=c_v)
+        out[0, ch].copy_(o32)   # single rounding: fp32 → out_dtype
+    return out
 
 
 @torch.inference_mode()
@@ -267,11 +300,23 @@ def rgb_to_yuv_p10(
     `color_range` should match whatever the source had — limited stays
     limited, full stays full — so mpv's downstream display path
     interprets it correctly."""
-    device = rgb.device
-    rgb_f = rgb[0].permute(1, 2, 0).to(torch.float32)  # (H, W, 3)
-    m = _RGB2YUV_MATRIX[matrix].to(device)             # (3, 3) [Y,U,V] x [R,G,B]
-    yuv = torch.einsum("hwc,rc->hwr", rgb_f, m)        # (H, W, 3)
-    y, u, v = yuv[..., 0], yuv[..., 1], yuv[..., 2]
+    # Per-channel linear combination on the native CHW planes —
+    # avoids materialising the frame as HWC fp32 twice (permute copy +
+    # einsum product) the old path paid. Arithmetic stays fp32: the
+    # 10-bit round-trip quantisation below is sensitive to ~0.5-LSB
+    # error, which fp16 accumulation would exceed.
+    r = rgb[0, 0].to(torch.float32)
+    g = rgb[0, 1].to(torch.float32)
+    b = rgb[0, 2].to(torch.float32)
+    m = _RGB2YUV_MATRIX[matrix]   # CPU 3×3 [Y,U,V] x [R,G,B]; scalars only
+
+    def _comb(row) -> torch.Tensor:
+        o = torch.mul(r, float(row[0]))
+        o.add_(g, alpha=float(row[1]))
+        o.add_(b, alpha=float(row[2]))
+        return o
+
+    y, u, v = _comb(m[0]), _comb(m[1]), _comb(m[2])
 
     if sub_h == 1 and sub_w == 1:
         # 4:2:0 — 2×2 mean pool
@@ -312,10 +357,12 @@ def _frame_yuv420p10_to_planes(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pull the three planes off a YUV420P10 frame as uint16 tensors
     on the GPU. With Grace-Blackwell unified memory the .to(device)
-    call is essentially a metadata move — no PCIe traffic involved."""
-    y = torch.from_numpy(np.asarray(frame[0])).to(device, non_blocking=True)
-    u = torch.from_numpy(np.asarray(frame[1])).to(device, non_blocking=True)
-    v = torch.from_numpy(np.asarray(frame[2])).to(device, non_blocking=True)
+    call is essentially a metadata move — no PCIe traffic involved.
+    (The copy is synchronous: the source is pageable vapoursynth
+    memory, for which torch ignores non_blocking anyway.)"""
+    y = torch.from_numpy(np.asarray(frame[0])).to(device)
+    u = torch.from_numpy(np.asarray(frame[1])).to(device)
+    v = torch.from_numpy(np.asarray(frame[2])).to(device)
     return y, u, v
 
 
@@ -341,18 +388,28 @@ def _planes_to_frame_yuv420p10(
     return dst_frame
 
 
-def _detect_matrix(clip: vs.VideoNode) -> str:
-    """Pick a matrix name from the first frame's `_Matrix` prop."""
-    try:
-        m = int(clip.get_frame(0).props.get("_Matrix", 1))
-    except Exception:
-        m = 1
-    return _MATRIX_FROM_PROP.get(m, "709")
-
-
 # =============================================================================
 # rife_yuv: vsrife wrapper with GPU color conversion
 # =============================================================================
+
+def _vsrife_padded_shape(model: str, h: int, w: int,
+                         scale: float) -> tuple[int, int]:
+    """Mirror vsrife's padding rule: modulo 64 for the 4.25/4.26
+    family (except 4.25.lite, which is 128), 32 otherwise. vsrife
+    computes this inline in rife() so it can't be imported; if a
+    vsrife upgrade changes it, the symptom is a spurious "no cached
+    TRT engine" recompile (the cache filename stops matching), not
+    corruption — the stderr notice in _ensure_engines makes that
+    visible. Returns (ph, pw)."""
+    if model == "4.25.lite":
+        modulo = 128
+    elif model in ("4.25", "4.25.heavy", "4.26", "4.26.heavy"):
+        modulo = 64
+    else:
+        modulo = 32
+    tmp = max(modulo, int(modulo / scale))
+    return math.ceil(h / tmp) * tmp, math.ceil(w / tmp) * tmp
+
 
 def _vsrife_engine_paths(model: str, ph: int, pw: int, scale: float,
                          fp16: bool, device: torch.device) -> tuple[Path, Path | None]:
@@ -375,29 +432,43 @@ def _ensure_engines(model: str, h: int, w: int, scale: float,
     to trigger compile. With install.sh's warmup step this should be a
     cache hit for production shapes; first-time custom shapes pay the
     one-time TRT compile (~30-60s)."""
-    import math
-    # Determine modulo + padded shape (matches vsrife)
-    if model in ("4.25", "4.25.lite", "4.25.heavy", "4.26", "4.26.heavy"):
-        modulo_base = 64
-    else:
-        modulo_base = 32
-    tmp = max(modulo_base, int(modulo_base / scale))
-    pw = math.ceil(w / tmp) * tmp
-    ph = math.ceil(h / tmp) * tmp
+    ph, pw = _vsrife_padded_shape(model, h, w, scale)
 
     flow_path, enc_path = _vsrife_engine_paths(model, ph, pw, scale, fp16, device)
     if not flow_path.exists():
-        # Trigger build via vsrife on a dummy 1-frame clip at the right
-        # native resolution. vsrife's static-shape mode bakes the engine
-        # to (pw, ph) and writes it to its cache dir.
-        from vsrife import rife as _rife
-        dummy_format = vs.RGBH if fp16 else vs.RGBS
-        dummy = vs.core.std.BlankClip(width=w, height=h, format=dummy_format,
-                                       length=2, fpsnum=30, fpsden=1)
-        clip = _rife(dummy, model=model, scale=scale,
-                     factor_num=2, factor_den=1,
-                     auto_download=True, trt=True)
-        clip.get_frame(0)
+        # Cache miss: a synchronous TRT compile (~30-60 s) is about to
+        # block mpv's filter init with no other feedback — without the
+        # notice below it reads as a player hang. The flag file lets
+        # warmup.lua surface an OSD message while we're stuck in here
+        # (this thread can't touch mpv's OSD itself).
+        sys.stderr.write(
+            f"[rife_yuv] no cached TRT engine for {model}@{w}x{h} "
+            f"(pad {pw}x{ph}) — compiling now, this takes ~30-60 s "
+            f"(one-time per shape)\n")
+        sys.stderr.flush()
+        _flag = Path("/tmp/dgxspark_trt_compiling")
+        try:
+            _flag.write_text(f"{model}@{w}x{h}")
+        except OSError:
+            pass
+        try:
+            # Trigger build via vsrife on a dummy 1-frame clip at the
+            # right native resolution. vsrife's static-shape mode bakes
+            # the engine to (pw, ph) and writes it to its cache dir.
+            from vsrife import rife as _rife
+            dummy_format = vs.RGBH if fp16 else vs.RGBS
+            dummy = vs.core.std.BlankClip(width=w, height=h,
+                                          format=dummy_format,
+                                          length=2, fpsnum=30, fpsden=1)
+            clip = _rife(dummy, model=model, scale=scale,
+                         factor_num=2, factor_den=1,
+                         auto_download=True, trt=True)
+            clip.get_frame(0)
+        finally:
+            try:
+                _flag.unlink()
+            except OSError:
+                pass
         flow_path, enc_path = _vsrife_engine_paths(
             model, ph, pw, scale, fp16, device,
         )
@@ -426,34 +497,11 @@ def _load_engines(model: str, h: int, w: int, scale: float,
 
         flow_path, enc_path = _ensure_engines(model, h, w, scale, fp16, device)
 
-        # Compute padded shape (same calculation as _ensure_engines).
-        if model in ("4.25", "4.25.lite", "4.25.heavy", "4.26", "4.26.heavy"):
-            modulo_base = 64
-        else:
-            modulo_base = 32
-        tmp = max(modulo_base, int(modulo_base / scale))
-        pw = math.ceil(w / tmp) * tmp
-        ph = math.ceil(h / tmp) * tmp
+        ph, pw = _vsrife_padded_shape(model, h, w, scale)
 
         flownet = torch.jit.load(str(flow_path)).eval()
         encode = (torch.jit.load(str(enc_path)).eval()
                   if enc_path is not None else None)
-
-        # encode_channel — the dim we have to allocate f0/f1 with.
-        # vsrife hardcodes this per-model; we replicate the table.
-        ec_table = {
-            "4.0": 0, "4.1": 0, "4.2": 0, "4.3": 0, "4.4": 0, "4.5": 0, "4.6": 0,
-            "4.7": 4, "4.8": 4, "4.9": 4,
-            "4.10": 8, "4.11": 8, "4.12": 8, "4.12.lite": 4,
-            "4.13": 8, "4.13.lite": 4, "4.14": 8, "4.14.lite": 8,
-            "4.15": 8, "4.15.lite": 4, "4.16.lite": 4,
-            "4.17": 8, "4.17.lite": 4,
-            "4.18": 8, "4.19": 8, "4.20": 8, "4.21": 8, "4.22": 8, "4.22.lite": 4,
-            "4.23": 8, "4.24": 8,
-            "4.25": 4, "4.25.lite": 4, "4.25.heavy": 4,
-            "4.26": 4, "4.26.heavy": 16,
-        }
-        encode_channel = ec_table.get(model, 0)
 
         # Pre-build the warp grid (same per resolution).
         dtype_t = torch.float
@@ -467,7 +515,12 @@ def _load_engines(model: str, h: int, w: int, scale: float,
 
         cached = {
             "flownet": flownet, "encode": encode,
-            "encode_channel": encode_channel,
+            # encode_channel filled in below — derived from the encode
+            # head's actual output during warmup instead of replicating
+            # vsrife's hardcoded per-model table (which silently
+            # drifted: e.g. it had 4.25.lite's modulo wrong before this
+            # was consolidated).
+            "encode_channel": 0,
             "ph": ph, "pw": pw, "h": h, "w": w,
             "padding": (0, pw - w, 0, ph - h),
             "need_pad": (pw != w or ph != h),
@@ -475,7 +528,45 @@ def _load_engines(model: str, h: int, w: int, scale: float,
             "stream_inf": torch.cuda.Stream(device),
             "stream_io": torch.cuda.Stream(device),
             "lock_inf": Lock(), "lock_io": Lock(),
+            # Per-engine timestep tensors keyed by t (see rife_yuv's
+            # _inference_pass): factor_num=2 only ever needs t=0.5, so
+            # this avoids a fresh ~4 MB full-frame alloc per interp frame.
+            "timestep_cache": {},
         }
+
+        # Engine cuDNN-graph warmup: feed zeros through flownet (+ encode
+        # head when present) once at engine-load time so the graph
+        # compile cost is paid here instead of on mpv's first inference
+        # request. Pure synthetic input — never touches mpv's source
+        # clip, which avoids caching the uninitialised black frames mpv
+        # vf_vapoursynth returns during script load. Lives in the
+        # cache-miss branch so F8/F9 vf reloads and episode changes that
+        # hit an already-warm engine skip it entirely.
+        import time as _warm_time
+        _t_warm0 = _warm_time.perf_counter()
+        with torch.inference_mode(), torch.cuda.stream(cached["stream_inf"]):
+            _zero_rgb = torch.zeros(1, 3, ph, pw, dtype=torch.float16,
+                                    device=device)
+            _zero_t = torch.zeros(1, 1, ph, pw, dtype=torch.float16,
+                                  device=device)
+            _f0_warm = encode(_zero_rgb) if encode is not None else None
+            _f1_warm = encode(_zero_rgb) if encode is not None else None
+            if encode is not None:
+                # The feature tensor's channel dim IS the model's
+                # encode_channel — read it off the real engine output.
+                cached["encode_channel"] = int(_f0_warm.shape[1])
+                flownet(_zero_rgb, _zero_rgb, _zero_t, tenFlow_div,
+                        backwarp_tenGrid, _f0_warm, _f1_warm)
+            else:
+                flownet(_zero_rgb, _zero_rgb, _zero_t, tenFlow_div,
+                        backwarp_tenGrid)
+            cached["stream_inf"].synchronize()
+        del _zero_rgb, _zero_t, _f0_warm, _f1_warm
+        sys.stderr.write(
+            f"[rife_yuv] engine warm {model}@{w}x{h} (pad {pw}x{ph}) in "
+            f"{(_warm_time.perf_counter()-_t_warm0)*1000:.0f}ms\n")
+        sys.stderr.flush()
+
         _engine_cache[key] = cached
         return cached
 
@@ -511,8 +602,8 @@ def rife_yuv(
     """
     if clip.format is None or clip.format.color_family != vs.YUV:
         raise vs.Error("rife_yuv: input must be YUV")
-    if clip.format.id != int(vs.YUV420P10):
-        raise vs.Error("rife_yuv: only YUV420P10 supported "
+    if clip.format.id not in (int(vs.YUV420P10), int(vs.YUV444P10)):
+        raise vs.Error("rife_yuv: only YUV420P10 / YUV444P10 supported "
                         f"(got {clip.format.name})")
     if target_subsample not in ("420", "444"):
         raise vs.Error(
@@ -520,6 +611,11 @@ def rife_yuv(
             f"(got {target_subsample!r})")
     _OUT_SUB = {"420": (1, 1), "444": (0, 0)}[target_subsample]
     _OUT_FORMAT = {"420": vs.YUV420P10, "444": vs.YUV444P10}[target_subsample]
+    # Real frames can pass through untouched only when the output
+    # format matches the input format; otherwise t==0 frames are
+    # re-materialised from the cached RGB (which holds chroma at full
+    # luma resolution either way).
+    _passthrough_ok = (clip.format.id == int(_OUT_FORMAT))
 
     # Don't sniff the matrix at init — mpv's vapoursynth integration
     # disallows frame requests before the filter graph is fully wired,
@@ -538,34 +634,22 @@ def rife_yuv(
     backwarp_tenGrid = cfg["backwarp_tenGrid"]
     stream_inf = cfg["stream_inf"]; stream_io = cfg["stream_io"]
     lock_inf = cfg["lock_inf"]; lock_io = cfg["lock_io"]
+    timestep_cache = cfg["timestep_cache"]
 
-    # Engine cuDNN-graph warmup: feed zeros through flownet (+ encode
-    # head when present) once at construction time so the graph
-    # compile cost is paid here instead of on mpv's first inference
-    # request. Pure synthetic input — never touches mpv's source clip.
-    # Avoids the failure mode where mpv vf_vapoursynth returns
-    # uninitialised black frames during script load and a
-    # `clip.get_frame()`-based prewarm caches those.
-    import time as _warm_time
-    _t_warm0 = _warm_time.perf_counter()
-    with torch.inference_mode(), torch.cuda.stream(stream_inf):
-        _zero_rgb = torch.zeros(1, 3, ph, pw, dtype=torch.float16, device=device)
-        _zero_t = torch.zeros(1, 1, ph, pw, dtype=torch.float16, device=device)
-        _f0_warm = encode(_zero_rgb) if encode is not None else None
-        _f1_warm = encode(_zero_rgb) if encode is not None else None
-        if encode is not None:
-            flownet(_zero_rgb, _zero_rgb, _zero_t, tenFlow_div,
-                    backwarp_tenGrid, _f0_warm, _f1_warm)
-        else:
-            flownet(_zero_rgb, _zero_rgb, _zero_t, tenFlow_div,
-                    backwarp_tenGrid)
-        stream_inf.synchronize()
-    del _zero_rgb, _zero_t, _f0_warm, _f1_warm
-    import sys as _sys
-    _sys.stderr.write(
-        f"[rife_yuv] engine warm {model}@{w}x{h} (pad {pw}x{ph}) in "
-        f"{(_warm_time.perf_counter()-_t_warm0)*1000:.0f}ms\n")
-    _sys.stderr.flush()
+    # Per-thread conversion streams. The RGB→YUV after flownet (and the
+    # t==0 re-materialisation) is plain elementwise math with no engine
+    # affinity — running it under lock_inf nearly doubled the lock's
+    # hold time and made every VS worker queue behind a host-blocking
+    # stream_inf.synchronize(). Each VS worker thread gets its own
+    # stream so conversions overlap freely with the next inference.
+    _conv_streams = threading.local()
+
+    def _conv_stream() -> torch.cuda.Stream:
+        s = getattr(_conv_streams, "s", None)
+        if s is None:
+            s = torch.cuda.Stream(device)
+            _conv_streams.s = s
+        return s
 
     # Per-source-frame caches: rgb tensor (img0/img1 input to flownet),
     # f0 (encode output), and the matrix string (so the reverse RGB→YUV
@@ -668,7 +752,19 @@ def rife_yuv(
             if has_head:
                 with lock_inf, torch.cuda.stream(stream_inf):
                     f0 = encode(rgb)
-                    stream_inf.synchronize()
+                    # rgb was allocated on stream_io; encode reads it on
+                    # stream_inf and we no longer host-sync before
+                    # caching. If an LRU eviction frees rgb while the
+                    # encode kernel is still queued, the caching
+                    # allocator would hand its block to the next
+                    # stream_io upload mid-read. record_stream defers
+                    # that reuse until stream_inf passes this point.
+                    rgb.record_stream(stream_inf)
+                # No host sync here: every consumer of f0 (flownet) runs
+                # on stream_inf as well, so stream ordering already
+                # guarantees the features are computed before they're
+                # read — the old synchronize() only inflated lock_inf's
+                # hold time by the encode kernel's duration.
 
             _cache_put(n, rgb, f0, matrix)
         except BaseException:
@@ -698,28 +794,31 @@ def rife_yuv(
         t = (n * factor_den) % factor_num / factor_num
 
         # Pass-through real frames (t == 0): convert YUV → RGB just to
-        # cache (for subsequent interpolated frames). For 4:2:0 output
-        # we can return the source frame directly; for 4:4:4 output
-        # we have to materialise a chroma-upsampled version because
-        # the source frame's YUV420P10 layout doesn't match the
-        # out_skeleton's YUV444P10. We synthesise it from the cached
-        # RGB (which already holds chroma at full luma resolution
-        # because yuv_p10_to_rgb upsampled it during the encoding
-        # pass) by running the reverse with sub_h=sub_w=0.
+        # cache (for subsequent interpolated frames). When the output
+        # format matches the input we can return the source frame
+        # directly; otherwise (e.g. 420 in → 444 out) we materialise
+        # the right layout from the cached RGB (which already holds
+        # chroma at full luma resolution because yuv_p10_to_rgb
+        # upsampled it during the encoding pass) by running the
+        # reverse with the output's subsampling.
         if t == 0:
             rgb, _, matrix = _cache_get(real_n)
             if rgb is None:
                 _convert_and_encode(real_n, f[0])
                 rgb, _, matrix = _cache_get(real_n)
-            if target_subsample == "420":
+            if _passthrough_ok:
                 return f[0]
             rgb_unpadded = rgb[:, :, :h, :w] if need_pad else rgb
-            with lock_inf, torch.cuda.stream(stream_inf):
+            # Pure elementwise conversion from an already host-synced
+            # cache entry — no reason to serialise it behind the TRT
+            # engine lock. Per-thread stream, fully concurrent.
+            conv = _conv_stream()
+            with torch.cuda.stream(conv):
                 yq, uq, vq = rgb_to_yuv_p10(rgb_unpadded, matrix,
                                               color_range=color_range,
                                               sub_h=_OUT_SUB[0],
                                               sub_w=_OUT_SUB[1])
-                stream_inf.synchronize()
+                conv.synchronize()
             return _planes_to_frame_yuv420p10(yq, uq, vq, f[2])
 
         # Interpolated frame: ensure both source frames are in cache,
@@ -736,9 +835,22 @@ def rife_yuv(
             _convert_and_encode(real_n_next, f[1])
             img1, f1, _ = _cache_get(real_n_next)
 
-        timestep = torch.full([1, 1, ph, pw], t,
-                               dtype=torch.float16, device=device)
+        # flownet treats the timestep tensor as read-only, so one shared
+        # tensor per t value is safe across concurrent inferences.
+        # GIL-atomic dict ops; a rare double-create is harmless.
+        timestep = timestep_cache.get(t)
+        if timestep is None:
+            timestep = torch.full([1, 1, ph, pw], t,
+                                  dtype=torch.float16, device=device)
+            timestep_cache[t] = timestep
 
+        # lock_inf covers ONLY the engine call now. The trailing RGB→YUV
+        # and the host-blocking sync used to live inside it, roughly
+        # doubling the hold time the 20 VS workers queued behind. The
+        # clone is mandatory: torch_tensorrt may reuse its output buffer
+        # on the next inference, and that next inference launches the
+        # moment we release the lock — the clone is ordered after
+        # flownet on stream_inf, so it captures the result first.
         with lock_inf, torch.cuda.stream(stream_inf):
             if has_head:
                 out = flownet(img0, img1, timestep, tenFlow_div,
@@ -748,12 +860,25 @@ def rife_yuv(
                               backwarp_tenGrid)
             if need_pad:
                 out = out[:, :, :h, :w]
+            out = out.clone()
+            inf_done = torch.cuda.Event()
+            inf_done.record(stream_inf)
+
+        # Convert on this thread's private stream, GPU-ordered after
+        # the inference via the event — no host blocking inside any
+        # lock. conv.synchronize() before the CPU writeback makes the
+        # cross-stream lifetimes safe without record_stream: by the
+        # time `out` is freed (function exit) the conv stream has
+        # fully consumed it.
+        conv = _conv_stream()
+        conv.wait_event(inf_done)
+        with torch.cuda.stream(conv):
             # Use the matrix the source frame came in with — videos with
             # mid-stream matrix changes are extremely rare; for the common
             # case both source frames share a matrix.
             yq, uq, vq = rgb_to_yuv_p10(out, matrix, color_range=color_range,
                                           sub_h=_OUT_SUB[0], sub_w=_OUT_SUB[1])
-            stream_inf.synchronize()
+            conv.synchronize()
 
         # Write GPU result directly into the BlankClip dst frame (no
         # .copy() — saves a 6 MB memset per interp frame at 1080p).
@@ -776,9 +901,10 @@ def rife_yuv(
         interleaved = interleaved[::factor_den]
         next_clip = next_clip[::factor_den]
 
-    # When target_subsample == "444", switch the output skeleton from
-    # YUV420P10 (inherited from interleaved) to YUV444P10 so the
-    # _planes_to_frame writer sees the correct plane dimensions.
+    # The output skeleton always carries _OUT_FORMAT explicitly — the
+    # input may be either 4:2:0 or 4:4:4 and the target is independent
+    # of it, so inheriting the format from `interleaved` is only
+    # correct by accident.
     #
     # keep=False is mandatory here: keep=True makes BlankClip return
     # the SAME VSFrame for every output index, and our _inference_pass
@@ -790,10 +916,8 @@ def rife_yuv(
     # same content, while U/V vary). Same root cause as the
     # fsrcnnx-cudnn upstream fix e1344b8 — see [[fsrcnnx-runner-race-fix]]
     # memory. Per-request fresh buffer eliminates the aliasing.
-    if target_subsample == "444":
-        out_skeleton = interleaved.std.BlankClip(keep=False, format=vs.YUV444P10)
-    else:
-        out_skeleton = interleaved.std.BlankClip(keep=False)
+    out_skeleton = interleaved.std.BlankClip(keep=False,
+                                             format=_OUT_FORMAT)
     out = out_skeleton.std.ModifyFrame(
         clips=[interleaved, next_clip, out_skeleton],
         selector=_inference_pass,

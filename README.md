@@ -94,7 +94,9 @@ listed by `--help` to script-install without prompts.
 
 In playback: **Shift+F9** toggles dual offload on/off. Connection
 failure falls back silently to single-machine mode (press again to
-retry).
+retry) — and so does a worker death mid-session: the host's liveness
+watchdog detects it in ~3 s, recovers the in-flight work, and playback
+continues single-machine.
 
 → Full design + per-component breakdown: [`dual_machine/README.md`](./dual_machine/README.md).
 
@@ -140,6 +142,7 @@ local-path dependencies).
 | `~/.local/share/applications/*.desktop` | App-launcher entries |
 | `~/.config/autostart/jellyfin-mpv-shim.desktop` | Auto-start shim on login |
 | `~/src/{mpv,mpv-dandanplay-danmaku}/` | Source checkouts (safe to delete; re-cloned on next install) |
+| `~/.cache/dgxspark-mpv/trt-engines/` | Backup of compiled TRT engines — survives uninstall / env rebuild so the next install's warm step restores instead of recompiling 4-7 min |
 
 ## Requirements
 

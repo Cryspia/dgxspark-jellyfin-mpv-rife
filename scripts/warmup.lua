@@ -5,7 +5,8 @@
 -- vf=vapoursynth=~~/rife.vpy).
 --
 -- Mechanism:
---   1) On file-loaded: pause, mute, save audio-delay, show "warming up".
+--   1) On file-loaded: pause, mute (saving both for restore), show
+--      "warming up".
 --   2) Issue `frame-step` once. mpv decodes + runs the vf chain on that
 --      frame, then re-pauses.
 --   3) `time-pos` increments → property observer fires → we know the
@@ -36,6 +37,47 @@ local TIMEOUT_S   = 15.0      -- hard cap; cold first-load can hit ~10s
 local STEP_BUDGET = 0.6       -- per-step wall-clock budget before we
                               -- give up on this frame and force-step
                               -- the next (prevents lock-up on stalled vf)
+local WARM_HIT_FRAMES = 6     -- shrunk target when this mpv process has
+                              -- already warmed the same chain shape:
+                              -- engines/cuDNN graphs are hot, we only
+                              -- need to prime the vf buffered-frames
+                              -- pipeline (bf=12 fills from ~6 source
+                              -- frames at factor 2)
+
+-- vs_gpu_helpers._ensure_engines touches this while a TRT engine is
+-- compiling (30-60 s, blocks the vf init thread with no feedback of
+-- its own). We poll it to (a) surface an OSD note, (b) hold off the
+-- warmup timeout so the compile doesn't get misread as a stall.
+local TRT_COMPILING_FLAG = "/tmp/dgxspark_trt_compiling"
+
+local function trt_compiling()
+  local f = io.open(TRT_COMPILING_FLAG, "r")
+  if f == nil then return false end
+  f:close()
+  return true
+end
+
+-- Chain shapes already warmed by this mpv process. Keyed by source
+-- dims + fps band (which select the RIFE model + FSRCNNX runner
+-- shapes) + the F8 variant override (which changes the runner). The
+-- engine caches live in the embedded Python interpreter and survive
+-- vf rebuilds / file changes, so a same-shape episode change needs
+-- only a token warmup instead of the full ~2 s sequence.
+local warmed = {}
+
+local function chain_key()
+  local w = mp.get_property_number("width") or 0
+  local h = mp.get_property_number("height") or 0
+  local fps = mp.get_property_number("container-fps") or 0
+  local band = (fps > 0 and fps < 25) and "heavy" or "light"
+  local variant = "auto"
+  local f = io.open("/tmp/fsrcnnx_active_variant", "r")
+  if f ~= nil then
+    variant = (f:read("*l") or "auto")
+    f:close()
+  end
+  return string.format("%dx%d/%s/%s", w, h, band, variant)
+end
 
 local state = {
   active        = false,
@@ -54,6 +96,12 @@ local function finish(reason)
   if state.finished then return end
   state.finished = true
   state.active = false
+  -- Record the warmed chain shape only on a clean finish — a timeout
+  -- means the chain may still be cold (or wedged) and the next file
+  -- with this shape should get the full warmup again.
+  if reason ~= "timeout" and state.chain_key then
+    warmed[state.chain_key] = true
+  end
   -- Restore to the resume position. jellyfin-mpv-shim's play() does
   -- `loadfile <url>` (no start=) and then sets `playback_time=offset`
   -- once mpv reports `duration`. The property assignment fires after
@@ -85,7 +133,14 @@ end
 local function step_one()
   if not state.active then return end
   if state.finished then return end
-  -- Hard timeout — give up regardless of progress.
+  -- Hard timeout — give up regardless of progress. A TRT compile in
+  -- progress legitimately blocks the chain for up to a minute; keep
+  -- pushing the clock forward (and the user informed) while it runs.
+  if trt_compiling() then
+    state.started_at = mp.get_time()
+    mp.osd_message("compiling TensorRT engine for this resolution "
+                   .. "(one-time, ~1 min)…", 2.0)
+  end
   if mp.get_time() - state.started_at > TIMEOUT_S then
     finish("timeout")
     return
@@ -119,6 +174,16 @@ end
 -- (e.g. EOF on a too-short clip, or vf returned no frame), poll forward.
 local function watchdog()
   if not state.active or state.finished then return end
+  if trt_compiling() then
+    -- Engine compile in flight — frames legitimately can't advance.
+    -- Surface it and don't burn the step budget.
+    state.step_started = mp.get_time()
+    state.started_at = mp.get_time()
+    mp.osd_message("compiling TensorRT engine for this resolution "
+                   .. "(one-time, ~1 min)…", 2.0)
+    mp.add_timeout(STEP_BUDGET, watchdog)
+    return
+  end
   if mp.get_time() - state.step_started > STEP_BUDGET then
     -- Stalled. Force-advance.
     state.stepped = state.stepped + 1
@@ -155,6 +220,18 @@ local function on_file_loaded()
   local src_fps = mp.get_property_number("container-fps") or 0
   if src_fps <= 0 then src_fps = 24 end
   state.target_frames = math.max(24, math.floor(src_fps * WARMUP_SECS + 0.5))
+
+  -- Same chain shape already warmed in this mpv process (shim plays
+  -- episodes back-to-back in one process): engines and cuDNN graphs
+  -- are hot, so shrink to a token warmup that just refills the vf
+  -- pipeline. ~2 s episode-change wait drops to a few hundred ms.
+  state.chain_key = chain_key()
+  if warmed[state.chain_key] then
+    state.target_frames = math.min(state.target_frames, WARM_HIT_FRAMES)
+    msg.info(string.format(
+      "warmup: chain %s already warm — shrinking to %d frames",
+      state.chain_key, state.target_frames))
+  end
 
   mp.set_property_bool("pause", true)
   mp.set_property_bool("mute", true)

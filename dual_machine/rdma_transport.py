@@ -80,6 +80,18 @@ class RDMAContext:
         self.port_attr = self.ctx.query_port(port)
         self.gid = self.ctx.query_gid(port, gid_index)
 
+    def register_region(self, addr: int, length: int) -> MR:
+        """Register an existing memory region (e.g. the cc_cache shm)
+        as an MR on this context's PD so its pages can be used as SGEs
+        directly — the NIC then DMA-reads them instead of the CPU
+        memmoving into a staging buffer (which, for cudaHostRegister'd
+        shm on Grace, reads at ~5 GB/s). Caller keeps the returned MR
+        alive for as long as the region is used in WRs."""
+        access = (e.IBV_ACCESS_LOCAL_WRITE |
+                  e.IBV_ACCESS_REMOTE_WRITE |
+                  e.IBV_ACCESS_REMOTE_READ)
+        return MR(self.pd, length, access, address=addr)
+
     def __del__(self):
         # pyverbs object dtors clean up automatically
         pass
@@ -220,8 +232,11 @@ class RDMAChannel:
                  max_wr: int = 64, my_psn: int = 0,
                  extra_payload: bytes = b""):
         self.rdma_ctx = rdma_ctx
+        # max_send_sge=8: post_send_sgl gathers a task header + up to 4
+        # cc_cache fields into one SEND (zero-copy dispatch path). mlx5
+        # supports 30+; 8 leaves headroom without bloating the WQE.
         cap = QPCap(max_send_wr=max_wr, max_recv_wr=max_wr,
-                    max_send_sge=1, max_recv_sge=1)
+                    max_send_sge=8, max_recv_sge=1)
         init = QPInitAttr(qp_type=e.IBV_QPT_RC,
                           scq=rdma_ctx.cq, rcq=rdma_ctx.cq, cap=cap)
         self.qp = QP(rdma_ctx.pd, init)
@@ -318,6 +333,18 @@ class RDMAChannel:
         buffer lives in shm and is not wrapped in an RDMAStagingBuffer."""
         sge = SGE(addr=addr, length=length, lkey=lkey)
         wr = SendWR(opcode=e.IBV_WR_SEND, num_sge=1, sg=[sge],
+                     wr_id=wr_id, send_flags=e.IBV_SEND_SIGNALED)
+        self.qp.post_send(wr)
+
+    def post_send_sgl(self, sges: list, wr_id: int = 0):
+        """Gathered SEND. `sges` = [(addr, length, lkey), ...] in wire
+        order; the peer receives their concatenation as ONE message.
+        Lets a dispatcher send header (bounce buffer) + payload fields
+        (e.g. cc_cache shm registered as its own MR) without first
+        memmoving everything into one staging buffer — the NIC's DMA
+        engine does the gather."""
+        sg = [SGE(addr=a, length=ln, lkey=k) for (a, ln, k) in sges]
+        wr = SendWR(opcode=e.IBV_WR_SEND, num_sge=len(sg), sg=sg,
                      wr_id=wr_id, send_flags=e.IBV_SEND_SIGNALED)
         self.qp.post_send(wr)
 

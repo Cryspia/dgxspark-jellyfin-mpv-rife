@@ -80,6 +80,14 @@ def rdma_proc_main():
     # Gating env for early-delivery wire. When set, multi-stage
     # producers emit a separate mid SEND followed by a FULL-range
     # SEND.
+    #
+    # Default OFF on measurement, not suspicion: the historical 8-17 dB
+    # stage race was fixed (state-machine encoding, see sync_worker),
+    # and 2026-06 A/B benches show ON is bit-clean but throughput-
+    # neutral at BOTH mult=2 (94 vs 96 fps) and mult=3 (86.6 vs 86.7)
+    # — the per-task wire-size reduction (task_dst_ranges) removed the
+    # latency early delivery used to hide. Not worth the extra WRITE+
+    # IMM per stage until a workload shows a real win.
     _mid_delivery_enabled = os.environ.get(
         "DUAL_MID_DELIVERY", "0") == "1"
     log(f"opening RDMA ctx dev={rdma_dev} gid={rdma_gid}"
@@ -306,11 +314,17 @@ def rdma_proc_main():
                             if sum(_stage_counts.values()) % 30 == 0:
                                 log(f"[stage_dbg] counts: {dict(sorted(_stage_counts.items()))}")
                     else:
+                        # No mid stage: ONE terminal WRITE covering the
+                        # union range compute stamped into meta
+                        # (task_dst_ranges with mid_delivery=False).
+                        # Writing layout.dst_size here used to ship the
+                        # slot's full worst-case padding (~2-4× the live
+                        # bytes for SR_INTERP / INTERP mult=2).
                         ch.post_write_with_imm(
-                            src_addr=shm.slot_dst_addr(i),
+                            src_addr=shm.slot_dst_addr(i) + full_off_l,
                             src_lkey=mr.lkey,
-                            length=layout.dst_size,
-                            remote_addr=raddr,
+                            length=full_size_l,
+                            remote_addr=raddr + full_off_l,
                             rkey=rkey,
                             imm=_imm(host_slot, _STAGE_FINAL),
                             wr_id=_WR3_SEND_DST | i)
@@ -1052,6 +1066,8 @@ def compute_proc_main():
 
     # Gating env. When enabled both worker and host post the early-
     # delivery mid SEND (see DUAL_MID_DELIVERY plumbing in guest_mp.py).
+    # Default OFF — measured throughput-neutral; rationale at the
+    # rdma_proc twin of this flag above.
     _mid_delivery_enabled = os.environ.get(
         "DUAL_MID_DELIVERY", "0") == "1"
 
@@ -1151,6 +1167,22 @@ def compute_proc_main():
     # compute_proc. Worker decides mult=2 vs mult≥3 multi-flownet
     # based on this. _run_interp uses `nonlocal` to mutate.
     _interp_mult_cache: int | None = None
+    # Hot-path constants hoisted out of the per-task handlers: the
+    # RGB→YUV matrix upload (one HtoD per SR_INTERP task otherwise),
+    # the debug flag (env read per task), and the flownet timestep
+    # tensors (~4 MB full-frame alloc per flownet otherwise; flownet
+    # treats them as read-only, so one per t value is safe).
+    _split_debug = os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1"
+    _rgb2yuv_m_dev = vgh._RGB2YUV_MATRIX[matrix_s].to(dev)
+    _timestep_cache: dict[float, torch.Tensor] = {}
+
+    def _timestep(t: float) -> torch.Tensor:
+        ts = _timestep_cache.get(t)
+        if ts is None:
+            ts = torch.full([1, 1, rife_cfg["ph"], rife_cfg["pw"]], t,
+                            dtype=torch.float16, device=dev)
+            _timestep_cache[t] = ts
+        return ts
 
     def _run_interp(cur, src, ov, src_a_idx, src_b_idx, task_id):
         """INTERP: read padded RGB + cached RIFE encode features, run
@@ -1218,14 +1250,13 @@ def compute_proc_main():
         if guest_mode:
             stage_keys = ("rgb", "rgb2", "rgb3")
         cc_slot_for_stage = (dst, dst2, dst3)
-        if os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1":
+        if _split_debug:
             log(f"_run_interp slot={cur} task_id={task_id} "
                 f"mult={mult} timesteps={timesteps} "
                 f"dst={dst} dst2={dst2} dst3={dst3}")
         with torch.inference_mode():
             for tstep_idx, tstep in enumerate(timesteps):
-                timestep_t = torch.full([1, 1, ph, pw], tstep,
-                                         dtype=torch.float16, device=dev)
+                timestep_t = _timestep(tstep)
                 with lock_inf, torch.cuda.stream(stream_inf):
                     if encode is not None:
                         if guest_mode:
@@ -1290,7 +1321,7 @@ def compute_proc_main():
                 rgb_in = cc_views[src_slot]["rgb_interp"]
             # RGB(fp16) → YUV(fp32) via matrix at proc dims.
             rgb_f = rgb_in[0].permute(1, 2, 0).to(torch.float32)
-            m = vgh._RGB2YUV_MATRIX[matrix_s].to(dev)
+            m = _rgb2yuv_m_dev
             yuv = torch.einsum("hwc,rc->hwr", rgb_f, m)
             y_full = yuv[..., 0]
             u_full = yuv[..., 1]
@@ -1395,7 +1426,7 @@ def compute_proc_main():
         dst_slot = int(meta.dst_cc_slot)
         del meta
         guest_mode = (cc_shm_local is None)
-        if os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1":
+        if _split_debug:
             log(f"_run_ccsr slot={cur} task_id={task_id} "
                 f"guest={guest_mode} dst_slot={dst_slot} "
                 f"downsample_pre={downsample_pre}")
@@ -1736,7 +1767,8 @@ def compute_proc_main():
                         mo, ms, fo, fs = layout.task_dst_ranges(
                             task_type,
                             interp_mult=_compute_interp_mult,
-                            rgb_interp_size=_compute_frame_sz)
+                            rgb_interp_size=_compute_frame_sz,
+                            mid_delivery=_mid_delivery_enabled)
                         meta.mid_off   = mo
                         meta.mid_size  = ms
                         meta.full_off  = fo

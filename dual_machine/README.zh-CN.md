@@ -36,15 +36,19 @@ RIFE 插帧 + FSRCNNX luma 超分在两块 GB10 上并行跑。输出和单机�
 
 ## 双机有什么好处
 
-1080p / 24 fps 源 → 4K / 48 fps 输出 稳态：
+1080p / 24 fps 源 → 4K / 48 fps 输出，dispatcher 稳态 fps
+（完整表见 [`bench/results.md`](../bench/results.md)）：
 
-| mode | sustained fps | 大概加速比 |
-|---|---|---|
-| 单机 | 48 – 50 | 1.00× |
-| 双机 | 95 – 97 | ~1.95× |
+| mode | dispatcher fps（稳态） |
+|---|---|
+| 双机 mult=2 | 95 – 96 |
+| 双机 mult=3 | 87 |
+| 双机 仅 RIFE（无 SR） | 153 – 156 |
+| 双机 仅 SR（mult=1） | 145 – 147 |
 
-画面质量和单机一致 （真实帧 byte-identical；插帧因为 RIFE 跨 GPU 非
-确定性，luma 大约 50–70 dB Y-PSNR vs 单机，远高于可见阈值）.
+约为单机稳态的 2 倍。画面质量和单机一致 （真实帧 byte-identical；
+插帧因为 RIFE 跨 GPU 非确定性，luma 大约 50–70 dB Y-PSNR vs 单机，
+远高于可见阈值）.
 
 ## 设计理念
 
@@ -56,11 +60,15 @@ RIFE 插帧 + FSRCNNX luma 超分在两块 GB10 上并行跑。输出和单机�
    受限）。 各自偏好的 queue 空了会 fallback 到对方的 queue，所以
    两块 GPU 都不会等。
 
-2. **通信藏在计算后面。** RDMA WRITE_WITH_IMM 跟下一个 task 的
-   kernel 并行搬数据。 Worker 在 host 还在跑 CCSR kernel 时就 post
-   下一个 mid-stage SEND；网线永远不在关键路径。 NCCL 只用来一次性
-   handshake （一个 int64[18] tensor 描述尺寸 / 格式 / variant /
-   interp_mult）；每帧数据全走 RDMA.
+2. **通信藏在计算后面，而且只传活字节。** RDMA WRITE_WITH_IMM 跟
+   下一个 task 的 kernel 并行搬数据；网线永远不在关键路径。 每个
+   task 只收发它的类型真正用到的字节区间 （INTERP mult=2 回传
+   12.4 MB 而不是整槽 54 MB；CCSR/SR_INTERP 请求约 12.5 MB 而不是
+   58.5 MB），并且 INTERP / SR_INTERP 请求负载走零拷贝：cc_cache
+   区域注册成 MR，NIC 按 SGE 列表直接 gather，派发线程不经过
+   ~5 GB/s cudaHostRegister 慢读路径做任何 memmove。 一次性
+   handshake （int64[19]，描述尺寸 / 格式 / variant / interp_mult /
+   encode 通道数） 走 liveness TCP socket；每帧数据全走 RDMA.
 
 3. **任务细分，自动分配。** CCSR / INTERP / SR_INTERP 都够小 （GB10
    上大约 2–12 ms），优先调度器能让两边同时有活，不需要逐帧协调。
@@ -105,7 +113,7 @@ flowchart LR
     end
     GMP ==>|"RDMA WRITE (src bundle)<br/>数据 + imm 编码控制"| WSHM
     WSHM ==>|"RDMA WRITE_WITH_IMM (rgb_interp)<br/>数据 + imm 编码控制"| GMP
-    ND <-.->|"liveness TCP (29905)<br/>handshake 144 B + ready 'R'<br/>+ FIN-watchdog"| WP
+    ND <-.->|"liveness TCP (29905)<br/>handshake 152 B + ready 'R'<br/>+ FIN-watchdog"| WP
 ```
 
 `cc_cache` 是被动 cuda-pinned shm —— 它只在 host 端存中间任务结果，
@@ -123,7 +131,7 @@ VA) 发起。 worker 看不到 cc_cache： 它只看到自己的
 | `queue_mgr.py` | DAG （每对 CCSR → INTERP → SR_INTERP） + 3 个优先级堆；`pop_for_host` 和 `pop_for_guest` 各自有偏好 + 跨队 fallback |
 | `host_3proc.py` | host 端 3 进程封装 （HostMP）. `dma_proc` 做 `process_vm_readv` 从 mpv 拉到 shm;`compute_proc` 跑 host GPU kernel;`buffer_mgr_proc` 中转共享状态机 |
 | `guest_mp.py` | host 进程内的 RDMA client。 把帧打包进 pinned RDMA buffer,post WRITE\_WITH\_IMM 给 worker,drain CQ，回调 `cc_cache_writeback_fn` + `task_done_fn` |
-| `worker.py` | worker 入口。 accept host 的 liveness TCP 连接，读 144 字节 handshake，启 3 进程 pipeline。 跨 session 持续；liveness socket 上的 FIN/RST 触发 per-session watchdog 后回 accept-loop |
+| `worker.py` | worker 入口。 accept host 的 liveness TCP 连接，读 152 字节 handshake，启 3 进程 pipeline。 跨 session 持续；liveness socket 上的 FIN/RST 触发 per-session watchdog 后回 accept-loop |
 | `worker_3proc.py` | worker 端 3 进程 pipeline (WorkerMP). `rdma_proc` 轮询 CQ;`compute_proc` 跑 worker GPU kernel;`buffer_mgr_proc` 跑 slot 状态机 |
 | `rdma_transport.py` | pyverbs 包装。 WRITE\_WITH\_IMM 把 slot/stage 编码进 imm field;recv MR 就是 slot.dst 区域 （零拷贝） |
 | `cc_cache.py` | host 的 `compute_proc` 和 `guest_mp` 共享的 cuda-pinned shm 池。 每 slot 存中间结果 `rgb_padded` / `rife_features` / `rgb_interp` / `sr_yuv`；生命周期由 queue_mgr 引用计数 |
@@ -202,7 +210,7 @@ SR 管线。 `mult=4` 只能在 ≤ 720p 源上跑得动，因为更高分辨率
 | 选择 | 备选 | 为什么 |
 |---|---|---|
 | **RDMA WRITE_WITH_IMM** 传每帧数据 | NCCL collective | Grace 上 NCCL 用不了 GPUDirect （peermem 不能装，dmabuf export 失败） — 有 ~14 ms transit 下限。 Pyverbs WRITE_WITH_IMM 完全绕开 NCCL；完全 pipeline 在 compute 后面时 effective transit ~0 ms |
-| **控制面全走一条 TCP socket** | NCCL + TCP 分担 | 整个控制面 （handshake 字节 / ready 信号 / FIN-watchdog） 都跑在 29905 liveness TCP socket 上。 NCCL 整个去掉了 — 它就负责发个 144 字节 handshake，带的 per-collective deadline （3 s） 又让 worker 冷启 TRT 编译完全没法等。 一根 socket + `struct.pack` 砍掉约 80 行胶水代码，顺便清空 `TORCH_NCCL_*` env 一堆，还把 TCPStore 端口 （29500） 也丢了 |
+| **控制面全走一条 TCP socket** | NCCL + TCP 分担 | 整个控制面 （handshake 字节 / ready 信号 / FIN-watchdog） 都跑在 29905 liveness TCP socket 上。 NCCL 整个去掉了 — 它就负责发个小 handshake，带的 per-collective deadline （3 s） 又让 worker 冷启 TRT 编译完全没法等。 一根 socket + `struct.pack` 砍掉约 80 行胶水代码，顺便清空 `TORCH_NCCL_*` env 一堆，还把 TCPStore 端口 （29500） 也丢了 |
 | **Worker 3 进程** | 单进程 | 把 RDMA 轮询 （延迟敏感，CQ busy-loop） / GPU 计算 （容忍延迟，可批量） / slot 状态机 （CPU bookkeeping） 分开。 各自钉一个核；GIL 竞争没了 |
 | **`process_vm_readv` host → shm** | mpv VA DMA | mpv 帧住在 mpv 堆里，不是共享映射；readv 一次 syscall 跨地址空间。 Grace 上吞吐 ~30 GB/s — 够 4K 4:2:0 跑 100+ fps |
 | **mpv 端 `memmove` writeback** | dma_proc 的 `process_vm_writev` | shm 在 mpv 和 dma_proc 都有映射，mpv 本地 memcpy ~30 GB/s；跨进程 writev ~2.5 GB/s （page fault 开销）。 4K SR task 省 ~8 ms |
@@ -249,6 +257,15 @@ host crash 时的 keepalive RST），拆掉当前 session 的 pipeline，然后
 回到 `listener.accept_session()` 等下一个 host。 新的 host 播放
 session 不用重启 daemon 就能 reattach — 一般 3 s 内。 没有 NCCL group 要
 re-init，整个控制面就一个 TCP socket。
+
+watchdog 是对称的：**host** 侧同样在这条 socket 上常驻一个线程。
+worker 会话中死亡 （crash / 断电 / 断链） 时 host ~3 s 内感知，把
+在途 guest 任务标记失败 （而不是每对 pair 各等 1 秒黑帧超时），已
+认领的任务回流给 host dispatcher，播放无缝降级单机继续。 Shift+F9
+一键重试 dual，和连接失败时一样。
+
+长会话里 seek 很便宜：seek-flush 清扫会释放消费者已被 flush 掉的
+cc_cache 槽位，反复拖进度条也不会耗尽 32 槽的池子。
 
 ## 另见
 

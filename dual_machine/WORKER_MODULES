@@ -1,0 +1,12 @@
+# Python modules the dual-machine WORKER box needs (one per line).
+# Single source of truth — consumed by install.sh's --dual-secondary
+# step AND bench/_common.sh's start_worker rsync, which previously
+# each kept their own list and drifted. vs_gpu_helpers.py is NOT here:
+# it lives at the repo root and both consumers add it explicitly.
+worker.py
+worker_3proc.py
+rdma_transport.py
+mp_pipeline.py
+cc_cache.py
+queue_mgr.py
+common.py

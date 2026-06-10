@@ -86,7 +86,8 @@ RoCE 互联，稳态 fps 大约翻倍。
 默认值从 `ip link` / `ip a` 取。 想脚本化安装就预设 `--help` 列出的 env.
 
 播放时：**Shift+F9** 开关双机 offload。 连不上自动回退到单机模式 （再按一
-次重试）.
+次重试）；会话中 worker 死亡同样自动回退 —— host 侧 liveness watchdog
+~3 秒内感知，回收在途任务，播放无缝降级单机继续。
 
 → 完整设计 + 组件细节：[`dual_machine/README.zh-CN.md`](./dual_machine/README.zh-CN.md).
 
@@ -131,6 +132,7 @@ per-task timing 脚本。 测试视频用 `bench/gen_clips.sh` 合成 （不依�
 | `~/.local/share/applications/*.desktop` | 启动器入口 |
 | `~/.config/autostart/jellyfin-mpv-shim.desktop` | 登录自启 shim |
 | `~/src/{mpv,mpv-dandanplay-danmaku}/` | 源码检出 （能删，下次安装会重 clone） |
+| `~/.cache/dgxspark-mpv/trt-engines/` | 编译好的 TRT 引擎备份 —— uninstall / 重建 env 后保留，下次安装直接还原省 4–7 分钟重编译 |
 
 ## 系统要求
 

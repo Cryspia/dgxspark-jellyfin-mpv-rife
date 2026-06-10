@@ -326,7 +326,8 @@ class SlotRingLayout:
         )
 
     def task_dst_ranges(self, task_type: int, *, interp_mult: int = 2,
-                        rgb_interp_size: int = 0
+                        rgb_interp_size: int = 0,
+                        mid_delivery: bool = True
                         ) -> tuple[int, int, int, int]:
         """Per-task split of slot.dst into FIRST-MID + FINAL byte ranges.
         Returns (mid_off, mid_size, full_off, full_size).
@@ -335,6 +336,17 @@ class SlotRingLayout:
         For INTERP with mult ≥ 4 the worker derives intermediate stages
         (1..mult-3) on the fly from dense-pack offsets (k * frame_sz);
         only the two anchors (stage 0 and final) are stored in meta.
+
+        Every range covers only the bytes the host actually reads for
+        that task type — slot.dst is sized for the worst case (named
+        regions vs the mult=4 INTERP overlay), so a blanket
+        0..dst_size WRITE used to ship up to ~40 MB of dead bytes per
+        task over the wire.
+
+        mid_delivery=False (DUAL_MID_DELIVERY off, the current
+        default) collapses everything into one terminal WRITE: the
+        union of the mid + final regions, since the single response
+        carries both.
         """
         off = {name: o for (name, o, *_) in self.dst_layout}
         sz  = {name: n for (name, _, n, *_) in self.dst_layout}
@@ -345,15 +357,23 @@ class SlotRingLayout:
             mid_size = sz["rgb_padded"] + sz["rife_features"]
             full_off  = 0
             full_size = off["rgb_padded"]
+            if not mid_delivery:
+                # Single terminal WRITE carries SR output + mid-out.
+                # no_interp (mult=1) CCSR skips the rgb_padded /
+                # rife_features writes entirely (no consumer), so the
+                # union shrinks to the SR planes.
+                if interp_mult <= 1:
+                    return (0, 0, 0, off["rgb_padded"])
+                return (0, 0, 0, mid_off + mid_size)
             return (mid_off, mid_size, full_off, full_size)
-        if task_type == TT_INTERP and interp_mult >= 3:
+        if task_type == TT_INTERP and interp_mult >= 2:
             # Dense-pack: frame k at slot.dst[k * frame_sz]. Stage 0 =
             # frame 0; final = frame (mult-2). The layout is decoupled
             # from CCSR named regions so CCSR field changes don't move
             # INTERP frame anchors.
             if rgb_interp_size <= 0:
                 raise ValueError(
-                    "task_dst_ranges(TT_INTERP, mult>=3) requires "
+                    "task_dst_ranges(TT_INTERP) requires "
                     "rgb_interp_size; got "
                     f"{rgb_interp_size}")
             need = interp_mult * rgb_interp_size
@@ -361,11 +381,16 @@ class SlotRingLayout:
                 f"INTERP mult={interp_mult} needs {need} B but "
                 f"slot.dst is {self.dst_size} B "
                 f"(rgb_interp_size={rgb_interp_size})")
+            if not mid_delivery or interp_mult == 2:
+                # One terminal WRITE with all (mult-1) frames. mult=2
+                # has a single frame and no mid stage by construction.
+                return (0, 0, 0, (interp_mult - 1) * rgb_interp_size)
             final_off = (interp_mult - 2) * rgb_interp_size
             return (0, rgb_interp_size, final_off, rgb_interp_size)
-        # Single-stage default: TT_INTERP mult=2, TT_SR_INTERP.
+        # Single-stage default: TT_SR_INTERP (and INTERP mult=1, which
+        # never dispatches). Host reads only yao/uao/vao.
         # mid_size=0 means producer skips WRITE_MID / MID_DONE entirely.
-        return (0, 0, 0, self.dst_size)
+        return (0, 0, 0, off["rgb_padded"])
 
 
 # ──────────────────────────────────────────────────────────────────────

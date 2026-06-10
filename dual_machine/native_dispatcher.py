@@ -371,7 +371,7 @@ def make_dispatcher(
                     "2020ncl": 9, "2020cl": 10}
     _RIFE_IDX = {"4.26": 0, "4.6": 1}
     handshake_bytes = _struct.pack(
-        "<18q",
+        "<19q",
         2, H, W, output_scale,
         _VARIANT_IDX[variant],
         _CHROMA_IDX[chroma_kernel],
@@ -384,8 +384,13 @@ def make_dispatcher(
         int(rife_cfg["ph"]), int(rife_cfg["pw"]),
         interp_mult,
         1 if no_sr else 0,
+        # enc_ch: derived from the loaded RIFE engine's encode head
+        # (4.26→4, 4.6→0). The worker previously hardcoded 4 — fine
+        # while dual is pinned to 4.26, silent slot-layout divergence
+        # the day a 4.6 dual session ships. Field [18].
+        int(rife_cfg.get("encode_channel", 0) or 0),
     )
-    sys.stderr.write("[native_dispatcher] sending handshake (144 B)…\n")
+    sys.stderr.write("[native_dispatcher] sending handshake (152 B)…\n")
     sys.stderr.flush()
     try:
         _liveness_sock.sendall(handshake_bytes)
@@ -613,7 +618,23 @@ def make_dispatcher(
             _prof_on = os.environ.get("DUAL_PROFILE", "0") == "1"
             _prof = {"cpu_ms": 0.0, "claim_retries": 0, "n": 0,
                      "last_report": _time.perf_counter()}
+            # Claim-before-pop: secure a host slot BEFORE taking a task
+            # off the queue. The old pop-then-claim order parked a
+            # popped task on this side while both host slots were busy
+            # — head-of-line blocking the guest could have served.
+            # Holding an idle claimed slot is free: this loop is the
+            # only host_mp claimant.
+            slot = None
             while True:
+                while slot is None:
+                    slot = host_mp.claim_slot()
+                    if slot is None:
+                        if queue_mgr._closed:
+                            return
+                        # cv-based wait: release_slot() (in
+                        # _hmp_watcher) signals the cv; typical wakeup
+                        # ~10us. Cap at 5ms as a safety net.
+                        host_mp.wait_slot_free(timeout=0.005)
                 node = queue_mgr.pop_for_host(
                     blocking=True, timeout=0.5)
                 if node is None:
@@ -654,16 +675,8 @@ def make_dispatcher(
                         f"[split-dispatch] gating violation: SR/CCSR popped "
                         f"without dst VA tid={node.id} K={node.frame_idx} "
                         f"type={node.type} phase={node.output_phase}")
-                slot = None
+                # Slot already claimed before the pop (see loop head).
                 _claim_retries = 0
-                while slot is None:
-                    slot = host_mp.claim_slot()
-                    if slot is None:
-                        _claim_retries += 1
-                        # cv-based wait: release_slot() (in
-                        # _hmp_watcher) signals the cv; typical wakeup
-                        # ~10us. Cap at 5ms as a safety net.
-                        host_mp.wait_slot_free(timeout=0.005)
                 queue_mgr.set_node_payload(node.id, "worker_slot", slot)
                 if os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1":
                     sys.stderr.write(
@@ -757,6 +770,7 @@ def make_dispatcher(
                 # before submit_listener can race-read this slot.
                 host_mp.commit_slot(slot)
                 host_mp.notify_submit()
+                slot = None   # consumed — claim a fresh one next round
                 if _prof_on:
                     _prof["cpu_ms"] += (_time.perf_counter() - _t_pop) * 1000
                     _prof["claim_retries"] += _claim_retries
@@ -978,6 +992,9 @@ def make_dispatcher(
             queue_mgr.task_done(task_id, ok=True,
                                  result={"executor": "guest"})
 
+        def _guest_task_fail(task_id: int, reason: str) -> None:
+            queue_mgr.task_done(task_id, ok=False, error=reason)
+
         # Mid SEND arrival → unblock downstream INTERPs gated on
         # CCSR stage 0. Stage idx encoded by guest_mp's CQ thread.
         def _guest_task_stage_done(task_id: int, stage_idx: int) -> None:
@@ -1017,6 +1034,7 @@ def make_dispatcher(
                 peer_handshake_port=_guest_port,
                 cc_cache_writeback_fn=_cc_writeback,
                 task_done_fn=_guest_task_done,
+                task_fail_fn=_guest_task_fail,
                 task_stage_done_fn=_guest_task_stage_done,
                 log=lambda m: sys.stderr.write(m + "\n"),
             )
@@ -1050,10 +1068,43 @@ def make_dispatcher(
         if guest_mp is not None:
             from cc_cache import FIELD_RGB_PADDED, FIELD_RIFE_FEATURES
 
+            # Zero-copy dispatch: register the cc_cache region as an MR
+            # so INTERP / SR_INTERP payloads can be described as SGEs
+            # pointing straight into cc_cache — the NIC gathers them,
+            # replacing a ~58 MB-per-INTERP CPU memmove through the
+            # ~5 GB/s cudaHostRegister'd read path. Falls back to the
+            # memmove pack functions below if registration fails.
+            # Lifetime is safe: queue_mgr refcounts pin every referenced
+            # slot until task_done (which always trails the SEND
+            # completion), and the seek-flush sweep keeps slots of
+            # RUNNING tasks alive.
+            guest_mp.register_cc_cache(_cc.addr, _cc.layout.total_size)
+
+            def _interp_payload_sges(cc, node, gmp):
+                """SGE description of the INTERP wire payload (same
+                byte order the memmove fallback produces)."""
+                src_a = node.payload["src_cc_slot_a"]
+                src_b = node.payload["src_cc_slot_b"]
+                rgb_sz = gmp._rgb_padded_bytes
+                ft_sz  = gmp._rife_features_bytes
+                k = gmp.cc_lkey
+                return [
+                    (cc.field_addr(src_a, FIELD_RGB_PADDED),    rgb_sz, k),
+                    (cc.field_addr(src_a, FIELD_RIFE_FEATURES), ft_sz,  k),
+                    (cc.field_addr(src_b, FIELD_RGB_PADDED),    rgb_sz, k),
+                    (cc.field_addr(src_b, FIELD_RIFE_FEATURES), ft_sz,  k),
+                ]
+
+            def _sr_payload_sges(cc, node, gmp):
+                src = node.payload["src_cc_slot_a"]
+                return [(cc.field_addr(src, FIELD_RGB_INTERP),
+                         gmp._interp_dst_rgb_bytes, gmp.cc_lkey)]
+
             def _pack_interp_payload(cc, node, base, poff, gmp):
                 """Wire layout (must match worker_3proc.split_src_views):
                   rgb_padded_a, features_a, rgb_padded_b, features_b
-                each contiguous, in slot.src after the 128B header."""
+                each contiguous, in slot.src after the 128B header.
+                Memmove fallback for _interp_payload_sges."""
                 src_a = node.payload["src_cc_slot_a"]
                 src_b = node.payload["src_cc_slot_b"]
                 rgb_sz = gmp._rgb_padded_bytes
@@ -1075,7 +1126,7 @@ def make_dispatcher(
                 """Wire layout: rgb_interp (fp16 RGB at proc dims).
                 cc_cache.rgb_interp is already laid out as (1, 3, proc_h,
                 proc_w) — single contiguous memmove is the whole payload.
-                """
+                Memmove fallback for _sr_payload_sges."""
                 src = node.payload["src_cc_slot_a"]
                 total = gmp._interp_dst_rgb_bytes
                 ctypes.memmove(base + poff,
@@ -1110,15 +1161,32 @@ def make_dispatcher(
                         ctypes.memmove(base + local_off, va,
                                         row_bytes * rows)
                     else:
-                        for r in range(rows):
-                            ctypes.memmove(base + local_off + r * row_bytes,
-                                            va + r * stride, row_bytes)
+                        # Strided source: one vectorised numpy copy
+                        # instead of `rows` Python-level memmoves.
+                        src_buf = (ctypes.c_char * (
+                            stride * (rows - 1) + row_bytes)
+                        ).from_address(va)
+                        src = np.lib.stride_tricks.as_strided(
+                            np.frombuffer(src_buf, dtype=np.uint8),
+                            shape=(rows, row_bytes), strides=(stride, 1))
+                        dst_buf = (ctypes.c_char * (
+                            row_bytes * rows)
+                        ).from_address(base + local_off)
+                        np.copyto(np.frombuffer(dst_buf, dtype=np.uint8)
+                                  .reshape(rows, row_bytes), src)
                 _copy_plane(_ccsr_src_offs["ya"], src_y_va,
                              _ccsr_H, y_row, src_y_stride)
                 _copy_plane(_ccsr_src_offs["ua"], src_u_va,
                              _ccsr_cH, uv_row, src_uv_stride)
                 _copy_plane(_ccsr_src_offs["va"], src_v_va,
                              _ccsr_cH, uv_row, src_uv_stride)
+
+            # Tripped by the liveness watchdog when the worker
+            # connection dies: stops the dispatch loop, which hands all
+            # queued + claimed work back to the host loop (clean
+            # degradation to single-machine instead of every pair
+            # waiting out its 1 s black-frame timeout).
+            _guest_down = threading.Event()
 
             def _guest_dispatch_loop():
                 """Guest dispatch loop. Asks mgr for any task it can
@@ -1132,13 +1200,30 @@ def make_dispatcher(
                 _prof = {"cpu_ms": 0.0, "claim_retries": 0,
                           "dst_va_waits": 0, "n": 0,
                           "last_report": _time.perf_counter()}
-                while True:
+                # Claim-before-pop, mirroring the host loop: never take
+                # a task off the shared queue until we hold the RDMA
+                # slot to run it. The old pop-then-claim order parked a
+                # popped task here while all guest slots were busy —
+                # head-of-line blocking the (possibly idle) host.
+                slot = None
+                _claim_retries = 0
+                while not _guest_down.is_set():
+                    while slot is None:
+                        if _guest_down.is_set() or queue_mgr._closed:
+                            return
+                        slot = guest_mp.claim_slot(
+                            blocking=True, timeout=0.005)
+                        if slot is None:
+                            _claim_retries += 1
                     node = queue_mgr.pop_for_guest(
                         blocking=True, timeout=0.5)
                     if node is None:
                         if queue_mgr._closed:
                             return
                         continue
+                    if _guest_down.is_set():
+                        queue_mgr.requeue(node)
+                        return
                     _t_pop = _time.perf_counter() if _prof_on else 0.0
 
                     # Strict gating: SR_* + CCSR tasks only enter the
@@ -1168,23 +1253,22 @@ def make_dispatcher(
                             f"K={node.frame_idx} type={node.type} "
                             f"phase={node.output_phase}")
 
-                    slot = None
-                    _claim_retries = 0
-                    while slot is None:
-                        # cv-based blocking claim. guest_mp.release_slot
-                        # already signals its internal cv. Cap timeout
-                        # at 5ms as safety net.
-                        slot = guest_mp.claim_slot(
-                            blocking=True, timeout=0.005)
-                        if slot is None:
-                            _claim_retries += 1
-
+                    # Slot already claimed before the pop (loop head).
                     base = guest_mp.get_send_buffer_addr(slot)
                     poff = guest_mp.get_send_payload_offset()
+                    # SGE list for the zero-copy gather path; stays
+                    # None when the payload was memmoved (CCSR always;
+                    # INTERP/SR_INTERP only if cc MR registration
+                    # failed) so notify_submit picks the staged path.
+                    sges = None
                     try:
                         if node.type == TaskType.INTERP:
-                            _pack_interp_payload(_cc, node, base, poff,
-                                                  guest_mp)
+                            if guest_mp.cc_lkey is not None:
+                                sges = _interp_payload_sges(_cc, node,
+                                                             guest_mp)
+                            else:
+                                _pack_interp_payload(_cc, node, base,
+                                                      poff, guest_mp)
                             guest_mp.fill_request(slot, node)
                         elif node.type == TaskType.CCSR:
                             _pack_ccsr_payload(node, base, guest_mp)
@@ -1196,8 +1280,12 @@ def make_dispatcher(
                                 dst_y_stride=sr_y_stride,
                                 dst_uv_stride=sr_uv_stride)
                         else:
-                            _pack_sr_payload(_cc, node, base, poff,
-                                              guest_mp)
+                            if guest_mp.cc_lkey is not None:
+                                sges = _sr_payload_sges(_cc, node,
+                                                         guest_mp)
+                            else:
+                                _pack_sr_payload(_cc, node, base, poff,
+                                                  guest_mp)
                             guest_mp.fill_request(
                                 slot, node,
                                 dst_y_va=sr_dst_y,
@@ -1210,6 +1298,7 @@ def make_dispatcher(
                             f"[guest-dispatch] pack failed task_id={node.id}"
                             f" type={node.type}: {ex}\n")
                         guest_mp.release_slot(slot)
+                        slot = None
                         queue_mgr.task_done(node.id, ok=False,
                                              error=f"pack: {ex}")
                         continue
@@ -1220,7 +1309,21 @@ def make_dispatcher(
                             f"type={TaskType(node.type).name} "
                             f"frame_idx={node.frame_idx} → slot={slot}\n")
                         sys.stderr.flush()
-                    guest_mp.notify_submit(slot)
+                    try:
+                        guest_mp.notify_submit(slot, payload_sges=sges)
+                    except Exception as ex:
+                        # post_send on a dead QP raises — recover the
+                        # slot and fail the task (the watchdog will
+                        # stop this loop shortly).
+                        sys.stderr.write(
+                            f"[guest-dispatch] notify_submit failed "
+                            f"task_id={node.id}: {ex}\n")
+                        guest_mp.release_slot(slot)
+                        slot = None
+                        queue_mgr.task_done(node.id, ok=False,
+                                             error=f"submit: {ex}")
+                        continue
+                    slot = None   # consumed — claim a fresh one next round
                     if _prof_on:
                         _prof["cpu_ms"] += (_time.perf_counter() - _t_pop) * 1000
                         _prof["claim_retries"] += _claim_retries
@@ -1250,6 +1353,62 @@ def make_dispatcher(
                                   name="guest-dispatch").start()
                 sys.stderr.write("[native_dispatcher] guest-dispatch thread "
                                  "started\n")
+                sys.stderr.flush()
+
+                def _liveness_watchdog():
+                    """Block on the liveness socket for the session's
+                    lifetime. The worker never sends again after the
+                    ready byte, so any recv return — EOF (clean worker
+                    exit) or OSError (RST / keepalive timeout, ~3 s
+                    after an ungraceful death) — means the worker is
+                    gone. Before this watchdog existed nobody read the
+                    socket post-ready: a dead worker left its in-flight
+                    tasks RUNNING forever (1 s black-frame timeout per
+                    pair) and the guest loop wedged once the 4 RDMA
+                    slots leaked."""
+                    try:
+                        while True:
+                            b = _liveness_sock.recv(1)
+                            if not b:
+                                break
+                            # Stray byte (only 'R' is ever sent, and
+                            # that was consumed before we started) —
+                            # ignore.
+                    except OSError:
+                        pass
+                    if _guest_down.is_set():
+                        return
+                    _guest_down.set()
+                    sys.stderr.write(
+                        "[native_dispatcher] worker liveness lost — "
+                        "stopping guest dispatch, failing in-flight "
+                        "guest tasks, continuing host-only\n")
+                    sys.stderr.flush()
+                    try:
+                        n_failed = guest_mp.fail_inflight(
+                            "worker connection lost")
+                        sys.stderr.write(
+                            f"[native_dispatcher] recovered {n_failed} "
+                            f"in-flight guest task(s)\n")
+                        sys.stderr.flush()
+                    except Exception as ex:
+                        sys.stderr.write(
+                            f"[native_dispatcher] in-flight recovery "
+                            f"failed: {ex}\n")
+                        sys.stderr.flush()
+                    # Publish the degraded state so sr_keys.lua's
+                    # Shift+F9 OSD reflects reality (retriable from a
+                    # single keypress, same as a connect failure).
+                    try:
+                        with open("/tmp/dual_machine_active", "w") as _f:
+                            _f.write("0")
+                    except OSError:
+                        pass
+
+                threading.Thread(target=_liveness_watchdog, daemon=True,
+                                  name="worker-liveness").start()
+                sys.stderr.write("[native_dispatcher] worker liveness "
+                                 "watchdog started\n")
                 sys.stderr.flush()
 
     # ── State ─────────────────────────────────────────────────────
@@ -1613,6 +1772,11 @@ def make_dispatcher(
         # — dma_proc transitions to SEND_PENDING, _hmp_watcher calls
         # task_done + release_slot.
 
+    # Read once: per-frame os.environ lookups on the compute hot path
+    # cost more than the trace they gate. The env var is a launch-time
+    # debug switch, not something toggled mid-session.
+    _compute_trace = os.environ.get("DUAL_COMPUTE_TRACE", "0") == "1"
+
     def compute(pair_k, phase,
                  sa_y, sa_u, sa_v, sb_y, sb_u, sb_v,
                  dst_y, dst_u, dst_v,
@@ -1621,10 +1785,9 @@ def make_dispatcher(
         """The native filter calls this once per output frame.
         pair_k = n // mult, phase = n % mult."""
         _enter()
-        if os.environ.get("DUAL_COMPUTE_TRACE", "0") == "1":
-            import time as _t
+        if _compute_trace:
             sys.stderr.write(
-                f"[cpu] t={_t.perf_counter():.3f} compute(K={pair_k}, "
+                f"[cpu] t={_time.perf_counter():.3f} compute(K={pair_k}, "
                 f"phase={phase}) ENTER dst=0x{dst_y:x}\n")
             sys.stderr.flush()
         try:
@@ -1635,10 +1798,9 @@ def make_dispatcher(
                 sa_y_stride, sa_uv_stride,
                 dst_y_stride, dst_uv_stride)
             _tick_fps()
-            if os.environ.get("DUAL_COMPUTE_TRACE", "0") == "1":
-                import time as _t
+            if _compute_trace:
                 sys.stderr.write(
-                    f"[cpu] t={_t.perf_counter():.3f} compute(K={pair_k}, "
+                    f"[cpu] t={_time.perf_counter():.3f} compute(K={pair_k}, "
                     f"phase={phase}) RETURN\n")
                 sys.stderr.flush()
         finally:

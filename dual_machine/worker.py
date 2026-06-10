@@ -1,6 +1,6 @@
 """Dual-machine worker daemon. Listens on a single TCP socket
 (`DUAL_LIVENESS_PORT`, default 29905) for host sessions; per session
-reads an 18-int64 handshake, spawns the 3-proc RDMA pipeline, sends a
+reads a 19-int64 handshake, spawns the 3-proc RDMA pipeline, sends a
 ready byte, then parks watchdog-style on the same socket until the
 host disconnects (FIN/RST → keepalive 1+1+2 ≈ 3 s detection).
 
@@ -9,7 +9,7 @@ socket; the data plane is RDMA (rdma_proc, port 29900). Removing NCCL
 killed the 3 s per-collective deadline that used to gate the slow
 worker prep path (cold TRT compile takes minutes).
 
-Handshake wire format (`<18q`, 144 bytes, little-endian signed int64):
+Handshake wire format (`<19q`, 152 bytes, little-endian signed int64):
   [0] mode (== 2; only mode left)
   [1] H, [2] W            source dimensions
   [3] scale                fsrcnnx upscale factor (=2)
@@ -26,6 +26,12 @@ Handshake wire format (`<18q`, 144 bytes, little-endian signed int64):
                            host's RIFE-padded dims
   [16] interp_mult         temporal multiplier (2/3/4)
   [17] no_sr               1 = skip FSRCNNX SR (F8 OFF in dual)
+  [18] enc_ch              RIFE encode-head channel count (4.26→4,
+                           4.6→0). Both sides size slot.src/dst and
+                           the rife_features field from this; a
+                           hardcoded worker-side 4 would silently
+                           corrupt data the day a 4.6 dual session is
+                           enabled.
 """
 from __future__ import annotations
 import os, sys, time, socket, struct, threading, traceback
@@ -72,8 +78,8 @@ _MATRIX_BY_IDX = {1: "709", 5: "470bg", 6: "170m", 7: "240m",
 _LIVENESS_BACKLOG = 128
 _DRAIN_INTERVAL_S = 1.0
 _LIVENESS_ACCEPT_TIMEOUT = 30.0
-_HANDSHAKE_FMT = "<18q"
-_HANDSHAKE_BYTES = struct.calcsize(_HANDSHAKE_FMT)  # 144
+_HANDSHAKE_FMT = "<19q"
+_HANDSHAKE_BYTES = struct.calcsize(_HANDSHAKE_FMT)  # 152
 
 
 def log(msg):
@@ -102,7 +108,7 @@ def _peer_alive(c: socket.socket) -> bool:
 class LivenessListener:
     """Persistent TCP listener for host control sessions.
 
-    Each host opens a connection here, sends its 144-byte handshake,
+    Each host opens a connection here, sends its 152-byte handshake,
     waits for the worker's 'R' ready byte, then holds the socket open
     for the session's lifetime. FIN/RST on the socket trips the
     per-session watchdog → pipeline teardown.
@@ -221,7 +227,7 @@ def _recv_exact(conn: socket.socket, n: int) -> bytes:
 
 
 def _parse_handshake(buf: bytes) -> dict | None:
-    """Decode 144-byte handshake into a dict, or None if mode != 2."""
+    """Decode 152-byte handshake into a dict, or None if mode != 2."""
     hs = struct.unpack(_HANDSHAKE_FMT, buf)
     if hs[0] != 2:
         return None
@@ -241,6 +247,7 @@ def _parse_handshake(buf: bytes) -> dict | None:
         "rife_pW": hs[15] if hs[15] > 0 else 1920,
         "interp_mult": hs[16] if hs[16] in (1, 2, 3, 4) else 2,
         "no_sr": 1 if hs[17] == 1 else 0,
+        "enc_ch": hs[18] if hs[18] >= 0 else 0,
     }
 
 
@@ -252,7 +259,7 @@ def serve_session(dev, conn: socket.socket, addr: tuple):
     """Handle one host session over the just-accepted liveness `conn`.
 
     Wire protocol:
-        host → worker:  144-byte handshake (struct '<18q')
+        host → worker:  152-byte handshake (struct '<19q')
         worker → host:  1 byte 'R' after compute_proc engines are ready
         host → worker:  (none after handshake; FIN/RST signals end)
 
@@ -329,7 +336,7 @@ def serve_session(dev, conn: socket.socket, addr: tuple):
         signal_ready_cb=_signal_ready, log=log,
         downsample_pre=cfg["downsample_pre"],
         pH=cfg["rife_pH"], pW=cfg["rife_pW"],
-        enc_ch=4,
+        enc_ch=cfg["enc_ch"],
         interp_mult=cfg["interp_mult"], no_sr=cfg["no_sr"],
         wmp_out=wmp_box,
     )

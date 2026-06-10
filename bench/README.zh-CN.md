@@ -63,7 +63,7 @@ bench/robustness.sh                # N=60 帧, RECOVERY_SLA=5 s
 RECOVERY_SLA=3 N=40 bench/robustness.sh
 ```
 
-四个场景，每个验证双机链能在 `RECOVERY_SLA` 秒内恢复（或干净 fallback 到单机）：
+九个场景，每个验证双机链能在 `RECOVERY_SLA` 秒内恢复（或干净 fallback 到单机）：
 
 1. `worker_down`   — mpv 启动前停掉 worker.service。 期望 liveness probe
    快速失败 → 单机 fallback.
@@ -86,6 +86,9 @@ RECOVERY_SLA=3 N=40 bench/robustness.sh
    cache 都改名，重启 worker 再开 mpv：必须重新编译 TRT （这套栈下
    30–60 秒），验证最终能进 dual 且渲染出帧。 退出时还原 cache。
    用 `TRT_BENCH_TIMEOUT` 调上限 （默认 300 s）。
+9. `seek_storm` — 对存活的 dual 会话用 IPC 连发 seek，验证 SLA 内恢复
+   播放。同时覆盖 seek-flush 的 cc_cache 槽位回收（高频拖动不允许耗尽
+   槽池）。
 
 需要 worker systemd 服务在从机上提前跑起来。 bench 自己会作为场景 1 的
 一部分停/启服务。
