@@ -34,7 +34,7 @@ DUAL_INTERP_MULT=2。dispatcher fps = 30 帧滚动稳态。
 
 | 链 | dispatcher fps（稳态） |
 |---|---|
-| 全链（RIFE + FSRCNNX） | 95 – 96 |
+| 全链（RIFE + FSRCNNX） | 95 – 97 |
 | 仅 RIFE（无 SR）       | 153 – 156 |
 | 仅 FSRCNNX（mult=1）   | 145 – 147 |
 | 全链，mult=3           | 87 |
@@ -91,4 +91,4 @@ gather 直接从注册为 MR 的 cc_cache 区域取数，不再由派发线程�
 
 RIFE 4.26 在单 GB10 上 2 个并发 INTERP 即打满 SM（1 GPU 全速跑
 1 个 INTERP）。两 GPU 并行 INTERP + CCSR/SR/传输完美流水 ≈ 本栈
-**108 fps** 天花板。当前稳态 95 – 96 fps ≈ 天花板的 89%。
+**108 fps** 天花板。当前稳态 95 – 97 fps ≈ 天花板的 89%。

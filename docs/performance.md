@@ -35,7 +35,7 @@ DUAL_INTERP_MULT=2. Dispatcher fps = rolling 30-frame steady state.
 
 | chain | dispatcher fps (steady) |
 |---|---|
-| full (RIFE + FSRCNNX)          | 95 – 96  |
+| full (RIFE + FSRCNNX)          | 95 – 97  |
 | RIFE only (no SR)              | 153 – 156 |
 | FSRCNNX only (mult=1)          | 145 – 147 |
 | full, mult=3                   | 87       |
@@ -97,4 +97,4 @@ cc_cache slots, so heavy seeking doesn't drain the pool. All 9
 RIFE 4.26 is SM-saturated at 2 concurrent INTERPs per GB10 (1 GPU runs
 1 INTERP at full speed). Two GPUs running INTERP in parallel + perfect
 pipelining of CCSR / SR / wire ≈ **108 fps** ceiling on this stack.
-Current sustained 95 – 96 fps = ~89 % of ceiling.
+Current sustained 95 – 97 fps = ~89 % of ceiling.
