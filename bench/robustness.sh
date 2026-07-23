@@ -374,7 +374,12 @@ echo "--- 8: trt_cache_miss (rename 1920x1088 engine on both sides → re-compil
 # minutes. Bench's only assertion here is "does it eventually reach
 # dual mode without crashing" — slow OK.
 rm -f /tmp/dual_machine_disabled /tmp/dual_machine_worker_dead 2>/dev/null
-VSRIFE_DIR="$HOME/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models"
+# Resolve the vsrife models dir through whatever pythonX.Y the env was
+# built with (glob, not a hardcoded python3.12) so a conda python bump
+# doesn't silently skip the cache rename. Both boxes share the env
+# layout, so the locally-resolved path applies to the remote too.
+VSRIFE_DIR="$(ls -d "$HOME"/miniforge3/envs/vsmpv/lib/python*/site-packages/vsrife/models 2>/dev/null | head -1)"
+: "${VSRIFE_DIR:=$HOME/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models}"
 CACHE_NAME="flownet_v4.26.pkl_1920x1088_fp16_scale-1.0_ensemble-False_NVIDIA GB10_trt-10.16.1.11.ts"
 host_cache_path="$VSRIFE_DIR/$CACHE_NAME"
 host_cache_backup="$host_cache_path.bench_backup"

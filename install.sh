@@ -43,12 +43,21 @@ MPV_VERSION="v0.41.0"
 # install, re-check that apply_patches() still reports "patched … for
 # TRT mixed-precision" (it hard-fails if the patch context vanished),
 # and re-run bench/fps.sh + bench/color.sh.
-TORCH_VERSION="2.12.0"
+#
+# Coupling that caps how far these go (verified 2026-07):
+#   • torch_tensorrt is the ceiling. Its latest (2.12.1) requires
+#     torch<2.13.0 AND tensorrt<10.17.0 — so torch stays on the 2.12.x
+#     line and tensorrt on 10.16.x until torch_tensorrt ships a 2.13
+#     wheel. Bumping torch to 2.13 / tensorrt to 11 leaves no matching
+#     torch_tensorrt and kills the RIFE TRT-compile path.
+#   • TENSORRT 10.16.1.11 is already the newest 10.16.x.
+#   • CUDNN_FE / vsrife / shim tracked to latest at bump time.
+TORCH_VERSION="2.12.1"
 VSRIFE_VERSION="5.7.0"
 TENSORRT_VERSION="10.16.1.11"
-TORCH_TRT_VERSION="2.12.0"
+TORCH_TRT_VERSION="2.12.1"
 SHIM_VERSION="2.10.0"
-CUDNN_FE_VERSION="1.24.0"
+CUDNN_FE_VERSION="1.26.0"
 
 # Miniforge installer pin + checksum (aarch64). `releases/latest` made
 # every fresh install a moving target. Find sha256 values in the
@@ -283,6 +292,14 @@ create_conda_env() {
   log "creating env (will pull ~1GB of conda-forge packages)"
   log "  channel: $fchannel"
   mamba create -n "$ENV_NAME" -y -c "$fchannel" \
+    `# Python is pinned to 3.12 ON PURPOSE — do NOT bump to match a` \
+    `# newer conda-forge default. The dual-machine RDMA transport` \
+    `# (dual_machine/rdma_transport.py) imports the SYSTEM pyverbs from` \
+    `# /usr/lib/python3/dist-packages, a Cython C-extension ABI-locked` \
+    `# to Ubuntu 24.04's system python (3.12). A 3.13 env can't load it,` \
+    `# and building a matched pyverbs from rdma-core source per-box is` \
+    `# fragile (ABI-drifts on any apt rdma-core upgrade). Staying on 3.12` \
+    `# keeps the env<->system ABI aligned so dual just works.` \
     python=3.12 \
     `# media + filter chain (pinned: the vapoursynth C ABI + ffmpeg` \
     `#  major drive the whole vf chain; bump deliberately + re-bench)` \
@@ -382,12 +399,19 @@ install_pip_packages() {
   pip install --upgrade pip
 
   # PyTorch — its CUDA wheels live on pytorch.org (not mirrored on USTC).
-  if ! python -c "import torch" 2>/dev/null; then
-    log "installing torch (CUDA 13 wheel from pytorch.org)"
+  # Gate on the exact pinned version, not just "is torch importable": an
+  # import-only check silently kept an old torch when TORCH_VERSION was
+  # bumped, leaving torch_tensorrt (which is version-locked to torch) on
+  # a mismatched pair. Compare the base version (strip the +cuXXX local
+  # tag) so "2.12.1" matches "2.12.1+cu130".
+  local cur_torch
+  cur_torch=$(python -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null || true)
+  if [[ "$cur_torch" != "$TORCH_VERSION" ]]; then
+    log "installing torch $TORCH_VERSION (CUDA 13 wheel from pytorch.org; was: ${cur_torch:-none})"
     pip install "torch==$TORCH_VERSION" --index-url "$PYTORCH_INDEX" || \
       pip install --pre torch --index-url "$PYTORCH_NIGHTLY_INDEX"
   else
-    log "torch already installed: $(python -c 'import torch; print(torch.__version__)')"
+    log "torch already at pinned $TORCH_VERSION"
   fi
 
   # Pinned application stack, one resolver run. Pins matter doubly here:
