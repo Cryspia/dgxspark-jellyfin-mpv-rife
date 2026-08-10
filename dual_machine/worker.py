@@ -162,6 +162,14 @@ class LivenessListener:
             self.srv.settimeout(_LIVENESS_ACCEPT_TIMEOUT)
             try:
                 return self.srv.accept()
+            except TimeoutError:
+                # No host connected within the accept window. This is the
+                # normal idle state, NOT a failure — return quietly so an
+                # idle worker doesn't spam the log with a timeout line
+                # every _LIVENESS_ACCEPT_TIMEOUT seconds. (TimeoutError is
+                # a subclass of OSError, so this must precede the OSError
+                # clause below.)
+                return None, None
             except OSError as e:
                 log(f"liveness accept failed: {type(e).__name__}: {e}")
                 return None, None
@@ -407,11 +415,20 @@ def main():
         port=int(os.environ.get("DUAL_LIVENESS_PORT", "29905")))
 
     log_path = os.environ.get("DUAL_WORKER_LOG", "/tmp/dual_worker.log")
+    waiting_logged = False
     while True:
-        log("waiting for host (liveness accept)…")
+        # Print the idle banner once per idle period, not on every
+        # accept-timeout retry — an idle worker would otherwise reprint
+        # it every _LIVENESS_ACCEPT_TIMEOUT seconds. bench/_common.sh's
+        # start_worker greps for this line, so it must still appear at
+        # startup and after each session ends.
+        if not waiting_logged:
+            log("waiting for host (liveness accept)…")
+            waiting_logged = True
         conn, addr = listener.accept_session()
         if conn is None:
-            continue  # accept timeout — listener still alive, retry
+            continue  # accept timeout / retry — listener still alive
+        waiting_logged = False  # real session incoming; re-arm the banner
         try:
             serve_session(dev, conn, addr)
             log("session ended cleanly")
