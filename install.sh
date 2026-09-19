@@ -81,7 +81,7 @@ MINIFORGE_SHA256="89b786c8d2c8b0fda7553914c1314ae4ddaa094503802f279377b19ac4463c
 # used to change what a re-install produced); bump after testing.
 DANMAKU_REPO_URL="https://github.com/Cryspia/mpv-dandanplay-danmaku.git"
 DANMAKU_SRC_DIR="$HOME/src/mpv-dandanplay-danmaku"
-DANMAKU_REF="1d0e5061ebfce3ca3a2a0c65d95797509dc027b2"
+DANMAKU_REF="9968911091b1715e28ced983431b3ce88e04a676"
 
 # User-visible install locations
 MPV_CFG_DIR="$HOME/.config/mpv"
