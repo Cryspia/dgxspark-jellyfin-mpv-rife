@@ -38,32 +38,64 @@ much lower on U/V than real video does. Numbers are only comparable
 across runs of the **same** clip; re-baseline whenever the clip
 changes.
 
-## 2026-09-19 — multi-rail transport
+## 2026-09-19 — multi-rail transport + dependency bump
 
-Re-measured after the transport moved from one RDMA device to one per
-rail (striped across both; see `dual_machine/README.md`). Same host,
-same clip, `SKIP_SINGLE=1 N=200 CF=24`; dispatcher fps is the
-comparable figure because wall fps still carries fixed init cost and
-N differs from the baseline run below.
+Two changes landed together. Same host, same clip, `SKIP_SINGLE=1
+N=200 CF=24`; dispatcher fps is the comparable figure because wall fps
+still carries fixed init cost and N differs from the baseline run below.
 
-| mode | dispatcher fps, single rail (2026-06-10) | dispatcher fps, two rails |
+### Transport: one RDMA device -> one per rail, striped
+
+| mode | single rail (2026-06-10) | two rails |
 |---|---:|---:|
-| dual            | 94.9 – 99.8   | 105.6 |
-| dual\_no\_sr     | 152.8 – 156.1 | 155.5 |
-| dual\_no\_interp | 145.1 – 146.6 | 159.6 |
+| dual            | 94.9 – 99.8   | 105.7 |
+| dual\_no\_sr     | 152.8 – 156.1 | 156.7 |
+| dual\_no\_interp | 145.1 – 146.6 | 164.2 |
 
-`bench/color.sh` over the same build (`N=20`, `CF=2`) — unchanged
-within the RIFE cross-GPU non-determinism the baseline already
-documents, and `no_interp` matches to every printed decimal:
+Fabric capacity (`ib_write_bw`, `-q 8 -s 65536 -D 15`): 98.01 Gb/s per
+rail, 196.02 both in parallel. Striped `SEND` with the pipeline's real
+message sizes: 156 Gb/s.
+
+### Dependencies
+
+Taken: `jellyfin-mpv-shim` 2.10.0 -> 3.0.0, `nvidia-cudnn-frontend`
+1.26.0 -> 1.29.0, miniforge/conda 26.5.0 -> 26.7.2. mpv (v0.41.0),
+vsrife (5.7.0) and fsrcnnx-cudnn (v0.2.2) were already current.
+
+cudnn-frontend 1.29 is worth its own line: `dual_no_interp` — the only
+mode that never touches RIFE — went 159.6 -> 164.2 (+2.9%) and stayed
+there across a TensorRT rollback, so the win is cuDNN's, not TRT's.
+Output is bit-identical (see PSNR below).
+
+**Not taken: torch 2.13.0 / torch\_tensorrt 2.13.0 / tensorrt
+11.0.0.114.** The set installs and runs clean but builds a slower RIFE
+engine on GB10:
+
+| task | TRT 10.16.1.11 | TRT 11.0.0.114 |
+|---|---:|---:|
+| INTERP kernel    | 17.6 ms | 20.86 ms (+18.5%) |
+| SR\_INTERP kernel | 8.5 ms  | 8.2 ms |
+| CCSR kernel      | 11.4 ms | 11.44 ms |
+
+Only the TRT-compiled path moved. Dispatcher fps fell to dual 96.5 and
+dual\_no\_sr 137.0 (two runs, <2% apart), while dual\_no\_interp was
+unaffected. Neither knob recovers it, measured on the real vsrife
+filter at 1920x1088: builder `optimization_level=5` gives 16.09 vs
+16.39 ms/frame (+10.5 s build time), and removing the mixed-precision
+patch gives 16.34 — so the patch is not implicated and stays. Re-test
+when torch\_tensorrt ships a newer TRT 11 pairing.
+
+### PSNR (`bench/color.sh`, `N=20`, `CF=2`)
+
+Unchanged within the RIFE cross-GPU non-determinism the baseline
+already documents. `no_interp` is bit-identical across the single-rail
+baseline, the multi-rail run and the post-rollback run:
 
 | pair | Y | U | V | overall | baseline overall |
 |---|---:|---:|---:|---:|---:|
-| full       | 57.96 | 49.90 | 48.98 | 53.12 | 53.22 |
-| no\_sr      | 60.78 | 47.14 | 47.37 | 51.66 | 51.71 |
+| full       | 57.82 | 49.89 | 48.97 | 53.08 | 53.22 |
+| no\_sr      | 61.23 | 47.14 | 47.38 | 51.69 | 51.71 |
 | no\_interp  | 63.79 | 37.69 | 36.56 | 41.84 | 41.84 |
-
-Fabric capacity for reference (`ib_write_bw`, `-q 8 -s 65536 -D 15`):
-98.01 Gb/s per rail, 196.02 Gb/s both in parallel.
 
 ## bench/fps.sh — sustained throughput
 
