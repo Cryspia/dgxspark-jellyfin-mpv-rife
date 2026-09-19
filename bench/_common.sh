@@ -39,6 +39,13 @@ WORKER_USER="${WORKER_USER:-${DUAL_WORKER_USER:-ubuntu}}"
 # /Users/$WORKER_USER vs anything else.
 WORKER_DIR="${WORKER_DIR:-${DUAL_WORKER_DIR:-.local/share/dgxspark-mpv/worker}}"
 RDMA_DEV="${RDMA_DEV:-${DUAL_RDMA_DEV:-rocep1s0f0}}"
+# RoCEv2 GID index for the rail's IPv4. install.sh pins it in dual.conf;
+# 3 is only the right fallback while the rail carries no extra addresses.
+RDMA_GID="${RDMA_GID:-${DUAL_RDMA_GID:-3}}"
+# Rail list for the multi-rail transport (one QP per entry, every
+# transfer striped across them). Empty == single rail on $RDMA_DEV.
+RDMA_DEVS="${RDMA_DEVS:-${DUAL_RDMA_DEVS:-}}"
+RDMA_GIDS="${RDMA_GIDS:-${DUAL_RDMA_GIDS:-}}"
 RDMA_PORT="${RDMA_PORT:-${DUAL_RDMA_PORT:-29900}}"
 
 # ─── default clips (override via env) ────────────────────────────────
@@ -154,6 +161,8 @@ start_worker() {
     ( nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
         DUAL_WORKER_HOST=$HOST_IP \
         DUAL_RDMA_DEV=$RDMA_DEV DUAL_RDMA_PORT=$RDMA_PORT \
+        DUAL_RDMA_GID=$RDMA_GID \
+        DUAL_RDMA_DEVS=$RDMA_DEVS DUAL_RDMA_GIDS=$RDMA_GIDS \
         ${WORKER_EXTRA_ENV:-} \
         PYTHONPATH=/usr/lib/python3/dist-packages \
         $PY -B worker.py </dev/null >/tmp/dual_worker.log 2>&1 & )
@@ -194,6 +203,8 @@ run_mpv() {
     [[ $mode = dual_no_interp ]] && mult=1
     env DUAL_WORKER_HOST="$WORKER_IP" \
         DUAL_RDMA_DEV="$RDMA_DEV" DUAL_RDMA_PORT="$RDMA_PORT" \
+        DUAL_RDMA_GID="$RDMA_GID" \
+        DUAL_RDMA_DEVS="$RDMA_DEVS" DUAL_RDMA_GIDS="$RDMA_GIDS" \
         DUAL_INTERP_MULT=$mult \
         DUAL_REPORT_FPS=30 \
         WARMUP_DISABLE=1 \

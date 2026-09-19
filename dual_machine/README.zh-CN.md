@@ -25,9 +25,13 @@ RIFE 插帧 + FSRCNNX luma 超分在两块 GB10 上并行跑。输出和单机�
 ## 需要什么
 
 - **两台 DGX Spark** (GB10, ARM64, Ubuntu 24.04, CUDA 13).
-- **200 G RoCE 链路** 互联 — Spark 上的 CX7 网卡有两个 PCIe device
-  共享一个 200 G 端口，两条 rail 都得能联通。 链路上用静态 IP （不要
-  DHCP）；安装脚本会提示输入自身 IP 和对端 IP，写入配置文件。
+- **RoCE 链路** 互联。 CX7 要跑满 200 Gb/s 必须同时驱动两条 PCIe 路径，
+  所以 fabric 在不同路径上各配一条 rail（`enp1s0f0np0` 与
+  `enP2p1s0f1np1`，各自一个 /24），**不是 bond**。 本管线只用其中一条，
+  所以实际跑 ~98 Gb/s，原因见
+  [为什么链路只跑 ~98 Gb/s 而不是 200](#为什么链路只跑-98-gbs-而不是-200)。
+  链路上用静态 IP （不要 DHCP）；安装脚本会提示输入自身 IP 和对端 IP，
+  写入配置文件。
 - **软件一致**：一样的 conda env， 一样 `install.sh` 装出来的
   mpv / vapoursynth / vsrife / fsrcnnx-cudnn。 主机跑
   `install.sh install --dual-host` 装完整栈；从机跑
@@ -222,6 +226,102 @@ SR 管线。 `mult=4` 只能在 ≤ 720p 源上跑得动，因为更高分辨率
 | **lua side-channel 传 seek / shutdown 事件** | mpv vapoursynth API 把事件传给 filter | mpv 的 vf API 不把 seek 或退出事件交给 filter,python 里看不到。 `scripts/dual_seek_flush.lua` 在 `seeking` property 变 true 时 （vf 拆除之前 fire，正好赶在 compute() 线程开始等之前） 写 `/tmp/dual_machine_seek_epoch`，在 `shutdown` 事件时写 `/tmp/dual_machine_shutdown` （mpv 嵌入式 python 的 atexit 不 fire，这是唯一靠谱的关闭钩子） |
 | **inotify 驱动的 seek-flush watcher** | 100 ms 轮询 | watcher 用 `inotify_init1` + `os.read` 阻塞 （ctypes，不加依赖）。 lua 写文件，kernel μs 级唤醒 vs 轮询路径平均 ~50 ms — 拖动进度条手感是"即时"而不是"明显卡一下" |
 | **wait_phase_done 超时静默返回** | 抛 RuntimeError | python exception 从 `compute_callable` 抛出来会被 pybind11 / vapoursynth 当成 filter error,mpv 会当致命错误退出整个进程。 直接静默返回 （让 mpv 显示 dst VA 里原本的内容 —— 通常是黑色，几个 vsync 后被下一帧覆盖） — worker 卡死或尾帧 corner case 永远不会让播放崩溃 |
+
+## 为什么链路只跑 ~98 Gb/s 而不是 200
+
+fabric 给每个节点的确是 200 Gb/s，本管线只用了一半 —— 这是传输层的性质，
+既不是配置没配对，也不是线插少了。
+
+### CX7 到底长什么样
+
+一台 DGX Spark 上只有**一颗** ConnectX-7 ASIC —— 四个 PCI function 报告
+的 `phys_switch_id` 完全相同 —— 带两个物理口。它通过**两条 PCIe5 x4 root
+complex** 接到主机，而且**每个物理口在两条路径上各暴露一次**（socket
+direct）。所以四个 netdev 是 2 个口 × 2 条 PCIe 路径，不是四个口：
+
+| netdev | PCI function | `devlink` port | PCIe 路径 |
+|---|---|---|---|
+| `enp1s0f0np0` | `0000:01:00.0` | port 0 | A |
+| `enP2p1s0f0np0` | `0002:01:00.0` | port 0 | B |
+| `enp1s0f1np1` | `0000:01:00.1` | port 1 | A |
+| `enP2p1s0f1np1` | `0002:01:00.1` | port 1 | B |
+
+天花板由两件事决定：
+
+- **每个物理口本身就是 200G 能力**。`ethtool` 通告
+  `200000baseCR4/Full` 和 `200000baseCR2/Full`。这里协商成 100 Gb/s 只是
+  因为 DAC 和交换机口是 QSFP28 100G（`ethtool -m` 显示
+  `Identifier: QSFP28`、`100G Base-CR4`）。
+- **每条 PCIe 路径是 x4 @ 32 GT/s**（`LnkSta: Speed 32GT/s, Width x4`），
+  约 128 Gb/s 原始带宽，单条扛不动 200G。网卡接到两条 root complex 上，
+  唯一原因就是这个。
+
+所以 **200 Gb/s 永远意味着并行驱动两条 PCIe 路径**，也就是两个 rdma
+device。插几根线是另一回事 —— 下面两种都能到 200 Gb/s：
+
+- 一根 200G 线插 port 0，用 `enp1s0f0np0`（路径 A）+ `enP2p1s0f0np0`
+  （路径 B）；
+- 两根 100G 线，每个口用一个 netdev，但要落在**不同**路径上。
+
+永远做不到的是：单个 netdev、单条 PCIe 路径、或单个 QP 跑到 200 Gb/s。
+
+本 fabric 用的是两根线那种形式，因为交换机口和 DAC 都是 100G。它配置
+`enp1s0f0np0`（port 0，路径 A）和 `enP2p1s0f1np1`（port 1，路径 B），另外
+两个不配 IP —— 它们所在物理口的那根线，已经被占着该口的那条路径吃满了。
+如果改成 `enp1s0f0np0` + `enp1s0f1np1`，两条 rail 就都压在路径 A 上，整机
+被卡在 100 Gb/s 附近。
+
+做 bond 也改变不了这一点。mlx5 硬件 RoCE LAG 只能在**同一个 PCI device**
+的 PF 之间形成 —— 那是同一条 PCIe 路径后面的两个 netdev，不会增加 PCIe
+带宽；而且 RoCE LAG 按 QP 哈希，单个 QP 无论如何只落在一个口上。跨两条
+root complex 做 bond 则只得到普通 Linux bond，没有 bonded RDMA device，
+RoCE 会退回单口。
+
+### 传输层怎么用这两条 rail
+
+`guest_mp.py`（host）和 `worker_3proc.py`（worker）为每条 rail 各开一个
+`RDMAContext` 和一对 RC QP，并把每次传输拆到所有 rail 上。
+
+rail 列表来自 `DUAL_RDMA_DEVS` / `DUAL_RDMA_GIDS`（host）与
+`WMP_RDMA_DEVS` / `WMP_RDMA_GIDS`（worker），逗号分隔，由 `install.sh`
+在配置时枚举写入。第 *r* 条 rail 的 TCP 握手端口是
+`DUAL_RDMA_PORT + r`，所以双 rail 安装会用 29900 和 29901。不设置（或只
+填一个）即退回单 rail 传输，与多 rail 出现之前完全一致 —— 这也是某条
+rail 出问题时的兜底。
+
+两个方向的拆分方式不同，因为用的 verb 不同：
+
+- **worker → host** 是 `RDMA WRITE_WITH_IMM`。发送方自己指定远端地址，
+  所以区间可以任意切，碎片在目的端自动拼回。`imm` 里带
+  `(slot, stage, part, n_parts)`；host 要数满该 `(slot, stage)` 的
+  `n_parts` 个到达后才执行写回。小于 1 MB 的写整块走一条 rail，并轮转，
+  这样一串小写也能分散开。
+- **host → worker** 是 `SEND`/`RECV`。报文落在该 QP 上下一个预投递的
+  recv WR 起始处，所以切点必须事先固定（`src_partition`），而且各 rail
+  的 recv 队列必须**锁步**。因此每条报文都会在每条 rail 上各投一个分片
+  —— 该 rail 窗口内没有字节时投零长度 —— 并且 host 用 `io_lock` 保证各
+  rail 上的报文顺序一致。短报文若跳过某条 rail，那条队列就会错位，之后
+  所有报文都会落进错误 slot 的缓冲区。
+
+MR 属于单个 PD，所以每个 staging buffer、`cc_cache` 区域以及 worker 的
+slot ring 都要按 rail 各注册一份（`MultiRailBuffer`）。dispatcher 仍然用
+rail 0 的 lkey 构造 SGE，由 `notify_submit` 按 rail 重映射。
+
+链路容量，两节点间 `ib_write_bw`（2026-09-19，`-q 8 -s 65536 -D 15`）：
+
+| | Gb/s |
+|---|---|
+| 仅 rail 0（`rocep1s0f0`） | 98.01 |
+| 仅 rail 1（`roceP2p1s0f1`） | 98.01 |
+| 两条并行 | 196.02 |
+
+在条带化 `SEND` 路径上用管线真实的报文尺寸实测（CCSR 6.2 MB、
+SR_INTERP 12.4 MB、INTERP 58.5 MB，4 个 slot，60 条报文，2026-09-19）：
+**156 Gb/s**，对比单 rail 的 98。没到 196 是因为比 rail 0 窗口短的报文会
+整块落在 rail 0 上 —— 窗口必须固定，这是 SEND/RECV 的要求。只有 INTERP
+会横跨两条 rail，而 INTERP 占这个方向约 92% 的字节，所以这点不均衡代价
+很小。`WRITE_WITH_IMM` 方向没有这个约束，每个区间都是均分的。
+
 
 ## `VK_LAYER_PRIORITY_BOOST`
 

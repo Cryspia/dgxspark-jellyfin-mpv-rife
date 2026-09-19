@@ -71,8 +71,11 @@ def rdma_proc_main():
     # RDMA setup. We import here so the parent's pyverbs context (if
     # any) isn't inherited.
     sys.path.insert(0, "/usr/lib/python3/dist-packages")
-    from rdma_transport import RDMAContext, RDMAChannel
+    from rdma_transport import (RDMAContext, RDMAChannel, resolve_rails,
+                                 src_partition, stripe, imm_encode,
+                                 STAGE_FINAL)
     import pyverbs.enums as e
+    from pyverbs.mr import MR
 
     rdma_dev = os.environ.get("WMP_RDMA_DEV", "rocep1s0f0")
     rdma_port = int(os.environ.get("WMP_RDMA_PORT", "29900"))
@@ -91,37 +94,79 @@ def rdma_proc_main():
     # for A/B.
     _mid_delivery_enabled = os.environ.get(
         "DUAL_MID_DELIVERY", "1") == "1"
-    log(f"opening RDMA ctx dev={rdma_dev} gid={rdma_gid}"
+    # One context + one QP per rail. A context is one PCI function and
+    # the CX7 only reaches 200 Gb/s across two PCIe paths, so rails are
+    # how bandwidth is bought here. Unset WMP_RDMA_DEVS == single rail
+    # == the old behaviour.
+    rails = resolve_rails(os.environ.get("WMP_RDMA_DEVS"),
+                           os.environ.get("WMP_RDMA_GIDS"),
+                           fallback_dev=rdma_dev, fallback_gid=rdma_gid)
+    n_rails = len(rails)
+    log(f"opening {n_rails} RDMA ctx: {rails}"
         f"{' [mid-delivery=on]' if _mid_delivery_enabled else ''}")
-    ctx = RDMAContext(dev_name=rdma_dev, port=1, gid_index=rdma_gid,
-                       max_cqe=max(64, 8 * layout.n_slots))
+    ctxs = [RDMAContext(dev_name=d, port=1, gid_index=g,
+                         max_cqe=max(64, 8 * layout.n_slots))
+            for d, g in rails]
+    ctx = ctxs[0]
 
     access = (e.IBV_ACCESS_LOCAL_WRITE |
               e.IBV_ACCESS_REMOTE_WRITE |
               e.IBV_ACCESS_REMOTE_READ)
-    mr = shm.register_rdma_mr(ctx.pd, access)
-    log(f"MR registered: lkey={mr.lkey} rkey={mr.rkey}")
+    # register_rdma_mr stores a single MR on the shm object, so it can
+    # only serve rail 0; the rest register the same pages directly. An
+    # MR is bound to one PD and its keys are meaningless on another.
+    mr = shm.register_rdma_mr(ctxs[0].pd, access)
+    mrs = [mr] + [MR(c.pd, layout.total_size, access, address=shm.addr)
+                  for c in ctxs[1:]]
+    log(f"MR registered on {len(mrs)} PD(s): lkeys={[m.lkey for m in mrs]}")
 
-    # Listen for host. RDMAChannel(is_server=True) blocks on accept.
-    log(f"listening on port {rdma_port} for host connection…")
-    ch = RDMAChannel(ctx, is_server=True, peer_ip="", peer_port=rdma_port,
-                      max_wr=max(64, 8 * layout.n_slots))
-    log(f"connected. my_qpn={ch.my_qpn} peer_qpn={ch.peer_qpn}")
+    # Fixed per-rail split of slot.src — where each rail's pre-posted
+    # recv WR points. Must equal the host's src_partition() of the same
+    # src_size, which both ends derive from the shared layout.
+    src_parts = src_partition(layout.src_size, n_rails)
 
-    # Parse the host's slot-info blob (extra_payload from the TCP
-    # handshake). Format: u32 n_slots, then n_slots × (u64 addr, u32
-    # rkey). These are the WRITE_WITH_IMM target addresses on the host
-    # for the dst bundle of each slot.
+    # Listen for host, one port per rail. RDMAChannel(is_server=True)
+    # blocks on accept.
+    chs = []
+    for r in range(n_rails):
+        log(f"rail{r} listening on port {rdma_port + r}…")
+        chs.append(RDMAChannel(ctxs[r], is_server=True, peer_ip="",
+                                peer_port=rdma_port + r,
+                                max_wr=max(64, 8 * layout.n_slots)))
+        log(f"rail{r} connected. my_qpn={chs[r].my_qpn} "
+            f"peer_qpn={chs[r].peer_qpn}")
+    ch = chs[0]
+
+    # Parse the host's slot-info blob (extra_payload from rail 0's TCP
+    # handshake). Layout:
+    #   u32 n_rails, u32 n_slots,
+    #   n_slots × u64 addr,
+    #   n_rails × n_slots × u32 rkey
+    # These are the WRITE_WITH_IMM target addresses on the host for the
+    # dst bundle of each slot. The address is rail-independent; the
+    # rkey is not, so there is one key table per rail.
     import struct as _struct
-    host_dst_remote = []  # list of (addr, rkey)
+    host_dst_remote = []          # [(addr, [rkey per rail]), ...]
     if ch.peer_extra:
-        peer_n = _struct.unpack_from("!I", ch.peer_extra, 0)[0]
-        off = 4
+        host_rails, peer_n = _struct.unpack_from("!II", ch.peer_extra, 0)
+        if host_rails != n_rails:
+            log(f"FATAL: host advertises {host_rails} rail(s), worker has "
+                f"{n_rails}. Set WMP_RDMA_DEVS to match DUAL_RDMA_DEVS.")
+            raise RuntimeError(
+                f"rail count mismatch: host={host_rails} worker={n_rails}")
+        off = 8
+        addrs = []
         for _s in range(peer_n):
-            addr, rkey = _struct.unpack_from("!QI", ch.peer_extra, off)
-            host_dst_remote.append((addr, rkey))
-            off += 12
-        log(f"received host_dst_remote: {peer_n} slots")
+            addrs.append(_struct.unpack_from("!Q", ch.peer_extra, off)[0])
+            off += 8
+        rkeys = [[0] * peer_n for _ in range(n_rails)]
+        for r in range(n_rails):
+            for _s in range(peer_n):
+                rkeys[r][_s] = _struct.unpack_from("!I", ch.peer_extra, off)[0]
+                off += 4
+        host_dst_remote = [(addrs[i], [rkeys[r][i] for r in range(n_rails)])
+                           for i in range(peer_n)]
+        log(f"received host_dst_remote: {peer_n} slots x {n_rails} rails")
     # Host's guest_mp n_slots may differ from worker's layout.n_slots.
     # That's fine — host_slot in the request header always indexes
     # into the host's own table, so as long as host_dst_remote covers
@@ -145,16 +190,38 @@ def rdma_proc_main():
     # ownership is enforced by the state machine itself).
     state_lock = threading.Lock()
 
+    def _post_slot_recv(i: int) -> None:
+        """Post one recv per rail for worker slot i, at that rail's
+        fixed window of slot.src.
+
+        Order matters and is the whole reason this is a function: a
+        SEND lands in the next pre-posted recv WR on its QP, so rail 0's
+        and rail 1's queues only keep pointing at the same slot if every
+        slot is posted to every rail in the same sequence. The host
+        upholds the other half of the bargain by sending exactly one
+        piece per rail per message (zero-length when empty).
+        """
+        base = shm.slot_src_addr(i)
+        for r in range(n_rails):
+            off, ln = src_parts[r]
+            chs[r].post_recv_at(base + off, ln, mrs[r].lkey,
+                                 wr_id=_WR3_RECV_SRC | i)
+
+    # Parts of one striped message land on different CQs in any order;
+    # the slot is only complete once every rail has delivered its piece.
+    recv_parts = [0] * layout.n_slots
+    send_parts = [1] * layout.n_slots   # expected pieces of the final WRITE
+    send_done  = [0] * layout.n_slots   # pieces drained so far
+
     # Pre-post recv on all slots.
     for i in range(layout.n_slots):
-        addr = shm.slot_src_addr(i)
-        ch.post_recv_at(addr, layout.src_size, mr.lkey,
-                         wr_id=_WR3_RECV_SRC | i)
+        _post_slot_recv(i)
         with state_lock:
             meta = shm.slot_state(i)
             meta.state = ST_RECV_PENDING
             del meta
-    log(f"pre-posted recv on all {layout.n_slots} slots; ready")
+    log(f"pre-posted recv on all {layout.n_slots} slots "
+        f"x {n_rails} rail(s); ready")
 
     stopping = threading.Event()
 
@@ -223,13 +290,44 @@ def rdma_proc_main():
         Single-stage tasks (mid_size==0) skip the mid SEND and emit
         one SEND covering the whole slot.dst.
         """
-        # WRITE_WITH_IMM imm encoding (must match guest_mp._imm_encode):
-        # bits 0-15 = slot, bits 16-19 = stage_code (4 bits).
+        # imm encoding lives in rdma_transport (imm_encode) so this end
+        # and guest_mp cannot drift: bits 0-15 slot, 16-19 stage_code,
+        # 20-23 part, 24-27 n_parts.
         #   stage_code 0..14 = mid stage_idx
         #   stage_code 15    = final (terminal write, fires task_done)
-        _STAGE_FINAL = 15
-        def _imm(slot: int, stage_code: int) -> int:
-            return (slot & 0xFFFF) | ((stage_code & 0xF) << 16)
+        _STAGE_FINAL = STAGE_FINAL
+
+        def _write_striped(worker_slot: int, src_off: int, size: int,
+                            raddr: int, rkeys: list, host_slot: int,
+                            stage_code: int, wr_op: int) -> int:
+            """Split one logical WRITE across the rails and post a piece
+            on each. Returns the number of pieces posted, which is what
+            the CQ side counts down before treating the write as done.
+
+            This direction is RDMA WRITE, so the sender picks the remote
+            address and a range can be cut anywhere — the pieces
+            reassemble themselves at the destination. The receiver only
+            needs to know how many are coming, and that rides in the imm.
+            """
+            pieces = [(rail, o, sz) for rail, o, sz in
+                      stripe(src_off, size, n_rails,
+                             rotate=host_slot + stage_code) if sz > 0]
+            n_parts = max(1, len(pieces))
+            # Publish the expected count before posting: a WRITE can
+            # complete the instant it is posted, and the CQ thread reads
+            # this to decide when the slot is fully drained.
+            if wr_op == _WR3_SEND_DST:
+                send_parts[worker_slot] = n_parts
+            for part, (rail, sub_off, sub_size) in enumerate(pieces):
+                chs[rail].post_write_with_imm(
+                    src_addr=shm.slot_dst_addr(worker_slot) + sub_off,
+                    src_lkey=mrs[rail].lkey,
+                    length=sub_size,
+                    remote_addr=raddr + sub_off,
+                    rkey=rkeys[rail],
+                    imm=imm_encode(host_slot, stage_code, part, n_parts),
+                    wr_id=wr_op | worker_slot)
+            return n_parts
         # Debug: count WRITEs per (slot, stage_code) to verify the
         # N-stage protocol on host-slot basis. Enable via
         # DUAL_STAGE_COUNT_DBG=1; dump on bench exit.
@@ -262,15 +360,10 @@ def rdma_proc_main():
                                 stage_size = mid_size
                             if (stage_size > 0 and host_dst_remote is not None
                                     and host_slot < len(host_dst_remote)):
-                                raddr, rkey = host_dst_remote[host_slot]
-                                ch.post_write_with_imm(
-                                    src_addr=shm.slot_dst_addr(i) + stage_off,
-                                    src_lkey=mr.lkey,
-                                    length=stage_size,
-                                    remote_addr=raddr + stage_off,
-                                    rkey=rkey,
-                                    imm=_imm(host_slot, stage_idx),
-                                    wr_id=_WR3_SEND_MID | i)
+                                raddr, rkeys = host_dst_remote[host_slot]
+                                _write_striped(i, stage_off, stage_size,
+                                               raddr, rkeys, host_slot,
+                                               stage_idx, _WR3_SEND_MID)
                                 if _stage_count_dbg:
                                     k = (host_slot, stage_idx)
                                     _stage_counts[k] = _stage_counts.get(k, 0) + 1
@@ -295,20 +388,15 @@ def rdma_proc_main():
                         log(f"WRITE_WITH_IMM disabled or bad host_slot="
                             f"{host_slot}; worker slot {i} dropped")
                         continue
-                    raddr, rkey = host_dst_remote[host_slot]
+                    raddr, rkeys = host_dst_remote[host_slot]
                     # N-stage: when at least one mid was sent (mid_size > 0
                     # AND mid delivery enabled), the final WRITE covers only
                     # full_off..full_off+full_size (the final-stage bytes).
                     # Otherwise write the whole slot.dst at offset 0.
                     if _mid_delivery_enabled and mid_size_l > 0:
-                        ch.post_write_with_imm(
-                            src_addr=shm.slot_dst_addr(i) + full_off_l,
-                            src_lkey=mr.lkey,
-                            length=full_size_l,
-                            remote_addr=raddr + full_off_l,
-                            rkey=rkey,
-                            imm=_imm(host_slot, _STAGE_FINAL),
-                            wr_id=_WR3_SEND_DST | i)
+                        _write_striped(
+                            i, full_off_l, full_size_l, raddr, rkeys,
+                            host_slot, _STAGE_FINAL, _WR3_SEND_DST)
                         if _stage_count_dbg:
                             k = (host_slot, _STAGE_FINAL)
                             _stage_counts[k] = _stage_counts.get(k, 0) + 1
@@ -321,14 +409,9 @@ def rdma_proc_main():
                         # Writing layout.dst_size here used to ship the
                         # slot's full worst-case padding (~2-4× the live
                         # bytes for SR_INTERP / INTERP mult=2).
-                        ch.post_write_with_imm(
-                            src_addr=shm.slot_dst_addr(i) + full_off_l,
-                            src_lkey=mr.lkey,
-                            length=full_size_l,
-                            remote_addr=raddr + full_off_l,
-                            rkey=rkey,
-                            imm=_imm(host_slot, _STAGE_FINAL),
-                            wr_id=_WR3_SEND_DST | i)
+                        _write_striped(
+                            i, full_off_l, full_size_l, raddr, rkeys,
+                            host_slot, _STAGE_FINAL, _WR3_SEND_DST)
         except Exception as ex:
             log(f"send_handler fatal: {type(ex).__name__}: {ex}")
             import traceback; log(traceback.format_exc())
@@ -337,20 +420,58 @@ def rdma_proc_main():
                                 name="rdma_proc-send")
     send_t.start()
 
-    # Main loop: poll CQ.
+    # Main loop: poll every rail's CQ. Each rail owns a CQ, and the
+    # pieces of one striped transfer complete on different CQs in no
+    # fixed order, so a blocking poll on one of them would stall the
+    # others. Spin across all instead.
     n_recv = 0
     n_send = 0
+
+    def _next_wr_id():
+        """Return the next completion's wr_id, or None if all CQs are
+        empty. Raises on a failed WC the way poll_cq_blocking did."""
+        import pyverbs.enums as _e
+        while not stopping.is_set():
+            idle = True
+            for _c in ctxs:
+                n, wcs = _c.cq.poll(8)
+                if n <= 0:
+                    continue
+                idle = False
+                for wc in wcs[:n]:
+                    if wc.status != _e.IBV_WC_SUCCESS:
+                        raise RuntimeError(
+                            f"WC error: status={wc.status} "
+                            f"wr_id={wc.wr_id}")
+                    _pending.append(wc.wr_id)
+            if _pending:
+                return _pending.pop(0)
+            if idle:
+                _t_sleep(0.00005)
+        return None
+
+    _pending: list = []
+    from time import sleep as _t_sleep
     try:
         while not stopping.is_set():
             try:
-                wr_id = ch.poll_cq_blocking()
+                wr_id = _next_wr_id()
             except Exception:
                 if stopping.is_set():
                     break
                 raise
+            if wr_id is None:
+                break
             op = wr_id & 0xFFFF0000
             s = wr_id & 0xFFFF
             if op == _WR3_RECV_SRC:
+                # One piece of the slot's src landed. The header lives
+                # in rail 0's piece at offset 0, so nothing may be read
+                # until every rail has delivered.
+                recv_parts[s] += 1
+                if recv_parts[s] < n_rails:
+                    continue
+                recv_parts[s] = 0
                 # NIC delivered src into slot s. Read the header
                 # eagerly so compute_proc has pair_k + task_type in
                 # SlotMeta and doesn't need to re-read the (volatile)
@@ -425,6 +546,15 @@ def rdma_proc_main():
                 n_send += 1
                 continue
             elif op == _WR3_SEND_DST:
+                # One piece of the final WRITE drained. Only the last
+                # one may recycle the slot — reposting recvs while a
+                # sibling piece is still in flight would let the next
+                # request overwrite bytes the NIC is still reading.
+                send_done[s] += 1
+                if send_done[s] < send_parts[s]:
+                    n_send += 1
+                    continue
+                send_done[s] = 0
                 # NIC drained dst from slot s; can repost recv.
                 if _rdma_prof and _post_send_ts[s] != 0.0:
                     _send_ms = (_rdma_time.perf_counter() - _post_send_ts[s]) * 1000
@@ -432,9 +562,7 @@ def rdma_proc_main():
                     # Reuse _recv_done_ts as "last send-done for slot s"
                     # for the RTT measurement above on the next recv.
                     _recv_done_ts[s] = _rdma_time.perf_counter()
-                addr = shm.slot_src_addr(s)
-                ch.post_recv_at(addr, layout.src_size, mr.lkey,
-                                 wr_id=_WR3_RECV_SRC | s)
+                _post_slot_recv(s)
                 with state_lock:
                     meta = shm.slot_state(s)
                     meta.state = ST_RECV_PENDING
@@ -1933,6 +2061,15 @@ class WorkerMP(MPPipelineBase):
         cfg["WMP_RDMA_DEV"] = self.rdma_dev
         cfg["WMP_RDMA_PORT"] = str(self.rdma_port)
         cfg["WMP_RDMA_GID"] = str(self.rdma_gid)
+        # Rail list. The worker runs on identical hardware to the host,
+        # so its dual.conf names the same devices; forward them under
+        # the WMP_ prefix the child processes read. Absent == single
+        # rail, which is the pre-multi-rail behaviour.
+        for src, dst in (("DUAL_RDMA_DEVS", "WMP_RDMA_DEVS"),
+                          ("DUAL_RDMA_GIDS", "WMP_RDMA_GIDS")):
+            v = os.environ.get(src, "")
+            if v:
+                cfg[dst] = v
 
     def start(self):
         self._spawn("rdma",    "worker_3proc", "rdma_proc_main")

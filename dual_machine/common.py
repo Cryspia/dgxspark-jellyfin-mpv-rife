@@ -16,11 +16,38 @@ What we discover automatically
 - The RoCE RDMA devices on this machine (`/sys/class/infiniband/*`).
 - The kernel network interfaces backing each RDMA device.
 - The IPv4 address bound to each of those interfaces.
+- The RoCEv2 GID index matching that address (what `DUAL_RDMA_GID`
+  pins at install time).
 - The local username (`$USER` / `getpass.getuser()`).
 
-DGX Spark's CX7 looks like two PCIe-split devices that share one 200G
-link — both rails need to be visible for the RDMA control plane to
-discover GIDs on either.
+Fabric shape (see the spark-roce repo for the authoritative table).
+A DGX Spark has ONE ConnectX-7 ASIC — all four functions report the
+same phys_switch_id — with two physical ports, attached to the host
+over TWO PCIe5 x4 root complexes. Each port is exposed on BOTH root
+complexes (socket direct), so the four netdevs are 2 ports x 2 PCIe
+paths, not four ports:
+
+    netdev          function      devlink   PCIe path
+    enp1s0f0np0     0000:01:00.0  port 0    A
+    enP2p1s0f0np0   0002:01:00.0  port 0    B
+    enp1s0f1np1     0000:01:00.1  port 1    A
+    enP2p1s0f1np1   0002:01:00.1  port 1    B
+
+Each PORT is 200G-capable (ethtool advertises 200000baseCR4/CR2).
+Each PCIe PATH is x4 at 32 GT/s, about 128 Gb/s raw, so one path
+cannot carry 200G. Hence the two root complexes.
+
+So 200 Gb/s always means driving two PCIe paths in parallel — two
+rdma devices. Cabling is a separate choice: one 200G cable in port 0
+driven by enp1s0f0np0 + enP2p1s0f0np0 gets there, and so do two 100G
+cables driven by one netdev per port on different paths. What is never
+possible is 200 Gb/s through a single netdev, PCIe path, or QP.
+
+This fabric uses the two-cable form (the switch and DACs are QSFP28
+100G) and addresses exactly one netdev per port, on different paths.
+Measured 2026-09-19 with ib_write_bw: 98.01 Gb/s per rail, 196.02
+Gb/s with both in parallel. This project's transport opens ONE context
+and one QP pair, so it uses one rail.
 """
 from __future__ import annotations
 import os, getpass, json, socket, subprocess
@@ -56,13 +83,41 @@ def _ip_for_iface(iface: str) -> str | None:
     except subprocess.CalledProcessError:
         return None
     for line in out.splitlines():
-        # ".. inet 10.200.128.1/24 .."
+        # ".. inet <addr>/24 .."
         parts = line.split()
         try:
             i = parts.index("inet")
             return parts[i + 1].split("/")[0]
         except (ValueError, IndexError):
             continue
+    return None
+
+
+def roce_v2_gid_index(rdma_dev: str, ip: str) -> int | None:
+    """Index of the RoCEv2 GID on `rdma_dev` port 1 that maps to IPv4
+    `ip`, or None.
+
+    The transport hard-codes 3 as a fallback. That holds only while the
+    rail carries one IPv4 and nothing else. Entries are ordered by when
+    the kernel added them, so one extra address — e.g. an IPv6 RA
+    leaking in from a switch that bridges the fabric ports into a
+    general-purpose LAN — shifts every index after it.
+    """
+    port = Path(f"/sys/class/infiniband/{rdma_dev}/ports/1")
+    want = ":".join(f"{int(a):02x}{int(b):02x}"
+                    for a, b in zip(ip.split(".")[::2], ip.split(".")[1::2]))
+    try:
+        indices = sorted(int(f.name) for f in (port / "gids").iterdir())
+    except OSError:
+        return None
+    for i in indices:
+        try:
+            gid = (port / "gids" / str(i)).read_text().strip()
+            typ = (port / "gid_attrs" / "types" / str(i)).read_text().strip()
+        except OSError:
+            continue
+        if typ == "RoCE v2" and gid.endswith(f":ffff:{want}"):
+            return i
     return None
 
 
@@ -79,15 +134,18 @@ def discover_roce() -> dict:
     Result:
       {
         "rails": [
-          {"rdma": "rocep1s0f0", "iface": "enp1s0f0np0", "ip": "10.200.128.1"},
-          {"rdma": "roceP2p1s0f0", "iface": "enP2p1s0f0np0", "ip": "10.200.129.1"},
+          {"rdma": "rocep1s0f0",   "iface": "enp1s0f0np0",   "ip": "<rail0-ip>"},
+          {"rdma": "roceP2p1s0f1", "iface": "enP2p1s0f1np1", "ip": "<rail1-ip>"},
         ],
-        "rdma_csv":  "rocep1s0f0,roceP2p1s0f0",
-        "iface_csv": "enp1s0f0np0,enP2p1s0f0np0",
-        "ip_csv":    "10.200.128.1,10.200.129.1",
+        "rdma_csv":  "rocep1s0f0,roceP2p1s0f1",
+        "iface_csv": "enp1s0f0np0,enP2p1s0f1np1",
+        "ip_csv":    "<rail0-ip>,<rail1-ip>",
       }
-    Rails without an IP or with no link carrier are skipped — we only
-    return the ones actually usable for transport right now.
+    Rails without an IP or with no link carrier are skipped. That is
+    what separates a real rail from the second PCIe view of the same
+    wire: all four netdevs report carrier, only the two addressed ones
+    are rails. Do not filter on name — the two schemes (enp1s0f* and
+    enP<n>p1s0f*) carry no rule that survives a re-cable.
     """
     rails = []
     for dev in _ib_devices():
@@ -97,7 +155,8 @@ def discover_roce() -> dict:
         ip = _ip_for_iface(iface)
         if ip is None:
             continue
-        rails.append({"rdma": dev, "iface": iface, "ip": ip})
+        rails.append({"rdma": dev, "iface": iface, "ip": ip,
+                      "gid": roce_v2_gid_index(dev, ip)})
     # Sort by IPv4 so both hosts pick the same rail ordering. NCCL's
     # OOB bootstrap socket lives on rail-0; if host and worker disagree
     # on which device is "rail 0", bootstrap can advertise an address

@@ -1435,7 +1435,7 @@ cmd_status() {
   section "dual-machine"
   if [[ -f $DUAL_CFG_FILE ]]; then
     echo "  config:  $DUAL_CFG_FILE"
-    sed 's/^/    /' "$DUAL_CFG_FILE" | head -12
+    sed 's/^/    /' "$DUAL_CFG_FILE" | head -16
     if systemctl --user list-unit-files 2>/dev/null \
         | grep -q "$DUAL_WORKER_SERVICE"; then
       local st
@@ -1731,14 +1731,109 @@ EOF
 # Dual-machine install pieces
 # ============================================================================
 
-# Default high-speed iface: first UP enp1s0* / enP2p1s0* device. The
-# Spark CX7 NIC presents two PCIe ports that bond into one 200 G link;
-# both names start with the same prefix, so picking either rail is
-# enough to pin a default — link aggregation pairs are derived below.
+# A DGX Spark has ONE ConnectX-7 ASIC (all four functions report the
+# same phys_switch_id) with two physical ports, and it attaches to the
+# host over TWO PCIe5 x4 root complexes. Each port is exposed on BOTH
+# root complexes — socket direct — so Linux sees four netdevs that are
+# 2 ports x 2 PCIe paths, not four ports:
+#
+#   netdev          PCIe function   devlink   PCIe path
+#   enp1s0f0np0     0000:01:00.0    port 0    A
+#   enP2p1s0f0np0   0002:01:00.0    port 0    B
+#   enp1s0f1np1     0000:01:00.1    port 1    A
+#   enP2p1s0f1np1   0002:01:00.1    port 1    B
+#
+# Each PORT is 200G-capable (ethtool advertises 200000baseCR4/CR2).
+# Each PCIe PATH is x4 at 32 GT/s — about 128 Gb/s raw, so one path
+# cannot carry 200G. That, and only that, is why the NIC is wired to
+# two root complexes.
+#
+# Consequence: 200 Gb/s always means driving TWO PCIe paths in parallel
+# (two rdma devices). How many cables are plugged in is a separate
+# choice. Both of these reach 200 Gb/s:
+#   - one 200G cable in port 0, using enp1s0f0np0 + enP2p1s0f0np0
+#   - two 100G cables, using one netdev per port on DIFFERENT paths
+# What is never possible is 200 Gb/s through a single netdev, a single
+# PCIe path, or a single QP.
+#
+# This fabric (see the spark-roce repo) takes the second option because
+# the switch ports and DACs are QSFP28 100G: it addresses one netdev
+# per port, deliberately on different PCIe paths, in two disjoint /24s.
+# The other two netdevs are left without an IP — their port's wire is
+# already saturated by the path that owns it. Pairing enp1s0f0np0 with
+# enp1s0f1np1 instead would put both rails on path A and cap the node
+# near 100 Gb/s.
+#
+# An LACP bond does not help either. mlx5 hardware RoCE LAG only forms
+# between PFs of the SAME PCI device, i.e. two netdevs behind ONE PCIe
+# path, which adds no PCIe bandwidth; and RoCE LAG hashes per QP, so a
+# single QP lands on a single port regardless. Bonding across the two
+# root complexes yields a plain Linux bond with no bonded RDMA device.
+#
+# So "which rail" is decided by which netdev carries an IPv4 — never by
+# name order, and never by link state alone (all four report UP).
+# Detection below therefore requires carrier + an IPv4, and prefers the
+# numerically lowest address so host and worker agree on rail 0.
 dual_detect_iface_default() {
-  ip -o link show up 2>/dev/null \
-    | awk -F': ' '/enp1s0|enP2p1s0/ {print $2; exit}' \
-    | awk '{print $1}'
+  local best_ip="" best_if="" iface ip
+  for iface in $(ls /sys/class/net 2>/dev/null); do
+    case $iface in enp1s0*|enP[0-9]*p1s0*) ;; *) continue ;; esac
+    [[ $(cat "/sys/class/net/$iface/carrier" 2>/dev/null) == 1 ]] || continue
+    ip=$(dual_detect_local_ip "$iface")
+    [[ -n $ip ]] || continue
+    # Compare as zero-padded octets so the rails sort numerically.
+    local key; key=$(printf '%03d%03d%03d%03d' ${ip//./ } 2>/dev/null) || continue
+    if [[ -z $best_ip || $key < $best_ip ]]; then best_ip=$key; best_if=$iface; fi
+  done
+  printf '%s\n' "$best_if"
+}
+
+# RDMA device backing $1, by reverse-walking /sys/class/infiniband
+# rather than pattern-matching the netdev name. The two name schemes
+# (enp1s0f0np0 -> rocep1s0f0, enP2p1s0f1np1 -> roceP2p1s0f1) don't
+# share a rule that survives a re-cable, so don't invent one.
+dual_detect_rdma_dev() {
+  local iface=$1 d
+  [[ -n $iface ]] || return 0
+  for d in /sys/class/infiniband/*; do
+    [[ -e "$d/device/net/$iface" ]] && { basename "$d"; return 0; }
+  done
+}
+
+# Every usable rail on this box, one per line: "<iface> <rdma> <gid> <ip>",
+# ordered by IPv4 so host and worker number the rails identically.
+# "Usable" == carrier + an IPv4, which is exactly what separates a rail
+# from the second PCIe view of the same wire.
+dual_detect_rails() {
+  local iface ip dev gid
+  for iface in $(ls /sys/class/net 2>/dev/null); do
+    case $iface in enp1s0*|enP[0-9]*p1s0*) ;; *) continue ;; esac
+    [[ $(cat "/sys/class/net/$iface/carrier" 2>/dev/null) == 1 ]] || continue
+    ip=$(dual_detect_local_ip "$iface"); [[ -n $ip ]] || continue
+    dev=$(dual_detect_rdma_dev "$iface"); [[ -n $dev ]] || continue
+    gid=$(dual_detect_gid_index "$dev" "$ip"); gid=${gid:-3}
+    printf '%s %s %s %s\n' "$iface" "$dev" "$gid" "$ip"
+  done | sort -t' ' -k4,4V
+}
+
+# RoCEv2 GID index on $1 (rdma dev) whose GID maps to IPv4 $2.
+# Hard-coding 3 works only while the rail carries exactly one IPv4 and
+# nothing else. GIDs are indexed in the order the kernel added them, so
+# one extra address — e.g. an IPv6 RA leaking in from a switch that
+# bridges the fabric ports into a general-purpose LAN — shifts every
+# index after it. Resolve it instead.
+dual_detect_gid_index() {
+  local dev=$1 ip=$2 i hexgid want
+  [[ -n $dev && -n $ip ]] || return 0
+  # IPv4-mapped GID tail: a.b.c.d -> %02x%02x:%02x%02x
+  want=$(printf '%02x%02x:%02x%02x' ${ip//./ } 2>/dev/null) || return 0
+  for i in $(ls "/sys/class/infiniband/$dev/ports/1/gids" 2>/dev/null | sort -n); do
+    hexgid=$(cat "/sys/class/infiniband/$dev/ports/1/gids/$i" 2>/dev/null)
+    [[ $hexgid == *:ffff:$want ]] || continue
+    [[ $(cat "/sys/class/infiniband/$dev/ports/1/gid_attrs/types/$i" 2>/dev/null) \
+       == "RoCE v2" ]] || continue
+    printf '%s\n' "$i"; return 0
+  done
 }
 
 dual_detect_local_ip() {
@@ -1777,12 +1872,18 @@ dual_configure() {
   section "step D1: dual-machine config (role=$role)"
 
   cat <<EOF
-A dual-machine install needs a 200 G RoCE link between this box and
-the other Spark, with static IPs (not DHCP) on the high-speed
-interface. Link aggregation across both PCIe ports of the CX7 NIC is
-enabled by default — bench numbers in docs/performance.md assume
-this. Press <Enter> to accept any default, or set the corresponding
-env before re-running to skip prompts (DUAL_RDMA_DEV / DUAL_HOST_IP /
+A dual-machine install needs a RoCE link between this box and the
+other Spark, with static IPs (not DHCP) on the high-speed interface.
+
+The CX7 reaches 200 Gb/s only by driving two PCIe paths at once, so
+the fabric addresses two rails on separate paths, each in its own /24.
+The transport opens one QP per rail and stripes every transfer across
+them; the rails are detected below and written as DUAL_RDMA_DEVS.
+DUAL_RDMA_DEV / the prompts below name rail 0, which also carries the
+handshake.
+
+Press <Enter> to accept any default, or set the corresponding env
+before re-running to skip prompts (DUAL_RDMA_DEV / DUAL_HOST_IP /
 DUAL_WORKER_IP / etc).
 
 EOF
@@ -1790,16 +1891,15 @@ EOF
   local iface_default; iface_default=$(dual_detect_iface_default)
   iface_default=${iface_default:-enp1s0f0np0}
 
-  local rdma_dev_default; rdma_dev_default=$(printf 'rocep1s0f%s' "$(printf '%s' "$iface_default" | sed -nE 's/.*enp1s0f([0-9]+)np[0-9]+/\1/p')")
+  local rdma_dev_default; rdma_dev_default=$(dual_detect_rdma_dev "$iface_default")
   rdma_dev_default=${rdma_dev_default:-rocep1s0f0}
 
+  # No baked-in address defaults. SELF_IP comes off the live interface;
+  # PEER_IP is unknowable here, so the operator supplies it (or presets
+  # DUAL_PEER_IP). Guessing would write a plausible-looking wrong value
+  # into dual.conf and fail later at QP handshake instead of here.
   local self_ip_default; self_ip_default=$(dual_detect_local_ip "$iface_default")
-  self_ip_default=${self_ip_default:-10.200.128.1}
-
-  local peer_ip_default
-  if [[ $role == "host" ]]; then peer_ip_default="10.200.128.2"
-  else                            peer_ip_default="10.200.128.1"
-  fi
+  local peer_ip_default=""
 
   local IFACE     RDMA_DEV  SELF_IP   PEER_IP   RDMA_PORT  WORKER_USER
   IFACE=$(_dual_prompt DUAL_IFACE       "high-speed interface"      "$iface_default")
@@ -1807,16 +1907,58 @@ EOF
   SELF_IP=$(_dual_prompt DUAL_SELF_IP   "this box's IP on the link" "$self_ip_default")
   PEER_IP=$(_dual_prompt DUAL_PEER_IP   "peer's IP on the link"     "$peer_ip_default")
   RDMA_PORT=$(_dual_prompt DUAL_RDMA_PORT "RDMA port"               "$DUAL_DEFAULT_RDMA_PORT")
+  [[ -n $SELF_IP ]] || fatal "no IPv4 on $IFACE — configure the RoCE rail first, or set DUAL_SELF_IP"
+  [[ -n $PEER_IP ]] || fatal "peer IP required — re-run interactively or set DUAL_PEER_IP"
   if [[ $role == "host" ]]; then
     WORKER_USER=$(_dual_prompt DUAL_WORKER_USER \
                   "guest user (for ssh + rsync from bench)" "ubuntu")
   fi
+
+  # Pin the RoCEv2 GID index for SELF_IP. guest_mp / worker_3proc read
+  # DUAL_RDMA_GID and fall back to a hard-coded 3, which is only right
+  # while the rail carries exactly one IPv4 and no extra IPv6 — not the
+  # case when the fabric ports are bridged into a LAN that sends RAs.
+  local RDMA_GID; RDMA_GID=$(dual_detect_gid_index "$RDMA_DEV" "$SELF_IP")
+  if [[ -z $RDMA_GID ]]; then
+    warn "no RoCEv2 GID on $RDMA_DEV for $SELF_IP — falling back to index 3"
+    RDMA_GID=3
+  fi
+
+  # Rail list for the multi-rail transport. guest_mp / worker_3proc open
+  # one context + one QP per entry and stripe every transfer across
+  # them; that is the only way to reach the fabric's 200 Gb/s, since a
+  # single PCIe5 x4 path tops out near 128 Gb/s. Rail r handshakes on
+  # DUAL_RDMA_PORT + r.
+  #
+  # Leave DUAL_RDMA_DEVS unset (or set it to one device) to fall back to
+  # the single-rail transport — same bytes on the wire as before
+  # multi-rail existed, and the escape hatch if a rail misbehaves.
+  local RDMA_DEVS RDMA_GIDS _rails
+  _rails=$(dual_detect_rails)
+  RDMA_DEVS=$(printf '%s\n' "$_rails" | awk '{printf "%s%s", sep, $2; sep=","}')
+  RDMA_GIDS=$(printf '%s\n' "$_rails" | awk '{printf "%s%s", sep, $3; sep=","}')
+  if [[ -n ${DUAL_RDMA_DEVS:-} ]]; then
+    RDMA_DEVS=$DUAL_RDMA_DEVS
+    RDMA_GIDS=${DUAL_RDMA_GIDS:-$RDMA_GIDS}
+  fi
+  local _n_rails=0
+  [[ -n $RDMA_DEVS ]] && _n_rails=$(awk -F, '{print NF}' <<<"$RDMA_DEVS")
+  if (( _n_rails > 1 )); then
+    log "multi-rail transport: $_n_rails rails ($RDMA_DEVS), " \
+        "handshake ports $RDMA_PORT..$((RDMA_PORT + _n_rails - 1))"
+  else
+    warn "only $_n_rails usable rail detected — the transport will run at" \
+         " one rail's line rate. Check that both fabric ports have an IPv4."
+  fi
+
   # MASTER_PORT / NCCL_IB_HCA / NCCL_SOCKET_IFNAME used to be written
   # here for torch.distributed rendezvous. Since the drop-NCCL refactor
   # (control plane is now a single TCP socket on DUAL_LIVENESS_PORT),
-  # none of those are read by anything. The single RDMA device on
-  # DUAL_RDMA_DEV is enough for pyverbs; multi-rail aggregation, if
-  # ever needed, would be configured at the pyverbs layer directly.
+  # none of those are read by anything.
+  #
+  # DUAL_RDMA_DEV / DUAL_RDMA_GID still name rail 0 — the rail that
+  # carries the handshake and the one a single-rail fallback uses.
+  # DUAL_RDMA_DEVS / DUAL_RDMA_GIDS below list every rail.
 
   # Role-specific host/worker IP mapping. From the HOST's perspective
   # DUAL_WORKER_HOST is the peer. From the SECONDARY's perspective
@@ -1840,6 +1982,9 @@ EOF
 DUAL_ROLE=$role
 DUAL_IFACE=$IFACE
 DUAL_RDMA_DEV=$RDMA_DEV
+DUAL_RDMA_GID=$RDMA_GID
+DUAL_RDMA_DEVS=$RDMA_DEVS
+DUAL_RDMA_GIDS=$RDMA_GIDS
 DUAL_RDMA_PORT=$RDMA_PORT
 DUAL_HOST_IP=$HOST_IP
 DUAL_WORKER_HOST=$WORKER_HOST
