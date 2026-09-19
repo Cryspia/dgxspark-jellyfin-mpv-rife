@@ -222,6 +222,15 @@ install_apt_packages() {
     libayatana-appindicator3-1
     # GNOME extension for showing tray icons in the top bar
     gnome-shell-extension-appindicator
+    # CJK faces for shim 3's in-mpv library browser. It draws its own
+    # text with PIL (jellyfin_mpv_shim/mpvtk/pilfont.py) rather than
+    # through fontconfig, from a fixed candidate list — and the only
+    # entries on that list this distro can satisfy are the two files
+    # fonts-noto-cjk ships. Without it every CJK title in the browser
+    # renders as tofu, no matter what fontconfig would have picked.
+    # Independent of osc_style: the browser is on whenever enable_gui
+    # is, which is shim's default.
+    fonts-noto-cjk
   )
   local missing=()
   for p in "${needed[@]}"; do
@@ -1055,17 +1064,37 @@ if os.path.exists(p):
 data["mpv_ext"] = True
 data["mpv_ext_path"] = "$ENV_PREFIX/bin/mpv"
 # Which OSC runs. Shim 3 replaced the old thumbnail_osc_builtin boolean
-# with osc_style, and its own default is "mpvtk" — the new in-window HUD
-# drawn by the library browser. We seed "mpv" instead: that is mpv's own
-# OSC, loaded by shim after construction so it can still draw trickplay
-# previews, i.e. what this box was already doing before the 3.0 bump.
-# Keeping the bump behaviour-neutral matters because the OSC is where
-# this project's own bindings live (scripts/sr_keys.lua) — switch to
-# "mpvtk" from shim's settings UI if you want the new HUD.
+# with osc_style; we take its default, "mpvtk" — the in-window HUD the
+# library browser draws. The 3.0 bump seeded "mpv" (mpv's own OSC) for
+# one release while the interaction with this project was unverified.
+# It now is:
+#   • Key bindings survive. mpvtk claims keys through keysweep, which
+#     only recognises pause / seek / fullscreen and only takes a key
+#     already bound to one of them. scripts/sr_keys.lua binds F8 / F9 /
+#     Shift+F8 / Shift+F9 to script-messages, which keysweep's action()
+#     does not parse, so they are never claimed.
+#   • Trickplay previews survive — mpvtk draws its own (mpvtk/widgets.py,
+#     mpvtk_browser/hud.py), which is why "mpv" existed only to keep
+#     them while the HUD was not in use.
+#   • Playback cost is nil. The HUD redraws on a dirty flag into an
+#     overlay-add BGRA buffer, not per frame, so a hidden HUD costs
+#     nothing on a chain this fps-sensitive.
+# CJK titles need fonts-noto-cjk — see the apt list for why fontconfig
+# does not cover it.
 #
 # setdefault, not assignment: shim's settings UI writes this same file,
-# so a reinstall must not stamp on a deliberate choice.
-data.setdefault("osc_style", "mpv")
+# so a reinstall must not stamp on a deliberate choice. An install that
+# still carries the one-release "mpv" seed keeps it; change it in shim's
+# settings UI, or delete the key and re-run install.
+data.setdefault("osc_style", "mpvtk")
+# Come up in the tray, not on screen. Step 10 installs an autostart
+# entry, so shim is launched at login — and shim 3 shares one window
+# between the library browser and the player, so without this the
+# browser takes over the display every time the user logs in, before
+# they have asked for anything. The tray icon is the way back
+# (close_to_tray defaults on, and the apt list above installs the
+# AppIndicator pieces that make a tray exist on GNOME).
+data.setdefault("start_minimized", True)
 # Drop the 2.x key. Shim 3 only logs "Config item ... was ignored" for
 # it, but leaving it invites someone to edit a setting that does nothing.
 data.pop("thumbnail_osc_builtin", None)
@@ -1446,7 +1475,7 @@ cmd_status() {
 
   section "apt packages"
   for p in libxpresent-dev gir1.2-ayatanaappindicator3-0.1 libayatana-appindicator3-1 \
-           gnome-shell-extension-appindicator build-essential; do
+           gnome-shell-extension-appindicator build-essential fonts-noto-cjk; do
     if dpkg -s "$p" >/dev/null 2>&1; then
       printf "  %-42s %s\n" "$p" "$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)"
     else
