@@ -38,6 +38,33 @@ much lower on U/V than real video does. Numbers are only comparable
 across runs of the **same** clip; re-baseline whenever the clip
 changes.
 
+## 2026-09-19 — multi-rail transport
+
+Re-measured after the transport moved from one RDMA device to one per
+rail (striped across both; see `dual_machine/README.md`). Same host,
+same clip, `SKIP_SINGLE=1 N=200 CF=24`; dispatcher fps is the
+comparable figure because wall fps still carries fixed init cost and
+N differs from the baseline run below.
+
+| mode | dispatcher fps, single rail (2026-06-10) | dispatcher fps, two rails |
+|---|---:|---:|
+| dual            | 94.9 – 99.8   | 105.6 |
+| dual\_no\_sr     | 152.8 – 156.1 | 155.5 |
+| dual\_no\_interp | 145.1 – 146.6 | 159.6 |
+
+`bench/color.sh` over the same build (`N=20`, `CF=2`) — unchanged
+within the RIFE cross-GPU non-determinism the baseline already
+documents, and `no_interp` matches to every printed decimal:
+
+| pair | Y | U | V | overall | baseline overall |
+|---|---:|---:|---:|---:|---:|
+| full       | 57.96 | 49.90 | 48.98 | 53.12 | 53.22 |
+| no\_sr      | 60.78 | 47.14 | 47.37 | 51.66 | 51.71 |
+| no\_interp  | 63.79 | 37.69 | 36.56 | 41.84 | 41.84 |
+
+Fabric capacity for reference (`ib_write_bw`, `-q 8 -s 65536 -D 15`):
+98.01 Gb/s per rail, 196.02 Gb/s both in parallel.
+
 ## bench/fps.sh — sustained throughput
 
 `N=400`, `CF=24`, bf=2, 1080p source → 4K output. `wall` includes

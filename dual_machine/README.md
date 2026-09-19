@@ -27,10 +27,14 @@ overlapping work. See [§ Components](#components) for the breakdown.
 ## Requirements
 
 - **Two DGX Spark boxes** (GB10, ARM64, Ubuntu 24.04, CUDA 13).
-- **200 G RoCE link** between them — the CX7 NIC on each Spark has
-  two PCIe devices that share one 200 G port; both rails must be
-  reachable. Static IPs on the link (no DHCP); the install script
-  prompts for self-IP + peer-IP and writes them to a config file.
+- **RoCE link** between them. Reaching 200 Gb/s on the CX7 means
+  driving two PCIe paths at once, so the fabric addresses two rails
+  (`enp1s0f0np0` and `enP2p1s0f1np1`, each in its own /24) on separate
+  paths — not a bond. This pipeline drives one rail, so it runs at
+  ~98 Gb/s; see
+  [Why the link runs at ~98 Gb/s, not 200](#why-the-link-runs-at-98-gbs-not-200).
+  Static IPs on the link (no DHCP); the install script prompts for
+  self-IP + peer-IP and writes them to a config file.
 - **Identical software**: same conda env, same `install.sh` build of
   mpv / vapoursynth / vsrife / fsrcnnx-cudnn. The host's `install.sh
   install --dual-host` writes the full stack; the worker's
@@ -243,6 +247,117 @@ below the output rate and mpv stutters.
 | **lua side-channel for seek / shutdown events** | mpv vapoursynth API surfacing them to the filter | mpv's vf API doesn't expose seek or exit events to the filter, so the dispatcher can't see them from inside python. `scripts/dual_seek_flush.lua` writes `/tmp/dual_machine_seek_epoch` on `seeking` property going true (fires before vf teardown, so parked compute() threads unpark in time) and `/tmp/dual_machine_shutdown` on the `shutdown` event (mpv's embedded python doesn't fire atexit, so this is the only reliable close hook) |
 | **inotify-driven seek-flush watcher** | 100 ms poll loop | the watcher blocks on `inotify_init1` + `os.read` (ctypes, no extra dep). lua's file write wakes it in microseconds vs the polling path's ~50 ms average — felt as instant on a progress-bar drag instead of a noticeable freeze |
 | **wait_phase_done returns silently on timeout** | raises RuntimeError | a python exception out of `compute_callable` becomes a vapoursynth filter error, which mpv treats as fatal and exits the process. Return silently (and let mpv display whatever was in the dst VA — usually black, replaced within a couple of vsyncs by the next frame) so a worker stall or trailing-K corner case never crashes playback |
+
+## Why the link runs at ~98 Gb/s, not 200
+
+The fabric is 200 Gb/s per node. This pipeline uses half of it, and
+that is a property of the transport, not of the config or the cabling.
+
+### What the CX7 actually looks like
+
+A DGX Spark has **one** ConnectX-7 ASIC — all four PCI functions report
+the same `phys_switch_id` — with two physical ports. It attaches to the
+host over **two PCIe5 x4 root complexes**, and each port is exposed on
+*both* of them (socket direct). So the four netdevs are 2 ports x 2
+PCIe paths, not four ports:
+
+| netdev | PCI function | `devlink` port | PCIe path |
+|---|---|---|---|
+| `enp1s0f0np0` | `0000:01:00.0` | port 0 | A |
+| `enP2p1s0f0np0` | `0002:01:00.0` | port 0 | B |
+| `enp1s0f1np1` | `0000:01:00.1` | port 1 | A |
+| `enP2p1s0f1np1` | `0002:01:00.1` | port 1 | B |
+
+Two facts set the ceiling:
+
+- **Each port is 200G-capable.** `ethtool` advertises
+  `200000baseCR4/Full` and `200000baseCR2/Full`. The ports negotiate
+  100 Gb/s here only because the DACs and switch ports are QSFP28 100G
+  (`ethtool -m` reports `Identifier: QSFP28`, `100G Base-CR4`).
+- **Each PCIe path is x4 at 32 GT/s** (`LnkSta: Speed 32GT/s, Width
+  x4`) — about 128 Gb/s raw. One path cannot carry 200G. That is the
+  entire reason the NIC is wired to two root complexes.
+
+So **200 Gb/s always means driving two PCIe paths in parallel**, i.e.
+two rdma devices. How many cables are plugged in is an independent
+choice — both of these reach 200 Gb/s:
+
+- one 200G cable in port 0, driven by `enp1s0f0np0` (path A) +
+  `enP2p1s0f0np0` (path B);
+- two 100G cables, driven by one netdev per port on *different* paths.
+
+What is never possible is 200 Gb/s through a single netdev, a single
+PCIe path, or a single QP.
+
+This fabric uses the two-cable form because the switch and DACs are
+100G. It addresses `enp1s0f0np0` (port 0, path A) and `enP2p1s0f1np1`
+(port 1, path B) and leaves the other two without an IP: their port's
+wire is already saturated by the path that owns it. Pairing
+`enp1s0f0np0` with `enp1s0f1np1` instead would put both rails on path A
+and cap the node near 100 Gb/s.
+
+A bond does not change this. mlx5 hardware RoCE LAG only forms between
+PFs of the *same* PCI device — two netdevs behind one PCIe path, which
+adds no PCIe bandwidth — and RoCE LAG hashes per QP, so a single QP
+lands on a single port either way. Bonding across the two root
+complexes gives a plain Linux bond with no bonded RDMA device, and RoCE
+falls back to one port.
+
+### How the transport uses them
+
+`guest_mp.py` (host) and `worker_3proc.py` (worker) open one
+`RDMAContext` and one RC QP per rail, and split every transfer across
+them.
+
+Rails come from `DUAL_RDMA_DEVS` / `DUAL_RDMA_GIDS` (host) and
+`WMP_RDMA_DEVS` / `WMP_RDMA_GIDS` (worker), both comma-separated and
+both written by `install.sh`, which enumerates the rails at config
+time. Rail *r* handshakes on TCP `DUAL_RDMA_PORT + r`, so a two-rail
+install uses 29900 and 29901. Unset — or a single entry — gives the
+single-rail transport, unchanged from before multi-rail existed; that
+is the fallback if a rail misbehaves.
+
+The two directions split differently, because they use different verbs:
+
+- **worker → host** is `RDMA WRITE_WITH_IMM`. The sender picks the
+  remote address, so a range can be cut anywhere and the pieces
+  reassemble at the destination. The `imm` carries `(slot, stage,
+  part, n_parts)`; the host runs a writeback only once it has counted
+  `n_parts` arrivals for that `(slot, stage)`. Writes under 1 MB go
+  whole onto one rail, rotating so a stream of them still spreads.
+- **host → worker** is `SEND`/`RECV`. A message lands at the start of
+  the next pre-posted recv WR on that QP, so the cut points are fixed
+  in advance (`src_partition`) and the per-rail recv queues must stay
+  in lockstep. Every message therefore posts exactly one piece per
+  rail — zero-length on a rail whose window holds no bytes — and the
+  host's `io_lock` keeps message order identical on all rails. Skipping
+  a rail for a short message would desynchronise its queue and land
+  every later message in the wrong slot's buffer.
+
+An MR belongs to one PD, so every staging buffer, the `cc_cache` region
+and the worker's slot ring are registered once per rail
+(`MultiRailBuffer`). The dispatcher still builds SGEs with rail 0's
+lkey; `notify_submit` remaps them per rail.
+
+Link capacity, `ib_write_bw` between two nodes (2026-09-19, `-q 8
+-s 65536 -D 15`):
+
+| | Gb/s |
+|---|---|
+| rail 0 alone (`rocep1s0f0`) | 98.01 |
+| rail 1 alone (`roceP2p1s0f1`) | 98.01 |
+| both in parallel | 196.02 |
+
+Measured on the striped `SEND` path with the pipeline's real message
+sizes (CCSR 6.2 MB, SR_INTERP 12.4 MB, INTERP 58.5 MB, 4 slots,
+60 messages, 2026-09-19): **156 Gb/s**, against a single rail's 98.
+It is not 196 because a message shorter than rail 0's window lands
+entirely on rail 0 — the windows are fixed, which is what SEND/RECV
+requires. Only INTERP spans both rails, and INTERP is ~92 % of the
+bytes in this direction, so the imbalance costs little. The
+`WRITE_WITH_IMM` direction has no such constraint and splits every
+range evenly.
+
 
 ## `VK_LAYER_PRIORITY_BOOST`
 

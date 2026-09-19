@@ -65,7 +65,9 @@ from typing import Optional, Callable
 sys.path.insert(0, "/usr/lib/python3/dist-packages")
 
 from rdma_transport import (
-    RDMAContext, RDMAStagingBuffer, RDMAChannel,
+    RDMAContext, RDMAStagingBuffer, RDMAChannel, MultiRailBuffer,
+    resolve_rails, src_partition, stripe, imm_encode, imm_decode,
+    STAGE_FINAL,
     _ZC_HEADER_INT64,
     _HDR_PAIR_K, _HDR_PHASE, _HDR_SRC_A, _HDR_SRC_B,
     _HDR_TASK_TYPE, _HDR_TASK_ID,
@@ -91,19 +93,14 @@ _WR_SEND_DONE = 0x10000      # host → worker SRC bundle send completion
 _WR_RECV_IMM  = 0x40000      # worker → host WRITE_WITH_IMM completion
 _WR_MASK_SLOT = 0xFFFF
 
-# imm_data encoding: bits 0-15 = slot, bits 16-19 = stage_code (4 bits).
+# imm_data layout (slot / stage_code / part / n_parts) is defined in
+# rdma_transport so guest_mp and worker_3proc cannot drift apart.
 # stage_code semantics:
 #   0..14  → mid stage_idx k (== stage_code). mult=N uses 0..N-3.
 #   15     → final (terminal task write, fires task_done downstream).
-# 4 bits gives mult ≤ 16 headroom — well past any practical RIFE
-# temporal multiplier.
-_STAGE_FINAL = 15
-
-def _imm_encode(slot: int, stage_code: int) -> int:
-    return (slot & 0xFFFF) | ((stage_code & 0xF) << 16)
-
-def _imm_decode(imm: int) -> tuple[int, int]:
-    return (imm & 0xFFFF, (imm >> 16) & 0xF)
+_STAGE_FINAL = STAGE_FINAL
+_imm_encode = imm_encode
+_imm_decode = imm_decode
 
 
 # Slot lifecycle states (just for diagnostics — actual state lives
@@ -190,7 +187,9 @@ class GuestMP:
         self.task_fail_fn = task_fail_fn
         # Set by register_cc_cache(); None = zero-copy sends unavailable.
         self._cc_mr = None
+        self._cc_mrs: list = []
         self.cc_lkey: "int | None" = None
+        self.cc_lkeys: list = []
         # Optional callback (task_id, stage_idx) → None. Fires when
         # the mid SEND for a two-stage producer arrives. Lets queue_mgr
         # unblock downstream INTERP before the FULL stage completes.
@@ -282,53 +281,88 @@ class GuestMP:
             TT_SR_INTERP: self._hdr_bytes + self._interp_dst_rgb_bytes,
         }
 
-        # ── RDMA setup ──────────────────────────────────────────────
-        log(f"[guest_mp] opening RDMA context dev={rdma_dev}")
-        self.ctx = RDMAContext(dev_name=rdma_dev, port=rdma_port,
-                                gid_index=rdma_gid_index,
-                                max_cqe=max(128, 8 * n_slots))
+        # ── RDMA setup (one context + one QP per rail) ──────────────
+        # 200 Gb/s on a CX7 needs two PCIe paths driven at once, and a
+        # context is one PCI function, so a rail here == a context ==
+        # a QP. DUAL_RDMA_DEVS lists them; unset keeps the single-rail
+        # config, which is the old behaviour byte for byte.
+        self.rails = resolve_rails(os.environ.get("DUAL_RDMA_DEVS"),
+                                    os.environ.get("DUAL_RDMA_GIDS"),
+                                    fallback_dev=rdma_dev,
+                                    fallback_gid=rdma_gid_index)
+        self.n_rails = len(self.rails)
+        log(f"[guest_mp] opening {self.n_rails} RDMA context(s): "
+            f"{[d for d, _ in self.rails]}")
+        self.ctxs = [RDMAContext(dev_name=d, port=rdma_port, gid_index=g,
+                                  max_cqe=max(128, 8 * n_slots))
+                     for d, g in self.rails]
+        self.ctx = self.ctxs[0]
 
-        # Per-slot send + recv buffers (pageable, ibv-pinned for DMA).
-        # See class docstring "Memory budget per slot" for rationale.
+        # Per-slot send + recv buffers. One allocation each, registered
+        # once per rail — an MR belongs to a single PD, so N rails mean
+        # N registrations of the same pages.
         self.send_bufs = []
         self.recv_bufs = []
         for s in range(n_slots):
-            self.send_bufs.append(RDMAStagingBuffer(self.ctx, self.src_size))
-            self.recv_bufs.append(RDMAStagingBuffer(self.ctx, self.dst_size))
+            self.send_bufs.append(MultiRailBuffer(self.ctxs, self.src_size))
+            self.recv_bufs.append(MultiRailBuffer(self.ctxs, self.dst_size))
 
-        # WRITE_WITH_IMM unified protocol: worker RDMA WRITEs the dst
-        # bundle directly into our recv_bufs[i] at known offsets with
-        # imm = encode(slot, stage). No SEND/RECV recv-queue ordering
-        # involved → multi-slot mixed-task safe. Pack per-slot
-        # (addr, rkey) into the handshake extra payload so the worker
-        # knows where to write.
-        # Wire format: u32 n_slots, then n_slots × (u64 addr, u32 rkey).
-        _extra = struct.pack("!I", n_slots)
+        # Fixed per-rail split of slot.src. The worker pre-posts one
+        # recv per rail at these offsets, so both ends must derive the
+        # same partition — it goes over the wire in the blob below
+        # rather than being recomputed from assumptions.
+        self.src_parts = src_partition(self.src_size, self.n_rails)
+
+        # Handshake blob (rail 0 carries everything; later rails only
+        # need to pair QPs). Layout:
+        #   u32 n_rails, u32 n_slots,
+        #   n_slots × u64 addr,
+        #   n_rails × n_slots × u32 rkey
+        # The worker RDMA WRITEs dst bundles into recv_bufs[slot]; the
+        # address is rail-independent, the rkey is not.
+        _extra = struct.pack("!II", self.n_rails, n_slots)
         for s in range(n_slots):
-            _extra += struct.pack("!QI", self.recv_bufs[s].addr,
-                                   self.recv_bufs[s].rkey)
+            _extra += struct.pack("!Q", self.recv_bufs[s].addr)
+        for r in range(self.n_rails):
+            for s in range(n_slots):
+                _extra += struct.pack("!I", self.recv_bufs[s].rkeys[r])
 
-        # QP — client (mpv side) connects to guest worker's server.
-        log(f"[guest_mp] connecting to {peer_ip}:{peer_handshake_port}")
-        self.ch = RDMAChannel(self.ctx, is_server=False,
-                               peer_ip=peer_ip,
-                               peer_port=peer_handshake_port,
-                               max_wr=4 * n_slots,
-                               extra_payload=_extra)
-        log(f"[guest_mp] RDMA QP RTS")
+        # QPs — client (mpv side) connects to the worker's listeners,
+        # one port per rail so a rail can fail to come up on its own
+        # without corrupting another rail's handshake.
+        self.chs = []
+        for r in range(self.n_rails):
+            port = peer_handshake_port + r
+            log(f"[guest_mp] rail{r} connecting to {peer_ip}:{port}")
+            self.chs.append(RDMAChannel(
+                self.ctxs[r], is_server=False,
+                peer_ip=peer_ip, peer_port=port,
+                max_wr=8 * n_slots,
+                extra_payload=_extra if r == 0 else b""))
+        self.ch = self.chs[0]
+        log(f"[guest_mp] {self.n_rails} RDMA QP(s) RTS")
 
-        # Dummy recv pool. WRITE_WITH_IMM consumes one recv WR per IMM
-        # event on this side; the WR's local SGE is unused (data lands
-        # at the remote-addr the worker chose, which IS our
-        # recv_bufs[slot] + offset). Pre-post against a tiny dummy MR
-        # and refill on each completion. Pool size = 2 × n_slots + 2
-        # (two-stage tasks have mid + full in flight, plus slack).
-        self._dummy_recv_buf = RDMAStagingBuffer(self.ctx, 16)
+        # Dummy recv pool, per rail. WRITE_WITH_IMM consumes one recv
+        # WR per IMM event on the rail it arrived on; the WR's local
+        # SGE is unused (data lands at the remote-addr the worker
+        # chose, which IS our recv_bufs[slot] + offset). A striped
+        # write delivers one IMM per rail, so each rail needs the same
+        # depth the single-rail build used.
+        self._dummy_recv_bufs = [RDMAStagingBuffer(c, 16) for c in self.ctxs]
+        self._dummy_recv_buf = self._dummy_recv_bufs[0]
         self._mid_imm_pool_size = 2 * n_slots + 2
-        for _ in range(self._mid_imm_pool_size):
-            self.ch.post_recv_at(self._dummy_recv_buf.addr, 16,
-                                  self._dummy_recv_buf.lkey,
-                                  wr_id=_WR_RECV_IMM)
+        for r in range(self.n_rails):
+            for _ in range(self._mid_imm_pool_size):
+                self.chs[r].post_recv_at(self._dummy_recv_bufs[r].addr, 16,
+                                          self._dummy_recv_bufs[r].lkey,
+                                          wr_id=_WR_RECV_IMM)
+
+        # Striped writes land as N IMMs that can arrive on any rail in
+        # any order. Count them per (slot, stage_code) and only run the
+        # writeback once the last part is in — acting on the first
+        # would hand mpv a half-written frame.
+        self._imm_parts: dict = {}
+        self._imm_lock = threading.Lock()
 
         # ── slot bookkeeping ────────────────────────────────────────
         self._lock = threading.Lock()
@@ -442,14 +476,22 @@ class GuestMP:
         (~5 GB/s) cudaHostRegister'd read path. Returns True on
         success; on failure callers keep using the memmove path."""
         try:
-            self._cc_mr = self.ctx.register_region(addr, length)
-            self.cc_lkey = self._cc_mr.lkey
+            # One MR per rail over the same pages — the dispatcher hands
+            # us SGEs tagged with rail 0's lkey and notify_submit remaps
+            # them per rail, so native_dispatcher stays rail-unaware.
+            self._cc_mrs = [c.register_region(addr, length)
+                            for c in self.ctxs]
+            self._cc_mr = self._cc_mrs[0]
+            self.cc_lkeys = [m.lkey for m in self._cc_mrs]
+            self.cc_lkey = self.cc_lkeys[0]
             self.log(f"[guest_mp] cc_cache region registered for "
                       f"zero-copy sends ({length/1e6:.0f} MB, "
-                      f"lkey={self.cc_lkey})")
+                      f"lkeys={self.cc_lkeys})")
             return True
         except Exception as e:
+            self._cc_mrs = []
             self._cc_mr = None
+            self.cc_lkeys = []
             self.cc_lkey = None
             self.log(f"[guest_mp] cc_cache MR registration failed "
                       f"({type(e).__name__}: {e}) — falling back to "
@@ -499,15 +541,61 @@ class GuestMP:
         # recv_bufs[slot] at the correct offset; the dummy-recv pool
         # pre-posted at __init__ catches IMM events. notify_submit
         # only needs to post the SRC SEND (host → worker direction).
+        #
+        # Striping this direction is constrained: a SEND lands at the
+        # start of the next pre-posted recv WR on that QP, so the cut
+        # points are fixed (self.src_parts) and EVERY message must post
+        # exactly one piece per rail. Skipping a rail for a short
+        # message would desynchronise that rail's recv queue and every
+        # later message would land in the wrong slot's buffer — hence
+        # the zero-length sends. The io_lock keeps message order
+        # identical on all rails, which is what makes the queues track
+        # each other in the first place.
+        buf = self.send_bufs[slot]
+        if payload_sges is None:
+            wire = [(buf.addr, send_len, buf.lkey)]
+        else:
+            wire = [(buf.addr, self._hdr_bytes, buf.lkey)]
+            wire.extend(payload_sges)
+        lkey_map = {buf.lkeys[0]: buf.lkeys}
+        if self.cc_lkeys:
+            lkey_map[self.cc_lkeys[0]] = self.cc_lkeys
+        per_rail = self._split_wire(wire, lkey_map)
         with self._io_lock:
-            if payload_sges is None:
-                self.ch.post_send(self.send_bufs[slot], send_len,
-                                   wr_id=_WR_SEND_DONE | slot)
-            else:
-                sges = [(self.send_bufs[slot].addr, self._hdr_bytes,
-                         self.send_bufs[slot].lkey)]
-                sges.extend(payload_sges)
-                self.ch.post_send_sgl(sges, wr_id=_WR_SEND_DONE | slot)
+            for r in range(self.n_rails):
+                rail_sges = per_rail[r]
+                if not rail_sges:
+                    # Zero-length SEND: consumes this rail's next recv
+                    # WR without moving bytes, keeping the queues aligned.
+                    self.chs[r].post_send_at(buf.addr, 0, buf.lkeys[r],
+                                              wr_id=_WR_SEND_DONE | slot)
+                else:
+                    self.chs[r].post_send_sgl(
+                        rail_sges, wr_id=_WR_SEND_DONE | slot)
+
+    def _split_wire(self, wire: list, lkey_map: dict) -> list:
+        """Cut the gathered wire message at self.src_parts boundaries.
+
+        `wire` is [(addr, len, lkey), ...] in wire order; the result is
+        one SGE list per rail, with each SGE's lkey swapped for that
+        rail's key (an lkey is only valid on the PD that issued it).
+        An SGE straddling a boundary is split in two.
+        """
+        per_rail = [[] for _ in range(self.n_rails)]
+        for r, (ro, rl) in enumerate(self.src_parts):
+            r_end = ro + rl
+            pos = 0
+            for addr, ln, lkey in wire:
+                seg_end = pos + ln
+                lo = max(pos, ro)
+                hi = min(seg_end, r_end)
+                if hi > lo:
+                    keys = lkey_map.get(lkey)
+                    per_rail[r].append(
+                        (addr + (lo - pos), hi - lo,
+                         keys[r] if keys else lkey))
+                pos = seg_end
+        return per_rail
 
     # ── CQ poll thread + writeback ─────────────────────────────────
 
@@ -530,54 +618,87 @@ class GuestMP:
         while True:
             if self._closed:
                 return
-            try:
-                n, wcs = self.ctx.cq.poll(8)
-            except Exception as exc:
-                self.log(f"[guest_mp-cq] poll failed: {exc}")
-                time.sleep(0.001)
-                continue
-            if n == 0:
+            got = 0
+            # Each rail has its own CQ. A striped write's parts land on
+            # different CQs in no particular order, so drain them all
+            # before deciding the loop was idle.
+            for rail in range(self.n_rails):
+                try:
+                    n, wcs = self.ctxs[rail].cq.poll(8)
+                except Exception as exc:
+                    self.log(f"[guest_mp-cq] rail{rail} poll failed: {exc}")
+                    time.sleep(0.001)
+                    continue
+                if n == 0:
+                    continue
+                got += n
+                self._drain_wcs(rail, wcs, n)
+            if got == 0:
                 idle_polls += 1
                 time.sleep(0.0001 if idle_polls < 20 else 0.001)
                 continue
             idle_polls = 0
-            for wc in wcs[:n]:
-                if wc.status != 0:
-                    # A failed SEND (QP error / flush) means the slot's
-                    # task will never produce a response — recover the
-                    # slot and report the task failed so queue_mgr
-                    # doesn't leave it RUNNING forever (the old code
-                    # just logged; 4 such errors leaked every slot and
-                    # wedged the guest dispatcher). RECV_IMM flushes
-                    # carry no slot of their own.
-                    self.log(f"[guest_mp-cq] wc.status={wc.status} "
-                              f"wr_id={hex(wc.wr_id)}")
-                    op = wc.wr_id & ~_WR_MASK_SLOT
-                    if op == _WR_SEND_DONE:
-                        self._fail_slot(int(wc.wr_id & _WR_MASK_SLOT),
-                                        "rdma send error "
-                                        f"status={wc.status}")
-                    continue
+
+    def _drain_wcs(self, rail: int, wcs, n: int) -> None:
+        for wc in wcs[:n]:
+            if wc.status != 0:
+                # A failed SEND (QP error / flush) means the slot's
+                # task will never produce a response — recover the
+                # slot and report the task failed so queue_mgr
+                # doesn't leave it RUNNING forever (the old code
+                # just logged; 4 such errors leaked every slot and
+                # wedged the guest dispatcher). RECV_IMM flushes
+                # carry no slot of their own.
+                self.log(f"[guest_mp-cq] rail{rail} wc.status={wc.status} "
+                          f"wr_id={hex(wc.wr_id)}")
                 op = wc.wr_id & ~_WR_MASK_SLOT
                 if op == _WR_SEND_DONE:
+                    self._fail_slot(int(wc.wr_id & _WR_MASK_SLOT),
+                                    "rdma send error "
+                                    f"status={wc.status}")
+                continue
+            op = wc.wr_id & ~_WR_MASK_SLOT
+            if op == _WR_SEND_DONE:
+                continue
+            if op == _WR_RECV_IMM:
+                # WRITE_WITH_IMM landed in recv_bufs[slot] at the
+                # offset the worker chose. Decode (slot, stage_code,
+                # part, n_parts) and refill THIS rail's dummy-recv pool
+                # — a recv WR is consumed on the QP the IMM arrived on.
+                # stage_code < _STAGE_FINAL ⇒ a mid stage (stage_idx
+                # == stage_code, 0..N-3 for mult=N). stage_code ==
+                # _STAGE_FINAL ⇒ terminal write → task_done flows.
+                slot, stage_code, _part, n_parts = _imm_decode(
+                    int(wc.imm_data))
+                self.chs[rail].post_recv_at(
+                    self._dummy_recv_bufs[rail].addr, 16,
+                    self._dummy_recv_bufs[rail].lkey,
+                    wr_id=_WR_RECV_IMM)
+                if not self._parts_complete(slot, stage_code, n_parts):
                     continue
-                if op == _WR_RECV_IMM:
-                    # WRITE_WITH_IMM landed in recv_bufs[slot] at the
-                    # offset the worker chose. Decode (slot, stage_code)
-                    # from imm_data and refill the dummy-recv pool.
-                    # stage_code < _STAGE_FINAL ⇒ a mid stage (stage_idx
-                    # == stage_code, 0..N-3 for mult=N). stage_code ==
-                    # _STAGE_FINAL ⇒ terminal write → task_done flows.
-                    slot, stage_code = _imm_decode(int(wc.imm_data))
-                    self.ch.post_recv_at(self._dummy_recv_buf.addr, 16,
-                                          self._dummy_recv_buf.lkey,
-                                          wr_id=_WR_RECV_IMM)
-                    if stage_code == _STAGE_FINAL:
-                        self._handle_recv(slot)
-                    else:
-                        self._handle_mid_recv(slot, stage_code)
-                    continue
-                self.log(f"[guest_mp-cq] unknown wr_id {hex(wc.wr_id)}")
+                if stage_code == _STAGE_FINAL:
+                    self._handle_recv(slot)
+                else:
+                    self._handle_mid_recv(slot, stage_code)
+                continue
+            self.log(f"[guest_mp-cq] rail{rail} unknown wr_id "
+                      f"{hex(wc.wr_id)}")
+
+    def _parts_complete(self, slot: int, stage_code: int,
+                         n_parts: int) -> bool:
+        """True when every part of this (slot, stage) striped write has
+        landed. Single-part writes (n_parts == 1) short-circuit, so the
+        single-rail path pays nothing for this."""
+        if n_parts <= 1:
+            return True
+        key = (slot, stage_code)
+        with self._imm_lock:
+            got = self._imm_parts.get(key, 0) + 1
+            if got < n_parts:
+                self._imm_parts[key] = got
+                return False
+            self._imm_parts.pop(key, None)
+        return True
 
     def _handle_mid_recv(self, slot: int, stage_idx: int) -> None:
         """A mid-stage WRITE_WITH_IMM landed. Memmove the stage's bytes
@@ -801,6 +922,13 @@ class GuestMP:
         the slot to the free list."""
         if not (0 <= slot < len(self._state)):
             return
+        # Drop any half-counted striped write for this slot. Leaving a
+        # partial count behind would make the NEXT task on this slot
+        # fire its writeback one part early, handing mpv a frame whose
+        # second half is still in flight.
+        with self._imm_lock:
+            for k in [k for k in self._imm_parts if k[0] == slot]:
+                self._imm_parts.pop(k, None)
         tid = 0
         with self._cv:
             t = self._task[slot]

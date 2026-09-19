@@ -145,6 +145,163 @@ class RDMAStagingBuffer:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Multi-rail support
+#
+# A DGX Spark's CX7 reaches 200 Gb/s only when two PCIe paths are driven
+# at once (see dual_machine/README.md). One RDMAContext is one PCI
+# function, so "use both rails" means: N contexts, N QPs, and every
+# logical transfer split across them.
+#
+# Two asymmetries drive the design:
+#
+#   worker -> host is RDMA WRITE_WITH_IMM. The sender picks the remote
+#   address, so a range can be cut anywhere and the pieces reassemble
+#   themselves. Splitting is free; the only bookkeeping is telling the
+#   receiver how many pieces to expect, which rides in the imm.
+#
+#   host -> worker is SEND/RECV. A message lands at the start of the
+#   next pre-posted recv WR on that QP, so the split points must be
+#   fixed in advance (src_partition) and, critically, the per-rail recv
+#   queues must stay in lockstep: if a message puts a piece on rail 0
+#   but not rail 1, the queues drift and later messages land in the
+#   wrong slot's buffer. Hence every message posts exactly one piece per
+#   rail, zero-length when that rail's range holds no bytes.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def resolve_rails(devs: "str | None", gids: "str | None",
+                   *, fallback_dev: str, fallback_gid: int) -> list[tuple]:
+    """Parse the rail config into [(rdma_dev, gid_index), ...].
+
+    `devs` / `gids` are comma-separated and come from DUAL_RDMA_DEVS /
+    DUAL_RDMA_GIDS (host) or WMP_RDMA_DEVS / WMP_RDMA_GIDS (worker).
+    A short or missing gid list repeats `fallback_gid`. An empty
+    `devs` yields the single-rail config, which is byte-for-byte the
+    old behaviour — that is the safety valve when a rail misbehaves.
+    """
+    if not devs or not devs.strip():
+        return [(fallback_dev, fallback_gid)]
+    dev_list = [d.strip() for d in devs.split(",") if d.strip()]
+    gid_list = [g.strip() for g in (gids or "").split(",") if g.strip()]
+    out = []
+    for i, d in enumerate(dev_list):
+        try:
+            g = int(gid_list[i])
+        except (IndexError, ValueError):
+            g = fallback_gid
+        out.append((d, g))
+    return out
+
+
+def src_partition(total: int, n_rails: int, *, align: int = 4096
+                   ) -> list[tuple[int, int]]:
+    """Fixed [(offset, length), ...] split of a slot's src buffer, one
+    entry per rail. Both ends compute this from values exchanged in the
+    handshake, so they agree without extra wire traffic.
+
+    Used to place the worker's pre-posted recv WRs. Rail r's recv SGE
+    is slot_src_addr + offset_r with length_r, and the host only ever
+    sends rail r the bytes that fall in that window.
+    """
+    if n_rails <= 1:
+        return [(0, total)]
+    step = max(align, (total // n_rails) // align * align)
+    parts = []
+    off = 0
+    for r in range(n_rails):
+        ln = (total - off) if r == n_rails - 1 else min(step, total - off)
+        parts.append((off, max(0, ln)))
+        off += ln
+    return parts
+
+
+def stripe(off: int, size: int, n_rails: int, *,
+            align: int = 4096, min_stripe: int = 1 << 20,
+            rotate: int = 0) -> list[tuple[int, int, int]]:
+    """Cut [off, off+size) into [(rail, sub_off, sub_size), ...].
+
+    Ranges below `min_stripe` are not worth two completions and two
+    doorbells, so they go whole onto one rail, chosen by `rotate` so a
+    stream of small writes still spreads across the fabric.
+    """
+    if n_rails <= 1 or size <= 0:
+        return [(0, off, size)]
+    if size < min_stripe:
+        return [(rotate % n_rails, off, size)]
+    step = max(align, (size // n_rails) // align * align)
+    out = []
+    cur = off
+    end = off + size
+    for r in range(n_rails):
+        sub = (end - cur) if r == n_rails - 1 else min(step, end - cur)
+        out.append((r, cur, max(0, sub)))
+        cur += sub
+    return out
+
+
+# imm_data layout, shared by guest_mp and worker_3proc. Must stay in
+# sync on both ends — that is why it lives here and not in either.
+#   bits  0-15  host slot
+#   bits 16-19  stage_code (0..14 = mid stage_idx, 15 = final)
+#   bits 20-23  part index within the striped write
+#   bits 24-27  part count (1 = not striped)
+STAGE_FINAL = 15
+
+
+def imm_encode(slot: int, stage_code: int,
+                part: int = 0, n_parts: int = 1) -> int:
+    return ((slot & 0xFFFF)
+            | ((stage_code & 0xF) << 16)
+            | ((part & 0xF) << 20)
+            | ((n_parts & 0xF) << 24))
+
+
+def imm_decode(imm: int) -> tuple[int, int, int, int]:
+    """-> (slot, stage_code, part, n_parts). n_parts is clamped to >=1
+    so an imm written by a single-rail peer (which leaves bits 24-27
+    zero) still decodes as one whole part."""
+    return (imm & 0xFFFF,
+            (imm >> 16) & 0xF,
+            (imm >> 20) & 0xF,
+            max(1, (imm >> 24) & 0xF))
+
+
+class MultiRailBuffer:
+    """One host allocation, registered once per rail.
+
+    An MR belongs to exactly one PD, so N rails need N registrations of
+    the same pages. The keys differ per rail; the address does not.
+    Rail 0's keys are exposed as .lkey / .rkey so single-rail callers
+    read unchanged.
+    """
+
+    def __init__(self, ctxs: list, length: int, *,
+                 force_pinned: bool = False):
+        self.length = length
+        use_pinned = force_pinned or os.environ.get("RDMA_PINNED", "0") == "1"
+        self.cpu_t = torch.empty(length, dtype=torch.uint8,
+                                  pin_memory=True) if use_pinned else \
+            torch.empty(length, dtype=torch.uint8)
+        self.addr = self.cpu_t.data_ptr()
+        access = (e.IBV_ACCESS_LOCAL_WRITE |
+                  e.IBV_ACCESS_REMOTE_WRITE |
+                  e.IBV_ACCESS_REMOTE_READ)
+        self.mrs = [MR(c.pd, length, access, address=self.addr)
+                    for c in ctxs]
+        self.lkeys = [m.lkey for m in self.mrs]
+        self.rkeys = [m.rkey for m in self.mrs]
+        self.lkey = self.lkeys[0]
+        self.rkey = self.rkeys[0]
+
+    def view_as(self, dtype, shape):
+        nbytes = int(np.prod(shape) * torch.tensor([], dtype=dtype).element_size())
+        if nbytes > self.length:
+            raise ValueError(
+                f"view_as: {shape} {dtype} = {nbytes} bytes > buffer {self.length}")
+        return self.cpu_t[:nbytes].view(dtype).view(*shape)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Channel: one RC QP between two endpoints
 # ──────────────────────────────────────────────────────────────────────
 
@@ -176,12 +333,22 @@ def _exchange_endpoints(my_qpn: int, my_psn: int, my_gid_raw: bytes,
     head = struct.pack(_HANDSHAKE_FMT, my_qpn, my_psn, my_gid_raw,
                         len(my_extra))
     msg = head + my_extra
+    # Both sides must be inside this window for the QPs to pair up.
+    # 30 s used to be the fixed budget on each side and it is not
+    # enough: with multiple rails each end opens N contexts and
+    # registers N MRs over the slot ring before it reaches the first
+    # handshake, and a cold worker may still be compiling TRT engines.
+    # The failure mode was a bare "cannot reach" that looks like a
+    # network fault. Override with DUAL_HANDSHAKE_TIMEOUT_S.
+    budget = float(os.environ.get("DUAL_HANDSHAKE_TIMEOUT_S", "120"))
     if is_server:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", peer_port))
-        s.listen(1)
-        s.settimeout(30.0)
+        # backlog 1 turns a stray probe (or a peer that reconnects)
+        # into RST for everyone behind it; give the queue some slack.
+        s.listen(16)
+        s.settimeout(budget)
         c, _ = s.accept()
         c.sendall(msg)
         data = _recv_exact(c, struct.calcsize(_HANDSHAKE_FMT))
@@ -190,18 +357,28 @@ def _exchange_endpoints(my_qpn: int, my_psn: int, my_gid_raw: bytes,
         peer_extra = _recv_exact(c, peer_extra_len) if peer_extra_len else b""
         c.close(); s.close()
     else:
-        for _ in range(60):
+        import time as _t
+        deadline = _t.monotonic() + budget
+        last_err = None
+        attempts = 0
+        while _t.monotonic() < deadline:
+            attempts += 1
+            c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 c.settimeout(2.0)
                 c.connect((peer_ip, peer_port))
                 break
-            except OSError:
-                import time; time.sleep(0.5)
+            except OSError as ex:
+                last_err = ex
                 try: c.close()
                 except OSError: pass
+                _t.sleep(0.5)
         else:
-            raise RuntimeError(f"handshake: cannot reach {peer_ip}:{peer_port}")
+            raise RuntimeError(
+                f"handshake: cannot reach {peer_ip}:{peer_port} after "
+                f"{attempts} attempts in {budget:.0f}s "
+                f"(last error: {last_err}) — is the peer's worker up, "
+                f"and does this rail's subnet route to it?")
         c.sendall(msg)
         data = _recv_exact(c, struct.calcsize(_HANDSHAKE_FMT))
         peer_qpn, peer_psn, peer_gid_raw, peer_extra_len = \
