@@ -18,6 +18,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import socket as _sock_mod
 import threading
 import time as _time
 from collections import OrderedDict, deque
@@ -209,6 +210,9 @@ def make_dispatcher(
                     output_scale, downsample_pre, interp_mult, no_sr,
                     variant, matrix_s, color_range, rife_model,
                     chroma_kernel, device)
+    # Set by the INVALIDATE path below: this rebuild is replacing a
+    # session that was alive a moment ago, so the worker is warm.
+    _rebuilding_from_live_session = False
     if _singleton_get is not None:
         with _singleton_lock():
             _st = _singleton_get()
@@ -283,9 +287,28 @@ def make_dispatcher(
                     except Exception: pass
                 _old_lsock = _st.get("liveness_sock")
                 if _old_lsock is not None:
+                    # shutdown() BEFORE close(), and this is the whole
+                    # fix for the F9 freeze. close() only drops OUR fd;
+                    # FIN goes out when the LAST copy of it closes, and
+                    # host_mp's three subprocesses inherited one at
+                    # fork. So the worker's watchdog stayed blocked in
+                    # recv(), the session it was serving never ended,
+                    # it never returned to accept() — and the rebuild's
+                    # fresh connection sat unaccepted in the backlog
+                    # while this side blocked 300 s on the ready byte.
+                    # shutdown() acts on the CONNECTION, not the fd, so
+                    # the FIN leaves immediately however many copies
+                    # are still open.
+                    try: _old_lsock.shutdown(_sock_mod.SHUT_RDWR)
+                    except Exception: pass
                     try: _old_lsock.close()
                     except Exception: pass
                 _st.clear()
+                # The worker needs a moment to notice the FIN, tear its
+                # session down and get back to accept(). Without this
+                # the reconnect below can land in the backlog of a
+                # listener that is still inside the old session.
+                _rebuilding_from_live_session = True
 
     dev = torch.device(device)
     torch.cuda.set_device(dev)
@@ -448,7 +471,20 @@ def make_dispatcher(
     # from scratch on cache miss — minutes). The socket is already
     # keepalive-armed (≈3 s detection of ungraceful disconnect), so a
     # worker crash mid-wait still trips cleanly.
-    _ready_timeout = float(os.environ.get("DUAL_WORKER_READY_TIMEOUT", "300"))
+    # 300 s is sized for a COLD worker, which may be compiling TRT
+    # engines from scratch. A rebuild (F9 mult cycle, resolution
+    # change) is talking to a worker that was serving us seconds ago:
+    # its engines are loaded and it answers in ~3 s. Keeping 300 s
+    # there turns any hiccup in the handover into five minutes of
+    # frozen mpv, because this recv blocks the filter thread — which
+    # is exactly what a mistimed F9 used to look like. Override with
+    # DUAL_WORKER_REBUILD_TIMEOUT if a slow box needs more.
+    if _rebuilding_from_live_session:
+        _ready_timeout = float(os.environ.get(
+            "DUAL_WORKER_REBUILD_TIMEOUT", "30"))
+    else:
+        _ready_timeout = float(os.environ.get(
+            "DUAL_WORKER_READY_TIMEOUT", "300"))
     _liveness_sock.settimeout(_ready_timeout)
     try:
         _r = _liveness_sock.recv(1)
