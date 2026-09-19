@@ -44,26 +44,37 @@ MPV_VERSION="v0.41.0"
 # TRT mixed-precision" (it hard-fails if the patch context vanished),
 # and re-run bench/fps.sh + bench/color.sh.
 #
-# Coupling that caps how far these go (verified 2026-07):
-#   • torch_tensorrt is the ceiling. Its latest (2.12.1) requires
-#     torch<2.13.0 AND tensorrt<10.17.0 — so torch stays on the 2.12.x
-#     line and tensorrt on 10.16.x until torch_tensorrt ships a 2.13
-#     wheel. Bumping torch to 2.13 / tensorrt to 11 leaves no matching
-#     torch_tensorrt and kills the RIFE TRT-compile path.
-#   • TENSORRT 10.16.1.11 is already the newest 10.16.x.
+# Coupling that caps how far these go (verified 2026-09):
+#   • torch_tensorrt moves torch and tensorrt as a set. 2.12.1 wants
+#     torch<2.13.0 + tensorrt<10.17.0; 2.13.0 wants torch 2.13.x +
+#     tensorrt 11.0.x. Never bump one of the three alone — a torch with
+#     no matching torch_tensorrt kills the RIFE TRT-compile path.
+#   • The 2.13 / TRT 11 set is DELIBERATELY NOT TAKEN. It installs and
+#     runs clean, but the RIFE engine it builds is slower on GB10:
+#     INTERP kernel 17.6 -> 20.86 ms (+18.5%), dispatcher fps dual
+#     105.6 -> 96.5 and dual_no_sr 155.5 -> 137.0, while the non-TRT
+#     paths (FSRCNNX cuDNN, CCSR) were unchanged or slightly faster.
+#     Measured 2026-09-19 on this fabric, reproduced across two runs.
+#     Neither knob recovers it: builder optimization_level=5 buys 1.8%
+#     (and 10.5 s of build time), and dropping the mixed-precision
+#     patch below changes nothing (16.34 vs 16.39 ms/frame), so the
+#     patch is not implicated. Re-test when torch_tensorrt ships a
+#     newer TRT 11 pairing; until then 2.12.1 / 10.16.1.11 is faster.
+#   • TENSORRT 10.16.1.11 is the newest 10.16.x.
+#   • vsrife only asks for torch>=2.10.0 — it does not constrain this.
 #   • CUDNN_FE / vsrife / shim tracked to latest at bump time.
 TORCH_VERSION="2.12.1"
 VSRIFE_VERSION="5.7.0"
 TENSORRT_VERSION="10.16.1.11"
 TORCH_TRT_VERSION="2.12.1"
-SHIM_VERSION="2.10.0"
-CUDNN_FE_VERSION="1.26.0"
+SHIM_VERSION="3.0.0"
+CUDNN_FE_VERSION="1.29.0"
 
 # Miniforge installer pin + checksum (aarch64). `releases/latest` made
 # every fresh install a moving target. Find sha256 values in the
 # release's *.sha256 assets when bumping.
-MINIFORGE_VERSION="26.3.2-3"
-MINIFORGE_SHA256="2c113a69297e612b01ca0f320c22a3107a11f2ab9b573d79ac868a175945ce29"
+MINIFORGE_VERSION="26.7.2-0"
+MINIFORGE_SHA256="89b786c8d2c8b0fda7553914c1314ae4ddaa094503802f279377b19ac4463cb2"
 
 # Danmaku plugin — fetched from a sibling project, installed via its own
 # install.py. Pinned to a commit for reproducibility (an upstream push
@@ -231,7 +242,26 @@ install_apt_packages() {
 install_miniforge() {
   section "step 2/10: miniforge + USTC mirrors"
   if [[ -x "$FORGE_DIR/bin/conda" ]]; then
-    log "miniforge already present at $FORGE_DIR"
+    # A pre-existing miniforge used to be left exactly as found, which
+    # made MINIFORGE_VERSION decorative on every box that already had
+    # one: bumping the pin changed nothing until someone wiped
+    # ~/miniforge3, so installs drifted apart silently. Bring base's
+    # conda up to the pin instead. The release tag is
+    # <conda-version>-<build>, so strip the build suffix to get the
+    # conda version that release ships. Only base is touched — the envs
+    # live in their own directories and are not reinstalled.
+    local want_conda="${MINIFORGE_VERSION%-*}"
+    local have_conda
+    have_conda=$("$FORGE_DIR/bin/conda" --version 2>/dev/null | awk '{print $2}')
+    if [[ "$have_conda" == "$want_conda" ]]; then
+      log "miniforge present at $FORGE_DIR (conda $have_conda, matches pin)"
+    else
+      log "miniforge present at $FORGE_DIR — updating base conda ${have_conda:-unknown} → $want_conda"
+      # Not fatal: an out-of-date base still builds a working env, and
+      # failing the whole install over it would be worse than the drift.
+      "$FORGE_DIR/bin/conda" install -n base -y "conda=$want_conda" \
+        || warn "base conda update to $want_conda failed — continuing on ${have_conda:-unknown}"
+    fi
   else
     log "downloading + installing miniforge $MINIFORGE_VERSION to $FORGE_DIR"
     cd /tmp
@@ -472,33 +502,19 @@ apply_patches() {
     [[ -L "$pydir" ]] && continue
     [[ -d "$pydir" ]] || continue
 
-    # jellyfin-mpv-shim's `mpv_options["osc"] = False` is INTENTIONAL and
-    # works correctly on mpv 0.41 — verified via `mpv --no-osc` accepted
-    # + `mpv.MPV(osc=False).osc == False` round-tripped. An earlier patch
-    # here mistakenly rewrote it to `script_opts="osc-visibility=auto"`,
-    # which kept mpv's built-in osc.lua loaded ALONGSIDE shim's
-    # trickplay-osc.lua → both scripts force-bind the "input" section →
-    # trickplay-osc's mouse bindings get shadowed → seekbar/play/pause
-    # unclickable (with hover thumbnails missing if you then disabled
-    # trickplay-osc to fix the click bug). Net: don't patch this. The
-    # shim's original line correctly disables the built-in OSC so
-    # trickplay-osc owns the "input" section uncontested. If a future
-    # mpv release actually removes `--osc`, revisit then. (Reverted in
-    # the commit that ships this comment.)
+    # No shim patch any more. Up to shim 2.x this block undid an old bad
+    # sed of ours against `mpv_options["osc"] = False` in player.py
+    # (rewriting it to script_opts="osc-visibility=auto" left mpv's
+    # osc.lua loaded ALONGSIDE trickplay-osc.lua; both force-bind the
+    # "input" section, so the seekbar stopped taking clicks). Shim 3
+    # deleted that line: which OSC runs is now `osc_style`, resolved in
+    # mpv_options.py, and shim loads exactly one by hand. Nothing left to
+    # repair — the .bak files a pre-3.0 install left behind are stale and
+    # would only reintroduce the 2.x player.py, so they are cleared.
     f="$pydir/site-packages/jellyfin_mpv_shim/player.py"
-    if [[ -f "$f" ]]; then
-      # If a prior install of this script applied the bad sed, restore
-      # the original line so trickplay-osc starts working again. cp -n
-      # in the old patch saved player.py.bak before mangling.
-      if [[ -f "${f}.bak" ]] && grep -q '"script_opts"\] = "osc-visibility' "$f"; then
-        cp -f "${f}.bak" "$f"
-        log "restored $f from .bak (undoing prior bad OSC patch)"
-      fi
-      # Same idea for the second bad patch (gated trickplay on
-      # thumbnail_osc_builtin) — restoring .bak above already covers it
-      # since .bak predates both seds; .bak2 (from the second patch)
-      # already has the first bad patch applied, so prefer .bak.
-    fi
+    for stale in "${f}.bak" "${f}.bak2"; do
+      [[ -f "$stale" ]] && { rm -f "$stale"; log "removed stale $stale (pre-3.0 shim patch backup)"; }
+    done
 
     # Patch vsrife for mixed-precision TRT compile. Default vsrife passes
     # use_explicit_typing=True which forces the whole graph (incl.
@@ -1038,15 +1054,21 @@ if os.path.exists(p):
         data = {}
 data["mpv_ext"] = True
 data["mpv_ext_path"] = "$ENV_PREFIX/bin/mpv"
-# Force thumbnail_osc_builtin=True (= shim default) so trickplay-osc.lua
-# owns the seekbar with hover BIF thumbnails. An earlier install of this
-# script set this to False to work around a click-handling bug; that bug
-# was actually caused by a bad sed in apply_patches (now removed) that
-# kept mpv's built-in osc.lua loaded alongside trickplay-osc.lua, double-
-# binding the "input" section and shadowing trickplay-osc's mouse events.
-# With shim's original `mpv_options["osc"] = False` restored, the
-# built-in OSC is genuinely disabled and trickplay-osc clicks work again.
-data["thumbnail_osc_builtin"] = True
+# Which OSC runs. Shim 3 replaced the old thumbnail_osc_builtin boolean
+# with osc_style, and its own default is "mpvtk" — the new in-window HUD
+# drawn by the library browser. We seed "mpv" instead: that is mpv's own
+# OSC, loaded by shim after construction so it can still draw trickplay
+# previews, i.e. what this box was already doing before the 3.0 bump.
+# Keeping the bump behaviour-neutral matters because the OSC is where
+# this project's own bindings live (scripts/sr_keys.lua) — switch to
+# "mpvtk" from shim's settings UI if you want the new HUD.
+#
+# setdefault, not assignment: shim's settings UI writes this same file,
+# so a reinstall must not stamp on a deliberate choice.
+data.setdefault("osc_style", "mpv")
+# Drop the 2.x key. Shim 3 only logs "Config item ... was ignored" for
+# it, but leaving it invites someone to edit a setting that does nothing.
+data.pop("thumbnail_osc_builtin", None)
 # Shim's default remote_kbps=10000 (= 10 Mbps cap) is sent to the
 # Jellyfin server as MaxStreamingBitrate in the device profile and
 # forces transcode for any > 10 Mbps remote content — typical
