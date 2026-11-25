@@ -173,8 +173,8 @@ def resolve_rails(devs: "str | None", gids: "str | None",
                    *, fallback_dev: str, fallback_gid: int) -> list[tuple]:
     """Parse the rail config into [(rdma_dev, gid_index), ...].
 
-    `devs` / `gids` are comma-separated and come from DUAL_RDMA_DEVS /
-    DUAL_RDMA_GIDS (host) or WMP_RDMA_DEVS / WMP_RDMA_GIDS (worker).
+    `devs` / `gids` are comma-separated and come from CLUSTER_RDMA_DEVS /
+    CLUSTER_RDMA_GIDS (host) or WMP_RDMA_DEVS / WMP_RDMA_GIDS (worker).
     A short or missing gid list repeats `fallback_gid`. An empty
     `devs` yields the single-rail config, which is byte-for-byte the
     old behaviour — that is the safety valve when a rail misbehaves.
@@ -193,7 +193,8 @@ def resolve_rails(devs: "str | None", gids: "str | None",
     return out
 
 
-def src_partition(total: int, n_rails: int, *, align: int = 4096
+def src_partition(total: int, n_rails: int, *, align: int = 4096,
+                  balanced_prefix: int | None = None
                    ) -> list[tuple[int, int]]:
     """Fixed [(offset, length), ...] split of a slot's src buffer, one
     entry per rail. Both ends compute this from values exchanged in the
@@ -202,10 +203,21 @@ def src_partition(total: int, n_rails: int, *, align: int = 4096
     Used to place the worker's pre-posted recv WRs. Rail r's recv SGE
     is slot_src_addr + offset_r with length_r, and the host only ever
     sends rail r the bytes that fall in that window.
+
+    When balanced_prefix is set, place the boundaries within that
+    prefix so its transfers use all rails; the last window still covers
+    the rest of the slot. Both endpoints must negotiate the same layout.
     """
+    if balanced_prefix is not None and not 0 < balanced_prefix <= total:
+        raise ValueError("invalid balanced source prefix")
     if n_rails <= 1:
         return [(0, total)]
-    step = max(align, (total // n_rails) // align * align)
+    if balanced_prefix is None:
+        step = max(align, (total // n_rails) // align * align)
+    else:
+        step = ((balanced_prefix // n_rails) // align * align
+                if balanced_prefix >= align * n_rails
+                else max(1, balanced_prefix // n_rails))
     parts = []
     off = 0
     for r in range(n_rails):
@@ -324,7 +336,8 @@ def _recv_exact(sock, n: int) -> bytes:
 
 def _exchange_endpoints(my_qpn: int, my_psn: int, my_gid_raw: bytes,
                          *, peer_ip: str, peer_port: int,
-                         is_server: bool, my_extra: bytes = b""
+                         is_server: bool, my_extra: bytes = b"",
+                         timeout: float | None = None
                          ) -> tuple[int, int, bytes, bytes]:
     """TCP-based handshake: trade (qpn, psn, gid, extra_blob) with peer.
     Returns peer's (qpn, psn, gid_raw, extra_blob). `extra` is opaque to
@@ -339,23 +352,23 @@ def _exchange_endpoints(my_qpn: int, my_psn: int, my_gid_raw: bytes,
     # registers N MRs over the slot ring before it reaches the first
     # handshake, and a cold worker may still be compiling TRT engines.
     # The failure mode was a bare "cannot reach" that looks like a
-    # network fault. Override with DUAL_HANDSHAKE_TIMEOUT_S.
-    budget = float(os.environ.get("DUAL_HANDSHAKE_TIMEOUT_S", "120"))
+    # network fault. Override with CLUSTER_HANDSHAKE_TIMEOUT_S.
+    budget = (float(os.environ.get("CLUSTER_HANDSHAKE_TIMEOUT_S", "120"))
+              if timeout is None else timeout)
     if is_server:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("0.0.0.0", peer_port))
-        # backlog 1 turns a stray probe (or a peer that reconnects)
-        # into RST for everyone behind it; give the queue some slack.
-        s.listen(16)
-        s.settimeout(budget)
-        c, _ = s.accept()
-        c.sendall(msg)
-        data = _recv_exact(c, struct.calcsize(_HANDSHAKE_FMT))
-        peer_qpn, peer_psn, peer_gid_raw, peer_extra_len = \
-            struct.unpack(_HANDSHAKE_FMT, data)
-        peer_extra = _recv_exact(c, peer_extra_len) if peer_extra_len else b""
-        c.close(); s.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", peer_port))
+            s.listen(16)
+            s.settimeout(budget)
+            c, _ = s.accept()
+            with c:
+                c.settimeout(budget)
+                c.sendall(msg)
+                data = _recv_exact(c, struct.calcsize(_HANDSHAKE_FMT))
+                peer_qpn, peer_psn, peer_gid_raw, peer_extra_len = \
+                    struct.unpack(_HANDSHAKE_FMT, data)
+                peer_extra = _recv_exact(c, peer_extra_len) if peer_extra_len else b""
     else:
         import time as _t
         deadline = _t.monotonic() + budget
@@ -407,13 +420,15 @@ class RDMAChannel:
     def __init__(self, rdma_ctx: RDMAContext, *, is_server: bool,
                  peer_ip: str, peer_port: int,
                  max_wr: int = 64, my_psn: int = 0,
-                 extra_payload: bytes = b""):
+                 max_recv_sge: int = 1,
+                 extra_payload: bytes = b"",
+                 handshake_timeout: float | None = None):
         self.rdma_ctx = rdma_ctx
         # max_send_sge=8: post_send_sgl gathers a task header + up to 4
         # cc_cache fields into one SEND (zero-copy dispatch path). mlx5
         # supports 30+; 8 leaves headroom without bloating the WQE.
         cap = QPCap(max_send_wr=max_wr, max_recv_wr=max_wr,
-                    max_send_sge=8, max_recv_sge=1)
+                    max_send_sge=8, max_recv_sge=max_recv_sge)
         init = QPInitAttr(qp_type=e.IBV_QPT_RC,
                           scq=rdma_ctx.cq, rcq=rdma_ctx.cq, cap=cap)
         self.qp = QP(rdma_ctx.pd, init)
@@ -423,10 +438,14 @@ class RDMAChannel:
         # Exchange QPN + PSN + GID (+ optional opaque payload) with peer
         # over TCP. `extra_payload` lets WRITE_WITH_IMM swap remote
         # MR (addr, rkey, size) tuples in the same round-trip.
-        peer_qpn, peer_psn, peer_gid_raw, peer_extra = _exchange_endpoints(
-            self.my_qpn, self.my_psn, _gid_to_raw(rdma_ctx.gid),
-            peer_ip=peer_ip, peer_port=peer_port, is_server=is_server,
-            my_extra=extra_payload)
+        try:
+            peer_qpn, peer_psn, peer_gid_raw, peer_extra = _exchange_endpoints(
+                self.my_qpn, self.my_psn, _gid_to_raw(rdma_ctx.gid),
+                peer_ip=peer_ip, peer_port=peer_port, is_server=is_server,
+                my_extra=extra_payload, timeout=handshake_timeout)
+        except Exception:
+            self.qp.close()
+            raise
         self.peer_qpn = peer_qpn
         self.peer_psn = peer_psn
         self.peer_gid = _raw_to_gid(peer_gid_raw)
@@ -530,6 +549,12 @@ class RDMAChannel:
         sge = SGE(addr=addr, length=length, lkey=lkey)
         wr = RecvWR(num_sge=1, sg=[sge], wr_id=wr_id)
         self.qp.post_recv(wr)
+
+    def post_recv_sgl(self, sges: list, wr_id: int = 0):
+        """Receive one message into a sequence of registered regions."""
+        sg = [SGE(addr=addr, length=length, lkey=lkey)
+              for addr, length, lkey in sges]
+        self.qp.post_recv(RecvWR(num_sge=len(sg), sg=sg, wr_id=wr_id))
 
     def post_write(self, *, src_addr: int, src_lkey: int, length: int,
                    remote_addr: int, rkey: int, wr_id: int = 0,
@@ -738,7 +763,7 @@ _HDR_CC_SLOT_B = 13
 _HDR_CC_FIELD  = 14
 # For INTERP mult ≥ 3, the second output frame's cc_cache slot on
 # the host side. -1 (or 0) means single-frame INTERP (mult=2). Worker
-# reads this and also reads mult from DUAL_INTERP_MULT env at startup
+# reads this and also reads mult from CLUSTER_INTERP_MULT env at startup
 # — the slot value just routes the writeback target.
 _HDR_DST_CC_SLOT_2 = 15
 

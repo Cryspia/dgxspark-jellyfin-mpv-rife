@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bench/timing.sh — per-task GPU compute, idle, RDMA transit, queue
 # depth + GPU utilisation for the dual chain. Runs ONE mode (default
-# `dual`) with DUAL_PROFILE=1 + DUAL_RDMA_PROF=1 + DUAL_GPU_IDLE_DBG=1
+# `dual`) with CLUSTER_PROFILE=1 + CLUSTER_RDMA_PROF=1 + CLUSTER_GPU_IDLE_DBG=1
 # enabled and tail-parses the worker / host logs into a summary table.
 #
 # Usage:
@@ -41,10 +41,10 @@ trap 'cleanup_all; flags_restore "$TMPDIR/saved_flags"; echo; echo "Artefacts: $
 
 cleanup_all
 
-export WORKER_EXTRA_ENV="DUAL_PROFILE=1 DUAL_RDMA_PROF=1 DUAL_GPU_IDLE_DBG=1"
+export WORKER_EXTRA_ENV="CLUSTER_PROFILE=1 CLUSTER_RDMA_PROF=1 CLUSTER_GPU_IDLE_DBG=1"
 start_worker || exit 1
 
-HOST_EXTRA="DUAL_PROFILE=1"
+HOST_EXTRA="CLUSTER_PROFILE=1"
 
 echo
 echo "=========================================================="
@@ -79,7 +79,7 @@ grep -E '^.*PROFILE +[A-Z_]+:' "$log_worker" 2>/dev/null \
   | tail -4 | sed 's/^[^:]*:/  /' || echo "  (no per-type lines)"
 
 echo
-echo "─── WORKER: GPU stream util (last 3 samples, DUAL_GPU_IDLE_DBG) ─"
+echo "─── WORKER: GPU stream util (last 3 samples, CLUSTER_GPU_IDLE_DBG) ─"
 grep -E 'GPU stream: kernel=' "$log_worker" 2>/dev/null \
   | tail -3 | sed 's/^[^:]*:/  /' || echo "  (no GPU stream lines)"
 

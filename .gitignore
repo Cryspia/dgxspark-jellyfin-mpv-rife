@@ -18,6 +18,12 @@ desktop.ini
 *.rej
 
 # Local user state never to be committed
+/AGENTS.md
+.env
+.env.*
+!.env.example
+cluster.conf
+dual.conf
 *.local.sh
 *.local.json
 

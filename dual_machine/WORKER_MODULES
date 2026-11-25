@@ -4,8 +4,11 @@
 # each kept their own list and drifted. vs_gpu_helpers.py is NOT here:
 # it lives at the repo root and both consumers add it explicitly.
 worker.py
+cluster_env.py
 worker_3proc.py
 rdma_transport.py
+peer_link.py
+peer_control.py
 mp_pipeline.py
 cc_cache.py
 queue_mgr.py

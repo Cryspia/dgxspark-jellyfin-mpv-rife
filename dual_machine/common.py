@@ -1,53 +1,8 @@
-"""Shared helpers for the dual-machine pipeline. The whole point of
-this module is that **no machine-specific addresses / usernames are
-ever hard-coded** — they're discovered at runtime.
+"""Shared cluster configuration, mode selection, and RDMA discovery.
 
-What the operator provides
-==========================
-- `DUAL_WORKER_HOST` env var: an IP or DNS name on a RoCE rail. The
-  client reaches the worker through it; the worker's RoCE IPs are
-  inferred from the same `/sys/class/infiniband/*` walk on the
-  worker side.
-- (optional) `DUAL_MASTER_PORT`: defaults to 29500.
-- (optional) `DUAL_NCCL_DEBUG`: defaults to "WARN".
-
-What we discover automatically
-==============================
-- The RoCE RDMA devices on this machine (`/sys/class/infiniband/*`).
-- The kernel network interfaces backing each RDMA device.
-- The IPv4 address bound to each of those interfaces.
-- The RoCEv2 GID index matching that address (what `DUAL_RDMA_GID`
-  pins at install time).
-- The local username (`$USER` / `getpass.getuser()`).
-
-Fabric shape (see the spark-roce repo for the authoritative table).
-A DGX Spark has ONE ConnectX-7 ASIC — all four functions report the
-same phys_switch_id — with two physical ports, attached to the host
-over TWO PCIe5 x4 root complexes. Each port is exposed on BOTH root
-complexes (socket direct), so the four netdevs are 2 ports x 2 PCIe
-paths, not four ports:
-
-    netdev          function      devlink   PCIe path
-    enp1s0f0np0     0000:01:00.0  port 0    A
-    enP2p1s0f0np0   0002:01:00.0  port 0    B
-    enp1s0f1np1     0000:01:00.1  port 1    A
-    enP2p1s0f1np1   0002:01:00.1  port 1    B
-
-Each PORT is 200G-capable (ethtool advertises 200000baseCR4/CR2).
-Each PCIe PATH is x4 at 32 GT/s, about 128 Gb/s raw, so one path
-cannot carry 200G. Hence the two root complexes.
-
-So 200 Gb/s always means driving two PCIe paths in parallel — two
-rdma devices. Cabling is a separate choice: one 200G cable in port 0
-driven by enp1s0f0np0 + enP2p1s0f0np0 gets there, and so do two 100G
-cables driven by one netdev per port on different paths. What is never
-possible is 200 Gb/s through a single netdev, PCIe path, or QP.
-
-This fabric uses the two-cable form (the switch and DACs are QSFP28
-100G) and addresses exactly one netdev per port, on different paths.
-Measured 2026-09-19 with ib_write_bw: 98.01 Gb/s per rail, 196.02
-Gb/s with both in parallel. This project's transport opens ONE context
-and one QP pair, so it uses one rail.
+Addresses are supplied by the operator or detected at runtime. A DGX Spark
+can use two RDMA rails on separate PCIe paths; the transport stripes data
+across the configured rails. See the multi-machine guide for network setup.
 """
 from __future__ import annotations
 import os, getpass, json, socket, subprocess
@@ -134,11 +89,11 @@ def discover_roce() -> dict:
     Result:
       {
         "rails": [
-          {"rdma": "rocep1s0f0",   "iface": "enp1s0f0np0",   "ip": "<rail0-ip>"},
-          {"rdma": "roceP2p1s0f1", "iface": "enP2p1s0f1np1", "ip": "<rail1-ip>"},
+          {"rdma": "<rdma-0>", "iface": "<interface-0>", "ip": "<rail0-ip>"},
+          {"rdma": "<rdma-1>", "iface": "<interface-1>", "ip": "<rail1-ip>"},
         ],
-        "rdma_csv":  "rocep1s0f0,roceP2p1s0f1",
-        "iface_csv": "enp1s0f0np0,enP2p1s0f1np1",
+        "rdma_csv":  "<rdma-0>,<rdma-1>",
+        "iface_csv": "<interface-0>,<interface-1>",
         "ip_csv":    "<rail0-ip>,<rail1-ip>",
       }
     Rails without an IP or with no link carrier are skipped. That is
@@ -157,10 +112,7 @@ def discover_roce() -> dict:
             continue
         rails.append({"rdma": dev, "iface": iface, "ip": ip,
                       "gid": roce_v2_gid_index(dev, ip)})
-    # Sort by IPv4 so both hosts pick the same rail ordering. NCCL's
-    # OOB bootstrap socket lives on rail-0; if host and worker disagree
-    # on which device is "rail 0", bootstrap can advertise an address
-    # the peer can't reach.
+    # Sort by IPv4 so the configured rail ordering is deterministic.
     def _ip_key(r):
         parts = r["ip"].split(".")
         return tuple(int(p) for p in parts)
@@ -174,18 +126,13 @@ def discover_roce() -> dict:
 
 
 def worker_host() -> str:
-    """Worker hostname/IP. Required env: DUAL_WORKER_HOST."""
-    v = os.environ.get("DUAL_WORKER_HOST", "").strip()
+    """Worker hostname/IP. Required env: CLUSTER_WORKER_HOST."""
+    v = os.environ.get("CLUSTER_WORKER_HOST", "").strip()
     if not v:
         raise RuntimeError(
-            "DUAL_WORKER_HOST not set — point this at the worker's RoCE IP "
-            "or any name that resolves to it (used both for SSH bootstrap "
-            "and as NCCL MASTER_ADDR).")
+            "CLUSTER_WORKER_HOST not set — point this at the worker's RoCE IP "
+            "or any name that resolves to it.")
     return v
-
-
-def master_port() -> int:
-    return int(os.environ.get("DUAL_MASTER_PORT", "29500"))
 
 
 def local_user() -> str:
@@ -205,4 +152,72 @@ if __name__ == "__main__":
     try:
         print("worker host:", worker_host())
     except RuntimeError as e:
-        print("worker host: (DUAL_WORKER_HOST unset —", e, ")")
+        print("worker host: (CLUSTER_WORKER_HOST unset —", e, ")")
+
+
+def use_tictac(worker_count: int, interp_mult: int, setting: str | None = None) -> bool:
+    """Select frame-owned mode for two or more workers, unless overridden."""
+    if worker_count < 2 or interp_mult not in (2, 3, 4):
+        return False
+    if setting is None or setting == "":
+        return True
+    return setting == "1"
+
+
+def four_machine_policy() -> dict:
+    """Load the playback thresholds shared with the mpv Lua sidecar."""
+    path = Path(__file__).with_name("four_machine_policy.json")
+    try:
+        with path.open(encoding="utf-8") as source:
+            policy = json.load(source)
+        required = ("max_source_fps", "native_4k_max_source_fps",
+                    "x4_1080_max_source_fps", "x3_max_source_fps",
+                    "lowres_max_height", "lowres_max_width", "fourk_min_height", "fourk_min_width")
+        if any(type(policy.get(key)) not in (int, float) or policy[key] <= 0
+               for key in required):
+            return {}
+        return policy
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def default_interpolation_multiplier(fps: float, height: int, width: int,
+                                     worker_count: int, setting: str | None = None,
+                                     native_4k: str | None = None) -> int:
+    """Choose a per-source multiplier; unknown rates use the conservative default."""
+    import math
+    if not math.isfinite(fps) or fps <= 0:
+        return 2
+    policy = four_machine_policy()
+    if policy and worker_count >= 3 and use_tictac(worker_count, 2, setting):
+        if fps > policy["max_source_fps"]:
+            return 1
+        fourk = height >= policy["fourk_min_height"] or width >= policy["fourk_min_width"]
+        if (fourk and fps <= policy["native_4k_max_source_fps"]
+                and native_4k != "0"):
+            return 2
+        if fps > policy["x3_max_source_fps"]:
+            return 2
+        if (height <= policy["lowres_max_height"] and width <= policy["lowres_max_width"]
+                and not fourk):
+            return 4
+        if not fourk and fps <= policy["x4_1080_max_source_fps"]:
+            return 4
+        return 3
+    if fps > 30:
+        return 1
+    max_mult = 4 if height <= 720 else 3
+    return max_mult if fps <= 25 else max_mult - 1
+
+
+def source_fps_from_sidecar() -> float:
+    """Read only the rate written for the current mpv process and lifetime."""
+    import math
+    path = Path(f"/tmp/dual_machine_source_fps_{os.getpid()}")
+    try:
+        if path.stat().st_mtime < Path("/proc/self").stat().st_ctime:
+            return 0.0
+        rate = float(path.read_text(encoding="ascii").strip())
+        return rate if math.isfinite(rate) and rate > 0 else 0.0
+    except (OSError, ValueError):
+        return 0.0

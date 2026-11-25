@@ -110,7 +110,7 @@ def make_dispatcher(
     # Legacy NCCL knob; retained for ABI but no longer applies — the
     # control plane is now a single TCP socket (liveness:29905) and
     # the per-stage timeouts are: 0.5 s for the initial connect, then
-    # `DUAL_WORKER_READY_TIMEOUT` (default 300 s) for the worker's
+    # `CLUSTER_WORKER_READY_TIMEOUT` (default 300 s) for the worker's
     # 'R' byte after engines load.
     init_timeout_s: float = 3.0,
     interp_mult: int = 2,
@@ -206,7 +206,41 @@ def make_dispatcher(
     # params key: shape, layout, and the per-task knobs that affect
     # subprocess wiring / engine selection. Resolution changes (next
     # video) and mult changes (F9) flip this and force a real teardown.
-    _params_key = (H, W, src_sub_w, src_sub_h, dst_sub_w, dst_sub_h,
+    _worker_host_config = (os.environ.get("CLUSTER_WORKER_HOSTS", "").strip()
+                           or os.environ.get("CLUSTER_WORKER_HOST", "127.0.0.1"))
+    _worker_hosts = tuple(x.strip() for x in _worker_host_config.split(",")
+                          if x.strip())
+    if not _worker_hosts or len(set(_worker_hosts)) != len(_worker_hosts):
+        raise ValueError("CLUSTER_WORKER_HOSTS must list distinct worker addresses")
+    from common import use_tictac
+    if use_tictac(len(_worker_hosts), interp_mult, os.environ.get("CLUSTER_TICTAC")):
+        from tictac_dispatcher import (make_dispatcher as _make_tictac,
+                                       InsufficientWorkers as _InsufficientWorkers)
+        try:
+            return _make_tictac(
+                clip, worker_hosts=_worker_hosts, variant=variant, matrix_s=matrix_s,
+                color_range=color_range, rife_model=rife_model, chroma_kernel=chroma_kernel,
+                downsample_pre=downsample_pre, output_scale=output_scale,
+                dst_sub_w=dst_sub_w, dst_sub_h=dst_sub_h,
+                interp_mult=interp_mult, no_sr=no_sr)
+        except _InsufficientWorkers as exc:
+            if not exc.available:
+                raise
+            _worker_hosts = exc.available
+            os.environ["CLUSTER_WORKER_HOSTS"] = ",".join(_worker_hosts)
+            os.environ["CLUSTER_WORKER_HOST"] = _worker_hosts[0]
+            sys.stderr.write("[native_dispatcher] one worker remains; using dual mode\n")
+    if "tictac_dispatcher" in sys.modules:
+        sys.modules["tictac_dispatcher"]._close_current()
+    _default_guest_slots = 2 if len(_worker_hosts) >= 3 else 4
+    _guest_slots_config = os.environ.get("CLUSTER_GUEST_SLOTS", str(_default_guest_slots))
+    _host_slots_config = os.environ.get("CLUSTER_HOST_SLOTS", "2")
+    _params_key = (_worker_hosts, _guest_slots_config,
+                    _host_slots_config,
+                    os.environ.get("CLUSTER_LOCAL_FRAME_CACHE", "0"),
+                    os.environ.get("CLUSTER_DIRECT_CC", "0"),
+                    os.environ.get("CLUSTER_MID_DELIVERY", "1"),
+                    H, W, src_sub_w, src_sub_h, dst_sub_w, dst_sub_h,
                     output_scale, downsample_pre, interp_mult, no_sr,
                     variant, matrix_s, color_range, rife_model,
                     chroma_kernel, device)
@@ -277,28 +311,22 @@ def make_dispatcher(
                 if _old_qm is not None:
                     try: _old_qm.shutdown()
                     except Exception: pass
-                _old_gmp = _st.get("guest_mp")
-                if _old_gmp is not None:
+                for _event in _st.get("guest_down_events", []):
+                    _event.set()
+                for _thread in _st.get("guest_threads", []):
+                    _thread.join(timeout=2.0)
+                for _old_gmp in _st.get("guests", []):
                     try: _old_gmp.close()
+                    except Exception: pass
+                _old_pull = _st.get("pull_coordinator")
+                if _old_pull is not None:
+                    try: _old_pull.close()
                     except Exception: pass
                 _old_hmp = _st.get("host_mp")
                 if _old_hmp is not None:
                     try: _old_hmp.shutdown()
                     except Exception: pass
-                _old_lsock = _st.get("liveness_sock")
-                if _old_lsock is not None:
-                    # shutdown() BEFORE close(), and this is the whole
-                    # fix for the F9 freeze. close() only drops OUR fd;
-                    # FIN goes out when the LAST copy of it closes, and
-                    # host_mp's three subprocesses inherited one at
-                    # fork. So the worker's watchdog stayed blocked in
-                    # recv(), the session it was serving never ended,
-                    # it never returned to accept() — and the rebuild's
-                    # fresh connection sat unaccepted in the backlog
-                    # while this side blocked 300 s on the ready byte.
-                    # shutdown() acts on the CONNECTION, not the fd, so
-                    # the FIN leaves immediately however many copies
-                    # are still open.
+                for _old_lsock in _st.get("liveness_socks", []):
                     try: _old_lsock.shutdown(_sock_mod.SHUT_RDWR)
                     except Exception: pass
                     try: _old_lsock.close()
@@ -354,30 +382,32 @@ def make_dispatcher(
     # also opens the keep-alive socket the worker uses to detect host
     # crash within ~3 s.
     import socket as _sock
-    worker_ip = os.environ.get("DUAL_WORKER_HOST", "127.0.0.1")
-    _liveness_port = int(os.environ.get("DUAL_LIVENESS_PORT", "29905"))
-    _liveness_sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-    _liveness_sock.settimeout(0.5)
-    try:
-        _liveness_sock.connect((worker_ip, _liveness_port))
-    except (OSError, _sock.timeout) as _le:
-        _liveness_sock.close()
-        raise RuntimeError(
-            f"worker liveness probe to {worker_ip}:{_liveness_port} "
-            f"failed in <0.5 s ({type(_le).__name__}: {_le}) — worker "
-            f"not serving") from _le
-    _liveness_sock.setsockopt(_sock.SOL_SOCKET, _sock.SO_KEEPALIVE, 1)
-    try:
-        _liveness_sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_KEEPIDLE, 1)
-        _liveness_sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_KEEPINTVL, 1)
-        _liveness_sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_KEEPCNT, 2)
-    except OSError:
-        pass
-    _liveness_sock.settimeout(None)
-    sys.stderr.write(
-        f"[native_dispatcher] liveness socket to "
-        f"{worker_ip}:{_liveness_port} open\n")
-    sys.stderr.flush()
+    _liveness_port = int(os.environ.get("CLUSTER_LIVENESS_PORT", "29905"))
+    _liveness_socks = []
+    _reachable_hosts = []
+    for worker_ip in _worker_hosts:
+        sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        try:
+            sock.settimeout(0.5)
+            sock.connect((worker_ip, _liveness_port))
+            sock.setsockopt(_sock.SOL_SOCKET, _sock.SO_KEEPALIVE, 1)
+            try:
+                sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_KEEPIDLE, 1)
+                sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_KEEPINTVL, 1)
+                sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_KEEPCNT, 2)
+            except OSError:
+                pass
+            sock.settimeout(None)
+            _liveness_socks.append(sock)
+            _reachable_hosts.append(worker_ip)
+            sys.stderr.write(f"[native_dispatcher] liveness socket to {worker_ip}:{_liveness_port} open\n")
+        except (OSError, _sock.timeout) as exc:
+            sock.close()
+            sys.stderr.write(f"[native_dispatcher] worker {worker_ip} unavailable: {exc}\n")
+    if not _reachable_hosts:
+        raise RuntimeError("no configured workers are reachable")
+    _worker_hosts = tuple(_reachable_hosts)
+    _params_key = (_worker_hosts,) + _params_key[1:]
 
     # ── Handshake over the liveness TCP socket ─────────────────────
     # No NCCL: we send the 18-int64 handshake directly on the already-
@@ -385,8 +415,8 @@ def make_dispatcher(
     # these get inherited by subprocesses spawned downstream.
     if interp_mult not in (1, 2, 3, 4):
         interp_mult = 2
-    os.environ["DUAL_INTERP_MULT"] = str(interp_mult)
-    os.environ["DUAL_NO_SR"] = "1" if no_sr else "0"
+    os.environ["CLUSTER_INTERP_MULT"] = str(interp_mult)
+    os.environ["CLUSTER_NO_SR"] = "1" if no_sr else "0"
     import struct as _struct
     _VARIANT_IDX = {v: i for i, v in enumerate(_HS_VARIANTS)}
     _CHROMA_IDX = {m: i for i, m in enumerate(_HS_CHROMA_MODES)}
@@ -395,12 +425,22 @@ def make_dispatcher(
     _RIFE_IDX = {"4.26": 0, "4.6": 1}
     # Stage early-delivery (mid SEND) switch — ON by default; carried
     # in the handshake so host and worker can never disagree.
-    # DUAL_MID_DELIVERY=0 disables for A/B.
-    _mid_delivery_on = os.environ.get("DUAL_MID_DELIVERY", "1") == "1"
-    os.environ["DUAL_MID_DELIVERY"] = "1" if _mid_delivery_on else "0"
+    # CLUSTER_MID_DELIVERY=0 disables for A/B.
+    _mid_delivery_on = os.environ.get("CLUSTER_MID_DELIVERY", "1") == "1"
+    # Normal mode always pulls final results. Direct cache writes remain
+    # available for CCSR's early feature stage when explicitly requested.
+    _local_cache_on = os.environ.get("CLUSTER_LOCAL_FRAME_CACHE", "0") == "1"
+    _direct_cc_on = (not _local_cache_on
+                     and os.environ.get("CLUSTER_DIRECT_CC", "0") == "1"
+                     and _mid_delivery_on)
+    os.environ["CLUSTER_PULL_RESULTS"] = "1"
+    os.environ["CLUSTER_PULL_NORMAL"] = "1"
+    sys.stderr.write("[native_dispatcher] result transport=pull\n")
+    os.environ["CLUSTER_MID_DELIVERY"] = "1" if _mid_delivery_on else "0"
     handshake_bytes = _struct.pack(
         "<20q",
-        2, H, W, output_scale,
+        11 if _direct_cc_on else 10,
+        H, W, output_scale,
         _VARIANT_IDX[variant],
         _CHROMA_IDX[chroma_kernel],
         src_sub_w, src_sub_h,
@@ -424,8 +464,11 @@ def make_dispatcher(
     sys.stderr.write("[native_dispatcher] sending handshake (160 B)…\n")
     sys.stderr.flush()
     try:
-        _liveness_sock.sendall(handshake_bytes)
+        for sock in _liveness_socks:
+            sock.sendall(handshake_bytes)
     except OSError as _he:
+        for sock in _liveness_socks:
+            sock.close()
         raise RuntimeError(
             f"handshake send failed ({type(_he).__name__}: {_he})") from _he
 
@@ -444,7 +487,7 @@ def make_dispatcher(
     # The dispatcher's `local_runner` is only used for this prewarm — the
     # actual compute-proc FSRCNNX runner is built independently inside
     # HostMP's subprocess. Skip both when no_sr (the compute proc reads
-    # DUAL_NO_SR via env and skips its own runner too).
+    # CLUSTER_NO_SR via env and skips its own runner too).
     if not no_sr:
         local_runner = FSRCNNXcuDNNRunner(
             wpath, variant, H=proc_h, W=proc_w, device=dev)
@@ -478,33 +521,33 @@ def make_dispatcher(
     # there turns any hiccup in the handover into five minutes of
     # frozen mpv, because this recv blocks the filter thread — which
     # is exactly what a mistimed F9 used to look like. Override with
-    # DUAL_WORKER_REBUILD_TIMEOUT if a slow box needs more.
+    # CLUSTER_WORKER_REBUILD_TIMEOUT if a slow box needs more.
     if _rebuilding_from_live_session:
         _ready_timeout = float(os.environ.get(
-            "DUAL_WORKER_REBUILD_TIMEOUT", "30"))
+            "CLUSTER_WORKER_REBUILD_TIMEOUT", "30"))
     else:
         _ready_timeout = float(os.environ.get(
-            "DUAL_WORKER_READY_TIMEOUT", "300"))
-    _liveness_sock.settimeout(_ready_timeout)
+            "CLUSTER_WORKER_READY_TIMEOUT", "300"))
     try:
-        _r = _liveness_sock.recv(1)
-    except (OSError, _sock.timeout) as _re:
-        raise RuntimeError(
-            f"worker ready signal not received in {_ready_timeout}s "
-            f"({type(_re).__name__}: {_re})") from _re
-    finally:
-        _liveness_sock.settimeout(None)
-    if not _r:
-        raise RuntimeError("worker closed liveness before signaling ready")
-    if _r != b"R":
-        raise RuntimeError(f"unexpected worker ready byte: {_r!r}")
-    sys.stderr.write("[native_dispatcher] worker ready\n"); sys.stderr.flush()
+        for worker_ip, sock in zip(_worker_hosts, _liveness_socks):
+            sock.settimeout(_ready_timeout)
+            try:
+                reply = sock.recv(1)
+            finally:
+                sock.settimeout(None)
+            if reply != b"R":
+                raise RuntimeError(f"worker {worker_ip} sent unexpected ready byte: {reply!r}")
+            sys.stderr.write(f"[native_dispatcher] worker {worker_ip} ready\n")
+    except (OSError, RuntimeError) as exc:
+        for sock in _liveness_socks:
+            sock.close()
+        raise RuntimeError(f"worker ready failed: {exc}") from exc
 
     # Transport config — read once, used by guest_mp's RDMAChannel below.
     # worker_ip already pulled up top for the liveness pre-flight.
-    rdma_dev = os.environ.get("DUAL_RDMA_DEV", "rocep1s0f0")
-    rdma_port = int(os.environ.get("DUAL_RDMA_PORT", "29900"))
-    rdma_gid = int(os.environ.get("DUAL_RDMA_GID", "3"))
+    rdma_dev = os.environ.get("CLUSTER_RDMA_DEV", "rocep1s0f0")
+    rdma_port = int(os.environ.get("CLUSTER_RDMA_PORT", "29900"))
+    rdma_gid = int(os.environ.get("CLUSTER_RDMA_GID", "3"))
 
     # Liveness socket to worker. Holds open for the lifetime of the
     # session; on host crash / clean exit, the kernel sends FIN to the
@@ -521,9 +564,13 @@ def make_dispatcher(
     # worker_3proc's body). The dispatcher's compute() hook submits
     # pairs to HostMP via the queue_mgr.
     host_mp = None
+    _guest_down_events = []
+    _guest_threads = []
     # 2 slots (tick-tac) hide the dma_proc → compute_proc handoff
     # at the SPLIT-task fine-grained pace.
-    host_mp_slots = 2
+    host_mp_slots = int(_host_slots_config)
+    if not 1 <= host_mp_slots <= 8:
+        raise ValueError("CLUSTER_HOST_SLOTS must be between 1 and 8")
     if True:
         # process_vm_readv from dma_proc (child) into mpv's address
         # space (parent) requires the tracee (mpv) to authorize tracing
@@ -595,7 +642,7 @@ def make_dispatcher(
         sys.stderr.flush()
         host_mp.wait_compute_ready(
             timeout=float(os.environ.get(
-                "DUAL_WORKER_READY_TIMEOUT", "300")))
+                "CLUSTER_WORKER_READY_TIMEOUT", "300")))
         sys.stderr.write("[native_dispatcher] HostMP compute_proc ready\n")
         sys.stderr.flush()
 
@@ -623,22 +670,30 @@ def make_dispatcher(
         import atexit as _atexit_dispatcher
         _hmp_close = host_mp
         _qmgr_close = queue_mgr
-        _guest_close_holder: list = [None]
+        _guest_close_holder: list = []
+        from pull_queue import PullCoordinator
+        _pull_coordinator = PullCoordinator()
         _inotify_close_holder: list = [None]
-        _liveness_close_holder: list = [_liveness_sock]
+        _liveness_close_holder: list = list(_liveness_socks)
         def _dispatcher_atexit():
             try: _qmgr_close.shutdown(drain_timeout=0.3)
             except Exception: pass
-            try:
-                if _guest_close_holder[0] is not None:
-                    _guest_close_holder[0].close()
+            for event in _guest_down_events:
+                event.set()
+            for thread in _guest_threads:
+                thread.join(timeout=2.0)
+            for guest in _guest_close_holder:
+                try: guest.close()
+                except Exception: pass
+            try: _pull_coordinator.close()
             except Exception: pass
             try: _hmp_close.shutdown()
             except Exception: pass
-            try:
-                if _liveness_close_holder[0] is not None:
-                    _liveness_close_holder[0].close()
-            except Exception: pass
+            for sock in _liveness_close_holder:
+                try: sock.shutdown(_sock_mod.SHUT_RDWR)
+                except OSError: pass
+                try: sock.close()
+                except OSError: pass
             try:
                 if _inotify_close_holder[0] is not None:
                     os.close(_inotify_close_holder[0])
@@ -649,7 +704,7 @@ def make_dispatcher(
         # this loop is defined and the thread spawned). The loop reads
         # _guest_mp_holder[0] each iteration so it picks up the
         # assignment when it happens.
-        _guest_mp_holder: list = [None]
+        _guest_mp_holder: list = []
 
         def _split_dispatch_loop():
             """Host dispatch loop. Just asks queue_mgr 'give me any
@@ -659,7 +714,7 @@ def make_dispatcher(
             empty sr_q never blocks us out of cc_q work. Mgr's
             pop_for_host is a single atomic transaction that wakes on
             ANY queue's notify and re-checks the priority order."""
-            _prof_on = os.environ.get("DUAL_PROFILE", "0") == "1"
+            _prof_on = os.environ.get("CLUSTER_PROFILE", "0") == "1"
             _prof = {"cpu_ms": 0.0, "claim_retries": 0, "n": 0,
                      "last_report": _time.perf_counter()}
             # Claim-before-pop: secure a host slot BEFORE taking a task
@@ -699,7 +754,13 @@ def make_dispatcher(
                 # branch).
                 if node.type in (TaskType.SR_INTERP, TaskType.CCSR):
                     va = queue_mgr.get_frame_va(node.frame_idx)
-                    if node.type == TaskType.CCSR:
+                    spec = node.payload.get("_speculative_output")
+                    if node.type == TaskType.CCSR and spec is not None:
+                        sr_dst_y, sr_dst_u, sr_dst_v = (
+                            ctypes.addressof(spec["y"]), ctypes.addressof(spec["u"]),
+                            ctypes.addressof(spec["v"]))
+                        sr_y_stride, sr_uv_stride = spec["y_stride"], spec["uv_stride"]
+                    elif node.type == TaskType.CCSR:
                         sr_dst_y, sr_dst_u, sr_dst_v = (
                             va.dst_a_y, va.dst_a_u, va.dst_a_v)
                     elif node.output_phase == 3:
@@ -713,8 +774,9 @@ def make_dispatcher(
                     else:
                         sr_dst_y, sr_dst_u, sr_dst_v = (
                             va.dst_i_y, va.dst_i_u, va.dst_i_v)
-                    sr_y_stride = va.dst_y_stride
-                    sr_uv_stride = va.dst_uv_stride
+                    if node.type != TaskType.CCSR or spec is None:
+                        sr_y_stride = va.dst_y_stride
+                        sr_uv_stride = va.dst_uv_stride
                     assert sr_dst_y != 0, (
                         f"[split-dispatch] gating violation: SR/CCSR popped "
                         f"without dst VA tid={node.id} K={node.frame_idx} "
@@ -722,7 +784,7 @@ def make_dispatcher(
                 # Slot already claimed before the pop (see loop head).
                 _claim_retries = 0
                 queue_mgr.set_node_payload(node.id, "worker_slot", slot)
-                if os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1":
+                if os.environ.get("CLUSTER_SPLIT_DEBUG", "0") == "1":
                     sys.stderr.write(
                         f"[split-dispatch] task_id={node.id} "
                         f"type={TaskType(node.type).name} "
@@ -808,6 +870,14 @@ def make_dispatcher(
                     req.dst_uv_stride_a = sr_uv_stride
                     req.phases_mask = 0x1   # writeback yao/uao/vao
                     req.dst_cc_field = -2   # kernel wrote cc_cache itself
+                # A retry must not overwrite stages that were already
+                # delivered before the disconnected worker failed.
+                _retry_stages = node.payload.get("retry_skipped_stages", ())
+                if _retry_stages and node.type == TaskType.CCSR:
+                    req.dst_cc_field = -3
+                elif _retry_stages and node.type == TaskType.INTERP:
+                    _retry_mask = sum(1 << int(stage) for stage in _retry_stages)
+                    req.dst_cc_field = -16 - _retry_mask
                 del req
                 # Publish: ST_FILLING → ST_RECV_PENDING. Has to happen
                 # AFTER `del req` so the RequestMeta writes are flushed
@@ -932,16 +1002,22 @@ def make_dispatcher(
             _t0 = _time.perf_counter()
             try: queue_mgr.shutdown(drain_timeout=0.3)
             except Exception: pass
-            try:
-                if _guest_close_holder[0] is not None:
-                    _guest_close_holder[0].close()
+            for event in _guest_down_events:
+                event.set()
+            for thread in _guest_threads:
+                thread.join(timeout=2.0)
+            for guest in _guest_close_holder:
+                try: guest.close()
+                except Exception: pass
+            try: _pull_coordinator.close()
             except Exception: pass
             try: host_mp.shutdown()
             except Exception: pass
-            try:
-                if _liveness_close_holder[0] is not None:
-                    _liveness_close_holder[0].close()
-            except Exception: pass
+            for sock in _liveness_close_holder:
+                try: sock.shutdown(_sock_mod.SHUT_RDWR)
+                except OSError: pass
+                try: sock.close()
+                except OSError: pass
             sys.stderr.write(
                 f"[dual-shutdown] complete in "
                 f"{(_time.perf_counter()-_t0)*1000:.1f} ms\n")
@@ -988,472 +1064,537 @@ def make_dispatcher(
     #    loop; host claims CCSR, guest claims INTERP (with SR_INTERP
     #    as fallback). Both sides also accept the other's task type
     #    if the priority order is empty on their side.
-    guest_mp = None
-    if host_mp is not None:
-        from guest_mp import GuestMP
-        from cc_cache import FIELD_RGB_INTERP
+    _worker_state_lock = threading.Lock()
+    _active_worker_hosts = set(_worker_hosts)
+    def _setup_guest(worker_ip, _liveness_sock):
+        guest_mp = None
+        if host_mp is not None:
+            from guest_mp import GuestMP
+            from cc_cache import FIELD_RGB_INTERP
 
-        _guest_port = rdma_port
-        # Must match the worker's RDMA n_slots (4 — see worker.py).
-        _guest_slots = 4
+            _guest_port = rdma_port
+            # Worker-side ring slots are independent of host slots; the
+            # actual host slot count is sent in the RDMA handshake.
+            _guest_slots = int(_guest_slots_config)
+            if not 1 <= _guest_slots <= 16:
+                raise ValueError("CLUSTER_GUEST_SLOTS must be between 1 and 16")
 
-        # cc_cache writeback callback:
-        #   INTERP payload : ("rgb_interp", rgb_addr, rgb_sz)
-        #     → memmoves rgb_interp into cc_cache[dst_slot].rgb_interp
-        #   CCSR payload   : ("ccsr", rgb_addr, rgb_sz, feat_addr, feat_sz)
-        #     → memmoves rgb_padded + rife_features into cc_cache[dst_slot]
-        _cc = host_mp.cc_cache
-        from cc_cache import (FIELD_RGB_PADDED, FIELD_RIFE_FEATURES,
-                              FIELD_RGB_INTERP)
-        def _cc_writeback(dst_slot: int, payload) -> None:
-            if len(payload) == 3 and payload[0] == "rgb_interp":
-                _, rgb_addr, rgb_sz = payload
-                rgb_dst = _cc.field_addr(dst_slot, FIELD_RGB_INTERP)
-                ctypes.memmove(rgb_dst, rgb_addr, rgb_sz)
-                _cc.set_field(dst_slot, FIELD_RGB_INTERP)
-            elif len(payload) == 5 and payload[0] == "ccsr":
-                _, rgb_addr, rgb_sz, feat_addr, feat_sz = payload
-                rgb_dst = _cc.field_addr(dst_slot, FIELD_RGB_PADDED)
-                feat_dst = _cc.field_addr(dst_slot, FIELD_RIFE_FEATURES)
-                ctypes.memmove(rgb_dst,  rgb_addr,  rgb_sz)
-                ctypes.memmove(feat_dst, feat_addr, feat_sz)
-                _cc.set_field(dst_slot, FIELD_RGB_PADDED)
-                _cc.set_field(dst_slot, FIELD_RIFE_FEATURES)
-            else:
-                sys.stderr.write(
-                    f"[cc_writeback] unknown payload shape "
-                    f"len={len(payload)} head={payload[0] if payload else None}\n")
-
-        # task_done callback: queue_mgr is the source of truth. We
-        # tag result with executor="guest" so _compute_split_task can
-        # recognise that the SR_* output is already in mpv VA (not in
-        # host_mp.shm.slot_dst) and skip the host-side memmove.
-        def _guest_task_done(task_id: int) -> None:
-            if os.environ.get("DUAL_REFCOUNT_DBG", "0") == "1":
-                sys.stderr.write(
-                    f"[ref-caller] guest_mp-cq task_done({task_id})\n")
-                sys.stderr.flush()
-            queue_mgr.task_done(task_id, ok=True,
-                                 result={"executor": "guest"})
-
-        def _guest_task_fail(task_id: int, reason: str) -> None:
-            queue_mgr.task_done(task_id, ok=False, error=reason)
-
-        # Mid SEND arrival → unblock downstream INTERPs gated on
-        # CCSR stage 0. Stage idx encoded by guest_mp's CQ thread.
-        def _guest_task_stage_done(task_id: int, stage_idx: int) -> None:
-            if os.environ.get("DUAL_REFCOUNT_DBG", "0") == "1":
-                sys.stderr.write(
-                    f"[ref-caller] guest_mp-cq task_stage_done("
-                    f"{task_id}, {stage_idx})\n")
-                sys.stderr.flush()
-            queue_mgr.task_stage_done(task_id, stage_idx)
-
-        # GuestMP reads DUAL_DOWNSAMPLE_PRE env to derive proc dims for
-        # the INTERP rgb_interp ferry size. Make sure it sees the same
-        # value we passed in handshake.
-        os.environ["DUAL_DOWNSAMPLE_PRE"] = str(downsample_pre)
-        # GuestMP / _pack_interp_payload compute wire offsets from
-        # WMP_SPLIT_PH/PW (= RIFE-padded source dims). Default 1088/1920
-        # is for 1080p; on 720p sources the actual rife_cfg pH/pW is
-        # 768/1280. Without this override host's pack offsets diverge
-        # from the worker's split_src_views layout (worker's WMP_SPLIT_PH
-        # comes from layout.pH propagated via _child_env, which IS
-        # correct), causing worker to read rgb_padded_b out of the
-        # middle of features_a — silent 33-9 dB PSNR drop on INTERP.
-        os.environ["WMP_SPLIT_PH"] = str(int(rife_cfg["ph"]))
-        os.environ["WMP_SPLIT_PW"] = str(int(rife_cfg["pw"]))
-        try:
-            guest_mp = GuestMP(
-                H=H, W=W, scale=output_scale,
-                sub_w=src_sub_w, sub_h=src_sub_h,
-                dst_sub_w=dst_sub_w, dst_sub_h=dst_sub_h,
-                pH=int(rife_cfg["ph"]),
-                pW=int(rife_cfg["pw"]),
-                enc_ch=int(rife_cfg.get("encode_channel", 0) or 0),
-                n_slots=_guest_slots,
-                rdma_dev=rdma_dev,
-                rdma_port=1, rdma_gid_index=rdma_gid,
-                peer_ip=worker_ip,
-                peer_handshake_port=_guest_port,
-                cc_cache_writeback_fn=_cc_writeback,
-                task_done_fn=_guest_task_done,
-                task_fail_fn=_guest_task_fail,
-                task_stage_done_fn=_guest_task_stage_done,
-                log=lambda m: sys.stderr.write(m + "\n"),
-            )
-            sys.stderr.write(
-                f"[native_dispatcher] GuestMP up: slots={_guest_slots} "
-                f"peer={worker_ip}:{_guest_port}\n")
-            sys.stderr.flush()
-            # Publish to the holder so _split_dispatch_loop (already
-            # running) starts gating its compute-q steal on guest's
-            # slot availability.
-            _guest_mp_holder[0] = guest_mp
-            # publish to atexit's holder so it can close on exit
-            try:
-                _guest_close_holder[0] = guest_mp
-            except Exception:
-                pass
-        except Exception as ex:
-            sys.stderr.write(
-                f"[native_dispatcher] GuestMP setup failed "
-                f"({type(ex).__name__}: {ex}); falling back to "
-                f"host_mp-only split-task path\n")
-            sys.stderr.flush()
-            guest_mp = None
-
-        # Second dispatch loop: pulls non-CC tasks from compute_q,
-        # packs cc_cache field data into the guest_mp send buffer,
-        # and posts via notify_submit. Runs in parallel with the
-        # host dispatch loop above; queue_mgr's _cv-locked pop_compute
-        # is multi-consumer safe (each task is delivered to exactly
-        # one loop). See SPLIT_TASK_ARCHITECTURE.md §13.
-        if guest_mp is not None:
-            from cc_cache import FIELD_RGB_PADDED, FIELD_RIFE_FEATURES
-
-            # Zero-copy dispatch: register the cc_cache region as an MR
-            # so INTERP / SR_INTERP payloads can be described as SGEs
-            # pointing straight into cc_cache — the NIC gathers them,
-            # replacing a ~58 MB-per-INTERP CPU memmove through the
-            # ~5 GB/s cudaHostRegister'd read path. Falls back to the
-            # memmove pack functions below if registration fails.
-            # Lifetime is safe: queue_mgr refcounts pin every referenced
-            # slot until task_done (which always trails the SEND
-            # completion), and the seek-flush sweep keeps slots of
-            # RUNNING tasks alive.
-            guest_mp.register_cc_cache(_cc.addr, _cc.layout.total_size)
-
-            def _interp_payload_sges(cc, node, gmp):
-                """SGE description of the INTERP wire payload (same
-                byte order the memmove fallback produces)."""
-                src_a = node.payload["src_cc_slot_a"]
-                src_b = node.payload["src_cc_slot_b"]
-                rgb_sz = gmp._rgb_padded_bytes
-                ft_sz  = gmp._rife_features_bytes
-                k = gmp.cc_lkey
-                return [
-                    (cc.field_addr(src_a, FIELD_RGB_PADDED),    rgb_sz, k),
-                    (cc.field_addr(src_a, FIELD_RIFE_FEATURES), ft_sz,  k),
-                    (cc.field_addr(src_b, FIELD_RGB_PADDED),    rgb_sz, k),
-                    (cc.field_addr(src_b, FIELD_RIFE_FEATURES), ft_sz,  k),
-                ]
-
-            def _sr_payload_sges(cc, node, gmp):
-                src = node.payload["src_cc_slot_a"]
-                return [(cc.field_addr(src, FIELD_RGB_INTERP),
-                         gmp._interp_dst_rgb_bytes, gmp.cc_lkey)]
-
-            def _pack_interp_payload(cc, node, base, poff, gmp):
-                """Wire layout (must match worker_3proc.split_src_views):
-                  rgb_padded_a, features_a, rgb_padded_b, features_b
-                each contiguous, in slot.src after the 128B header.
-                Memmove fallback for _interp_payload_sges."""
-                src_a = node.payload["src_cc_slot_a"]
-                src_b = node.payload["src_cc_slot_b"]
-                rgb_sz = gmp._rgb_padded_bytes
-                ft_sz  = gmp._rife_features_bytes
-                cur = poff
-                for cc_slot in (src_a, src_b):
-                    ctypes.memmove(
-                        base + cur,
-                        cc.field_addr(cc_slot, FIELD_RGB_PADDED),
-                        rgb_sz)
-                    cur += rgb_sz
-                    ctypes.memmove(
-                        base + cur,
-                        cc.field_addr(cc_slot, FIELD_RIFE_FEATURES),
-                        ft_sz)
-                    cur += ft_sz
-
-            def _pack_sr_payload(cc, node, base, poff, gmp):
-                """Wire layout: rgb_interp (fp16 RGB at proc dims).
-                cc_cache.rgb_interp is already laid out as (1, 3, proc_h,
-                proc_w) — single contiguous memmove is the whole payload.
-                Memmove fallback for _sr_payload_sges."""
-                src = node.payload["src_cc_slot_a"]
-                total = gmp._interp_dst_rgb_bytes
-                ctypes.memmove(base + poff,
-                                cc.field_addr(src, FIELD_RGB_INTERP),
-                                total)
-
-            # Pack CCSR src payload (1080p YUV) from mpv frame VA into
-            # slot.src's ya/ua/va region. Mirrors host dma_proc's
-            # behavior but happens in mpv process (UMA shm means a
-            # simple memmove handles it). Honor mpv's strides if
-            # non-packed (vapoursynth row pad).
-            _ccsr_src_offs = {name: off for name, off, _, _, _ in
-                               guest_mp.src_layout}
-            _ccsr_H, _ccsr_W = guest_mp.H, guest_mp.W
-            _ccsr_cH, _ccsr_cW = guest_mp.cH, guest_mp.cW
-            def _pack_ccsr_payload(node, base, gmp):
-                src_y_va = node.payload.get("src_y", 0)
-                src_u_va = node.payload.get("src_u", 0)
-                src_v_va = node.payload.get("src_v", 0)
-                if not (src_y_va and src_u_va and src_v_va):
-                    raise RuntimeError(
-                        f"CCSR pack: missing mpv VA "
-                        f"(y={src_y_va:#x} u={src_u_va:#x} v={src_v_va:#x})")
-                src_y_stride = int(node.payload.get(
-                    "src_y_stride", _ccsr_W * 2))
-                src_uv_stride = int(node.payload.get(
-                    "src_uv_stride", _ccsr_cW * 2))
-                y_row = _ccsr_W * 2
-                uv_row = _ccsr_cW * 2
-                def _copy_plane(local_off, va, rows, row_bytes, stride):
-                    if stride == row_bytes:
-                        ctypes.memmove(base + local_off, va,
-                                        row_bytes * rows)
-                    else:
-                        # Strided source: one vectorised numpy copy
-                        # instead of `rows` Python-level memmoves.
-                        src_buf = (ctypes.c_char * (
-                            stride * (rows - 1) + row_bytes)
-                        ).from_address(va)
-                        src = np.lib.stride_tricks.as_strided(
-                            np.frombuffer(src_buf, dtype=np.uint8),
-                            shape=(rows, row_bytes), strides=(stride, 1))
-                        dst_buf = (ctypes.c_char * (
-                            row_bytes * rows)
-                        ).from_address(base + local_off)
-                        np.copyto(np.frombuffer(dst_buf, dtype=np.uint8)
-                                  .reshape(rows, row_bytes), src)
-                _copy_plane(_ccsr_src_offs["ya"], src_y_va,
-                             _ccsr_H, y_row, src_y_stride)
-                _copy_plane(_ccsr_src_offs["ua"], src_u_va,
-                             _ccsr_cH, uv_row, src_uv_stride)
-                _copy_plane(_ccsr_src_offs["va"], src_v_va,
-                             _ccsr_cH, uv_row, src_uv_stride)
-
-            # Tripped by the liveness watchdog when the worker
-            # connection dies: stops the dispatch loop, which hands all
-            # queued + claimed work back to the host loop (clean
-            # degradation to single-machine instead of every pair
-            # waiting out its 1 s black-frame timeout).
-            _guest_down = threading.Event()
-
-            def _guest_dispatch_loop():
-                """Guest dispatch loop. Asks mgr for any task it can
-                run (CCSR / INTERP / SR_INTERP); priority is set by
-                _GUEST_PRIORITY in queue_mgr. Atomic priority
-                resolution means a temporarily-empty primary queue
-                doesn't lock us into waiting — we wake on any
-                submit_frame / task_done notify and re-check all
-                eligible queues."""
-                _prof_on = os.environ.get("DUAL_PROFILE", "0") == "1"
-                _prof = {"cpu_ms": 0.0, "claim_retries": 0,
-                          "dst_va_waits": 0, "n": 0,
-                          "last_report": _time.perf_counter()}
-                # Claim-before-pop, mirroring the host loop: never take
-                # a task off the shared queue until we hold the RDMA
-                # slot to run it. The old pop-then-claim order parked a
-                # popped task here while all guest slots were busy —
-                # head-of-line blocking the (possibly idle) host.
-                slot = None
-                _claim_retries = 0
-                while not _guest_down.is_set():
-                    while slot is None:
-                        if _guest_down.is_set() or queue_mgr._closed:
-                            return
-                        slot = guest_mp.claim_slot(
-                            blocking=True, timeout=0.005)
-                        if slot is None:
-                            _claim_retries += 1
-                    node = queue_mgr.pop_for_guest(
-                        blocking=True, timeout=0.5)
-                    if node is None:
-                        if queue_mgr._closed:
-                            return
-                        continue
-                    if _guest_down.is_set():
-                        queue_mgr.requeue(node)
-                        return
-                    _t_pop = _time.perf_counter() if _prof_on else 0.0
-
-                    # Strict gating: SR_* + CCSR tasks only enter the
-                    # queue after FrameVA.dst_{a,i}_y is set. By
-                    # construction va is set when we pop.
-                    sr_dst_y = sr_dst_u = sr_dst_v = 0
-                    sr_y_stride = sr_uv_stride = 0
-                    if node.type in (TaskType.SR_INTERP, TaskType.CCSR):
-                        va = queue_mgr.get_frame_va(node.frame_idx)
-                        if node.type == TaskType.CCSR:
-                            sr_dst_y, sr_dst_u, sr_dst_v = (
-                                va.dst_a_y, va.dst_a_u, va.dst_a_v)
-                        elif node.output_phase == 3:
-                            sr_dst_y, sr_dst_u, sr_dst_v = (
-                                va.dst_i3_y, va.dst_i3_u, va.dst_i3_v)
-                        elif node.output_phase == 2:
-                            sr_dst_y, sr_dst_u, sr_dst_v = (
-                                va.dst_i2_y, va.dst_i2_u, va.dst_i2_v)
-                        else:
-                            sr_dst_y, sr_dst_u, sr_dst_v = (
-                                va.dst_i_y, va.dst_i_u, va.dst_i_v)
-                        sr_y_stride = va.dst_y_stride
-                        sr_uv_stride = va.dst_uv_stride
-                        assert sr_dst_y != 0, (
-                            f"[guest-dispatch] gating violation: SR/CCSR "
-                            f"popped without dst VA tid={node.id} "
-                            f"K={node.frame_idx} type={node.type} "
-                            f"phase={node.output_phase}")
-
-                    # Slot already claimed before the pop (loop head).
-                    base = guest_mp.get_send_buffer_addr(slot)
-                    poff = guest_mp.get_send_payload_offset()
-                    # SGE list for the zero-copy gather path; stays
-                    # None when the payload was memmoved (CCSR always;
-                    # INTERP/SR_INTERP only if cc MR registration
-                    # failed) so notify_submit picks the staged path.
-                    sges = None
-                    try:
-                        if node.type == TaskType.INTERP:
-                            if guest_mp.cc_lkey is not None:
-                                sges = _interp_payload_sges(_cc, node,
-                                                             guest_mp)
-                            else:
-                                _pack_interp_payload(_cc, node, base,
-                                                      poff, guest_mp)
-                            guest_mp.fill_request(slot, node)
-                        elif node.type == TaskType.CCSR:
-                            _pack_ccsr_payload(node, base, guest_mp)
-                            guest_mp.fill_request(
-                                slot, node,
-                                dst_y_va=sr_dst_y,
-                                dst_u_va=sr_dst_u,
-                                dst_v_va=sr_dst_v,
-                                dst_y_stride=sr_y_stride,
-                                dst_uv_stride=sr_uv_stride)
-                        else:
-                            if guest_mp.cc_lkey is not None:
-                                sges = _sr_payload_sges(_cc, node,
-                                                         guest_mp)
-                            else:
-                                _pack_sr_payload(_cc, node, base, poff,
-                                                  guest_mp)
-                            guest_mp.fill_request(
-                                slot, node,
-                                dst_y_va=sr_dst_y,
-                                dst_u_va=sr_dst_u,
-                                dst_v_va=sr_dst_v,
-                                dst_y_stride=sr_y_stride,
-                                dst_uv_stride=sr_uv_stride)
-                    except Exception as ex:
-                        sys.stderr.write(
-                            f"[guest-dispatch] pack failed task_id={node.id}"
-                            f" type={node.type}: {ex}\n")
-                        guest_mp.release_slot(slot)
-                        slot = None
-                        queue_mgr.task_done(node.id, ok=False,
-                                             error=f"pack: {ex}")
-                        continue
-
-                    if os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1":
-                        sys.stderr.write(
-                            f"[guest-dispatch] task_id={node.id} "
-                            f"type={TaskType(node.type).name} "
-                            f"frame_idx={node.frame_idx} → slot={slot}\n")
-                        sys.stderr.flush()
-                    try:
-                        guest_mp.notify_submit(slot, payload_sges=sges)
-                    except Exception as ex:
-                        # post_send on a dead QP raises — recover the
-                        # slot and fail the task (the watchdog will
-                        # stop this loop shortly).
-                        sys.stderr.write(
-                            f"[guest-dispatch] notify_submit failed "
-                            f"task_id={node.id}: {ex}\n")
-                        guest_mp.release_slot(slot)
-                        slot = None
-                        queue_mgr.task_done(node.id, ok=False,
-                                             error=f"submit: {ex}")
-                        continue
-                    slot = None   # consumed — claim a fresh one next round
-                    if _prof_on:
-                        _prof["cpu_ms"] += (_time.perf_counter() - _t_pop) * 1000
-                        _prof["claim_retries"] += _claim_retries
-                        _prof["n"] += 1
-                        if (_time.perf_counter() - _prof["last_report"]) >= 2.0:
-                            n = _prof["n"]
-                            sys.stderr.write(
-                                f"[profile] GUEST-DISP n={n} "
-                                f"cpu_per_task={_prof['cpu_ms']/n:.2f}ms "
-                                f"claim_retries={_prof['claim_retries']} "
-                                f"dst_va_waits={_prof['dst_va_waits']}\n")
-                            sys.stderr.flush()
-                            _prof = {"cpu_ms": 0.0, "claim_retries": 0,
-                                      "dst_va_waits": 0, "n": 0,
-                                      "last_report": _time.perf_counter()}
-
-            # DUAL_FORCE_HOST=1 disables guest-dispatch so all tasks
-            # run on host_mp. Useful for isolating single-machine PSNR
-            # behavior from cross-machine races.
-            if os.environ.get("DUAL_FORCE_HOST", "0") == "1":
-                sys.stderr.write("[native_dispatcher] DUAL_FORCE_HOST=1 — "
-                                 "guest-dispatch NOT started (host-only "
-                                 "tasks run via host_mp)\n")
-                sys.stderr.flush()
-            else:
-                threading.Thread(target=_guest_dispatch_loop, daemon=True,
-                                  name="guest-dispatch").start()
-                sys.stderr.write("[native_dispatcher] guest-dispatch thread "
-                                 "started\n")
-                sys.stderr.flush()
-
-                def _liveness_watchdog():
-                    """Block on the liveness socket for the session's
-                    lifetime. The worker never sends again after the
-                    ready byte, so any recv return — EOF (clean worker
-                    exit) or OSError (RST / keepalive timeout, ~3 s
-                    after an ungraceful death) — means the worker is
-                    gone. Before this watchdog existed nobody read the
-                    socket post-ready: a dead worker left its in-flight
-                    tasks RUNNING forever (1 s black-frame timeout per
-                    pair) and the guest loop wedged once the 4 RDMA
-                    slots leaked."""
-                    try:
-                        while True:
-                            b = _liveness_sock.recv(1)
-                            if not b:
-                                break
-                            # Stray byte (only 'R' is ever sent, and
-                            # that was consumed before we started) —
-                            # ignore.
-                    except OSError:
-                        pass
-                    if _guest_down.is_set():
-                        return
-                    _guest_down.set()
+            # cc_cache writeback callback:
+            #   INTERP payload : ("rgb_interp", rgb_addr, rgb_sz)
+            #     → memmoves rgb_interp into cc_cache[dst_slot].rgb_interp
+            #   CCSR payload   : ("ccsr", rgb_addr, rgb_sz, feat_addr, feat_sz)
+            #     → memmoves rgb_padded + rife_features into cc_cache[dst_slot]
+            _cc = host_mp.cc_cache
+            from cc_cache import (FIELD_RGB_PADDED, FIELD_RIFE_FEATURES,
+                                  FIELD_RGB_INTERP)
+            def _cc_writeback(dst_slot: int, payload) -> None:
+                if len(payload) == 1 and payload[0] == "direct_ccsr":
+                    _cc.set_field(dst_slot, FIELD_RGB_PADDED)
+                    _cc.set_field(dst_slot, FIELD_RIFE_FEATURES)
+                elif len(payload) == 1 and payload[0] == "direct_interp":
+                    _cc.set_field(dst_slot, FIELD_RGB_INTERP)
+                elif len(payload) == 3 and payload[0] == "rgb_interp":
+                    _, rgb_addr, rgb_sz = payload
+                    rgb_dst = _cc.field_addr(dst_slot, FIELD_RGB_INTERP)
+                    ctypes.memmove(rgb_dst, rgb_addr, rgb_sz)
+                    _cc.set_field(dst_slot, FIELD_RGB_INTERP)
+                elif len(payload) == 5 and payload[0] == "ccsr":
+                    _, rgb_addr, rgb_sz, feat_addr, feat_sz = payload
+                    rgb_dst = _cc.field_addr(dst_slot, FIELD_RGB_PADDED)
+                    feat_dst = _cc.field_addr(dst_slot, FIELD_RIFE_FEATURES)
+                    ctypes.memmove(rgb_dst,  rgb_addr,  rgb_sz)
+                    ctypes.memmove(feat_dst, feat_addr, feat_sz)
+                    _cc.set_field(dst_slot, FIELD_RGB_PADDED)
+                    _cc.set_field(dst_slot, FIELD_RIFE_FEATURES)
+                else:
                     sys.stderr.write(
-                        "[native_dispatcher] worker liveness lost — "
-                        "stopping guest dispatch, failing in-flight "
-                        "guest tasks, continuing host-only\n")
-                    sys.stderr.flush()
-                    try:
-                        n_failed = guest_mp.fail_inflight(
-                            "worker connection lost")
-                        sys.stderr.write(
-                            f"[native_dispatcher] recovered {n_failed} "
-                            f"in-flight guest task(s)\n")
-                        sys.stderr.flush()
-                    except Exception as ex:
-                        sys.stderr.write(
-                            f"[native_dispatcher] in-flight recovery "
-                            f"failed: {ex}\n")
-                        sys.stderr.flush()
-                    # Publish the degraded state so sr_keys.lua's
-                    # Shift+F9 OSD reflects reality (retriable from a
-                    # single keypress, same as a connect failure).
-                    try:
-                        with open("/tmp/dual_machine_active", "w") as _f:
-                            _f.write("0")
-                    except OSError:
-                        pass
+                        f"[cc_writeback] unknown payload shape "
+                        f"len={len(payload)} head={payload[0] if payload else None}\n")
 
-                threading.Thread(target=_liveness_watchdog, daemon=True,
-                                  name="worker-liveness").start()
-                sys.stderr.write("[native_dispatcher] worker liveness "
-                                 "watchdog started\n")
+            # task_done callback: queue_mgr is the source of truth. We
+            # tag result with executor="guest" so _compute_split_task can
+            # recognise that the SR_* output is already in mpv VA (not in
+            # host_mp.shm.slot_dst) and skip the host-side memmove.
+            def _guest_task_done(task_id: int) -> None:
+                if os.environ.get("CLUSTER_REFCOUNT_DBG", "0") == "1":
+                    sys.stderr.write(
+                        f"[ref-caller] guest_mp-cq task_done({task_id})\n")
+                    sys.stderr.flush()
+                queue_mgr.task_done(task_id, ok=True,
+                                     result={"executor": "guest"})
+
+            def _guest_task_fail(task_id: int, reason: str, source_backup) -> None:
+                if queue_mgr.retry_task(task_id, source_backup):
+                    sys.stderr.write(
+                        f"[native_dispatcher] requeued task {task_id} after worker loss\n")
+                else:
+                    queue_mgr.task_done(task_id, ok=False, error=reason)
+
+            def _guest_transport_error(reason: str) -> None:
+                sys.stderr.write(f"[native_dispatcher] worker transport error: {reason}\n")
+                try: _liveness_sock.shutdown(_sock_mod.SHUT_RDWR)
+                except OSError: pass
+
+            # Mid SEND arrival → unblock downstream INTERPs gated on
+            # CCSR stage 0. Stage idx encoded by guest_mp's CQ thread.
+            def _guest_task_stage_done(task_id: int, stage_idx: int) -> None:
+                if os.environ.get("CLUSTER_REFCOUNT_DBG", "0") == "1":
+                    sys.stderr.write(
+                        f"[ref-caller] guest_mp-cq task_stage_done("
+                        f"{task_id}, {stage_idx})\n")
+                    sys.stderr.flush()
+                queue_mgr.task_stage_done(task_id, stage_idx)
+
+            # GuestMP reads CLUSTER_DOWNSAMPLE_PRE env to derive proc dims for
+            # the INTERP rgb_interp ferry size. Make sure it sees the same
+            # value we passed in handshake.
+            os.environ["CLUSTER_DOWNSAMPLE_PRE"] = str(downsample_pre)
+            # GuestMP / _pack_interp_payload compute wire offsets from
+            # WMP_SPLIT_PH/PW (= RIFE-padded source dims). Default 1088/1920
+            # is for 1080p; on 720p sources the actual rife_cfg pH/pW is
+            # 768/1280. Without this override host's pack offsets diverge
+            # from the worker's split_src_views layout (worker's WMP_SPLIT_PH
+            # comes from layout.pH propagated via _child_env, which IS
+            # correct), causing worker to read rgb_padded_b out of the
+            # middle of features_a — silent 33-9 dB PSNR drop on INTERP.
+            os.environ["WMP_SPLIT_PH"] = str(int(rife_cfg["ph"]))
+            os.environ["WMP_SPLIT_PW"] = str(int(rife_cfg["pw"]))
+            try:
+                guest_mp = GuestMP(
+                    H=H, W=W, scale=output_scale,
+                    sub_w=src_sub_w, sub_h=src_sub_h,
+                    dst_sub_w=dst_sub_w, dst_sub_h=dst_sub_h,
+                    pH=int(rife_cfg["ph"]),
+                    pW=int(rife_cfg["pw"]),
+                    enc_ch=int(rife_cfg.get("encode_channel", 0) or 0),
+                    n_slots=_guest_slots,
+                    rdma_dev=rdma_dev,
+                    rdma_port=1, rdma_gid_index=rdma_gid,
+                    peer_ip=worker_ip,
+                    peer_handshake_port=_guest_port,
+                    cc_cache_writeback_fn=_cc_writeback,
+                    cc_cache=_cc,
+                    task_done_fn=_guest_task_done,
+                    task_fail_fn=_guest_task_fail,
+                    transport_error_fn=_guest_transport_error,
+                    task_stage_done_fn=_guest_task_stage_done,
+                    log=lambda m: sys.stderr.write(m + "\n"),
+                )
+                guest_mp._pull_controller = _pull_coordinator
+                sys.stderr.write(
+                    f"[native_dispatcher] GuestMP up: slots={_guest_slots} "
+                    f"peer={worker_ip}:{_guest_port}\n")
                 sys.stderr.flush()
+                # Publish to the holder so _split_dispatch_loop (already
+                # running) starts gating its compute-q steal on guest's
+                # slot availability.
+                _guest_mp_holder.append(guest_mp)
+                # publish to atexit's holder so it can close on exit
+                try:
+                    _guest_close_holder.append(guest_mp)
+                except Exception:
+                    pass
+            except Exception as ex:
+                sys.stderr.write(
+                    f"[native_dispatcher] GuestMP setup failed "
+                    f"({type(ex).__name__}: {ex}); falling back to "
+                    f"host_mp-only split-task path\n")
+                sys.stderr.flush()
+                guest_mp = None
+
+            # Second dispatch loop: pulls non-CC tasks from compute_q,
+            # packs cc_cache field data into the guest_mp send buffer,
+            # and posts via notify_submit. Runs in parallel with the
+            # host dispatch loop above; queue_mgr's _cv-locked pop_compute
+            # is multi-consumer safe (each task is delivered to exactly
+            # one loop). See SPLIT_TASK_ARCHITECTURE.md §13.
+            if guest_mp is not None:
+                from cc_cache import FIELD_RGB_PADDED, FIELD_RIFE_FEATURES
+
+                # Zero-copy dispatch: register the cc_cache region as an MR
+                # so INTERP / SR_INTERP payloads can be described as SGEs
+                # pointing straight into cc_cache — the NIC gathers them,
+                # replacing a ~58 MB-per-INTERP CPU memmove through the
+                # ~5 GB/s cudaHostRegister'd read path. Falls back to the
+                # memmove pack functions below if registration fails.
+                # Lifetime is safe: queue_mgr refcounts pin every referenced
+                # slot until task_done (which always trails the SEND
+                # completion), and the seek-flush sweep keeps slots of
+                # RUNNING tasks alive.
+                guest_mp.register_cc_cache(_cc.addr, _cc.layout.total_size)
+
+                def _interp_payload_sges(cc, node, gmp):
+                    """SGE description of the INTERP wire payload (same
+                    byte order the memmove fallback produces)."""
+                    src_a = node.payload["src_cc_slot_a"]
+                    src_b = node.payload["src_cc_slot_b"]
+                    rgb_sz = gmp._rgb_padded_bytes
+                    ft_sz  = gmp._rife_features_bytes
+                    k = gmp.cc_lkey
+                    return [
+                        (cc.field_addr(src_a, FIELD_RGB_PADDED),    rgb_sz, k),
+                        (cc.field_addr(src_a, FIELD_RIFE_FEATURES), ft_sz,  k),
+                        (cc.field_addr(src_b, FIELD_RGB_PADDED),    rgb_sz, k),
+                        (cc.field_addr(src_b, FIELD_RIFE_FEATURES), ft_sz,  k),
+                    ]
+
+                def _sr_payload_sges(cc, node, gmp):
+                    src = node.payload["src_cc_slot_a"]
+                    return [(cc.field_addr(src, FIELD_RGB_INTERP),
+                             gmp._interp_dst_rgb_bytes, gmp.cc_lkey)]
+
+                def _pack_interp_payload(cc, node, base, poff, gmp):
+                    """Wire layout (must match worker_3proc.split_src_views):
+                      rgb_padded_a, features_a, rgb_padded_b, features_b
+                    each contiguous, in slot.src after the 128B header.
+                    Memmove fallback for _interp_payload_sges."""
+                    src_a = node.payload["src_cc_slot_a"]
+                    src_b = node.payload["src_cc_slot_b"]
+                    rgb_sz = gmp._rgb_padded_bytes
+                    ft_sz  = gmp._rife_features_bytes
+                    cur = poff
+                    for cc_slot in (src_a, src_b):
+                        ctypes.memmove(
+                            base + cur,
+                            cc.field_addr(cc_slot, FIELD_RGB_PADDED),
+                            rgb_sz)
+                        cur += rgb_sz
+                        ctypes.memmove(
+                            base + cur,
+                            cc.field_addr(cc_slot, FIELD_RIFE_FEATURES),
+                            ft_sz)
+                        cur += ft_sz
+
+                def _pack_sr_payload(cc, node, base, poff, gmp):
+                    """Wire layout: rgb_interp (fp16 RGB at proc dims).
+                    cc_cache.rgb_interp is already laid out as (1, 3, proc_h,
+                    proc_w) — single contiguous memmove is the whole payload.
+                    Memmove fallback for _sr_payload_sges."""
+                    src = node.payload["src_cc_slot_a"]
+                    total = gmp._interp_dst_rgb_bytes
+                    ctypes.memmove(base + poff,
+                                    cc.field_addr(src, FIELD_RGB_INTERP),
+                                    total)
+
+                # Pack CCSR src payload (1080p YUV) from mpv frame VA into
+                # slot.src's ya/ua/va region. Mirrors host dma_proc's
+                # behavior but happens in mpv process (UMA shm means a
+                # simple memmove handles it). Honor mpv's strides if
+                # non-packed (vapoursynth row pad).
+                _ccsr_src_offs = {name: off for name, off, _, _, _ in
+                                   guest_mp.src_layout}
+                _ccsr_H, _ccsr_W = guest_mp.H, guest_mp.W
+                _ccsr_cH, _ccsr_cW = guest_mp.cH, guest_mp.cW
+                def _pack_ccsr_payload(node, base, gmp):
+                    src_y_va = node.payload.get("src_y", 0)
+                    src_u_va = node.payload.get("src_u", 0)
+                    src_v_va = node.payload.get("src_v", 0)
+                    if not (src_y_va and src_u_va and src_v_va):
+                        raise RuntimeError(
+                            f"CCSR pack: missing mpv VA "
+                            f"(y={src_y_va:#x} u={src_u_va:#x} v={src_v_va:#x})")
+                    src_y_stride = int(node.payload.get(
+                        "src_y_stride", _ccsr_W * 2))
+                    src_uv_stride = int(node.payload.get(
+                        "src_uv_stride", _ccsr_cW * 2))
+                    y_row = _ccsr_W * 2
+                    uv_row = _ccsr_cW * 2
+                    def _copy_plane(local_off, va, rows, row_bytes, stride):
+                        if stride == row_bytes:
+                            ctypes.memmove(base + local_off, va,
+                                            row_bytes * rows)
+                        else:
+                            # Strided source: one vectorised numpy copy
+                            # instead of `rows` Python-level memmoves.
+                            src_buf = (ctypes.c_char * (
+                                stride * (rows - 1) + row_bytes)
+                            ).from_address(va)
+                            src = np.lib.stride_tricks.as_strided(
+                                np.frombuffer(src_buf, dtype=np.uint8),
+                                shape=(rows, row_bytes), strides=(stride, 1))
+                            dst_buf = (ctypes.c_char * (
+                                row_bytes * rows)
+                            ).from_address(base + local_off)
+                            np.copyto(np.frombuffer(dst_buf, dtype=np.uint8)
+                                      .reshape(rows, row_bytes), src)
+                    _copy_plane(_ccsr_src_offs["ya"], src_y_va,
+                                 _ccsr_H, y_row, src_y_stride)
+                    _copy_plane(_ccsr_src_offs["ua"], src_u_va,
+                                 _ccsr_cH, uv_row, src_uv_stride)
+                    _copy_plane(_ccsr_src_offs["va"], src_v_va,
+                                 _ccsr_cH, uv_row, src_uv_stride)
+
+                # Tripped by the liveness watchdog when the worker
+                # connection dies: stops the dispatch loop, which hands all
+                # queued + claimed work back to the host loop (clean
+                # degradation to single-machine instead of every pair
+                # waiting out its 1 s black-frame timeout).
+                _guest_down = threading.Event()
+                _guest_down_events.append(_guest_down)
+
+                def _guest_dispatch_loop():
+                    """Guest dispatch loop. Asks mgr for any task it can
+                    run (CCSR / INTERP / SR_INTERP); priority is set by
+                    _GUEST_PRIORITY in queue_mgr. Atomic priority
+                    resolution means a temporarily-empty primary queue
+                    doesn't lock us into waiting — we wake on any
+                    submit_frame / task_done notify and re-check all
+                    eligible queues."""
+                    _prof_on = os.environ.get("CLUSTER_PROFILE", "0") == "1"
+                    _prof = {"cpu_ms": 0.0, "claim_retries": 0,
+                              "dst_va_waits": 0, "n": 0,
+                              "last_report": _time.perf_counter()}
+                    # Claim-before-pop, mirroring the host loop: never take
+                    # a task off the shared queue until we hold the RDMA
+                    # slot to run it. The old pop-then-claim order parked a
+                    # popped task here while all guest slots were busy —
+                    # head-of-line blocking the (possibly idle) host.
+                    slot = None
+                    _claim_retries = 0
+                    while not _guest_down.is_set():
+                        while slot is None:
+                            if _guest_down.is_set() or queue_mgr._closed:
+                                return
+                            slot = guest_mp.claim_slot(
+                                blocking=True, timeout=0.005)
+                            if slot is None:
+                                _claim_retries += 1
+                        node = queue_mgr.pop_for_guest(
+                            blocking=True, timeout=0.5)
+                        if node is None:
+                            if queue_mgr._closed:
+                                return
+                            continue
+                        if _guest_down.is_set():
+                            queue_mgr.requeue(node)
+                            guest_mp.release_slot(slot)
+                            return
+                        _t_pop = _time.perf_counter() if _prof_on else 0.0
+
+                        # Strict gating: SR_* + CCSR tasks only enter the
+                        # queue after FrameVA.dst_{a,i}_y is set. By
+                        # construction va is set when we pop.
+                        sr_dst_y = sr_dst_u = sr_dst_v = 0
+                        sr_y_stride = sr_uv_stride = 0
+                        if node.type in (TaskType.SR_INTERP, TaskType.CCSR):
+                            va = queue_mgr.get_frame_va(node.frame_idx)
+                            spec = node.payload.get("_speculative_output")
+                            if node.type == TaskType.CCSR and spec is not None:
+                                sr_dst_y, sr_dst_u, sr_dst_v = (
+                                    ctypes.addressof(spec["y"]), ctypes.addressof(spec["u"]),
+                                    ctypes.addressof(spec["v"]))
+                                sr_y_stride, sr_uv_stride = spec["y_stride"], spec["uv_stride"]
+                            elif node.type == TaskType.CCSR:
+                                sr_dst_y, sr_dst_u, sr_dst_v = (
+                                    va.dst_a_y, va.dst_a_u, va.dst_a_v)
+                            elif node.output_phase == 3:
+                                sr_dst_y, sr_dst_u, sr_dst_v = (
+                                    va.dst_i3_y, va.dst_i3_u, va.dst_i3_v)
+                            elif node.output_phase == 2:
+                                sr_dst_y, sr_dst_u, sr_dst_v = (
+                                    va.dst_i2_y, va.dst_i2_u, va.dst_i2_v)
+                            else:
+                                sr_dst_y, sr_dst_u, sr_dst_v = (
+                                    va.dst_i_y, va.dst_i_u, va.dst_i_v)
+                            if node.type != TaskType.CCSR or spec is None:
+                                sr_y_stride = va.dst_y_stride
+                                sr_uv_stride = va.dst_uv_stride
+                            assert sr_dst_y != 0, (
+                                f"[guest-dispatch] gating violation: SR/CCSR "
+                                f"popped without dst VA tid={node.id} "
+                                f"K={node.frame_idx} type={node.type} "
+                                f"phase={node.output_phase}")
+
+                        # Slot already claimed before the pop (loop head).
+                        base = guest_mp.get_send_buffer_addr(slot)
+                        poff = guest_mp.get_send_payload_offset()
+                        # SGE list for the zero-copy gather path; stays
+                        # None when the payload was memmoved (CCSR always;
+                        # INTERP/SR_INTERP only if cc MR registration
+                        # failed) so notify_submit picks the staged path.
+                        sges = None
+                        try:
+                            if node.type == TaskType.INTERP:
+                                if guest_mp.cc_lkey is not None:
+                                    sges = _interp_payload_sges(_cc, node,
+                                                                 guest_mp)
+                                else:
+                                    _pack_interp_payload(_cc, node, base,
+                                                          poff, guest_mp)
+                                guest_mp.fill_request(slot, node)
+                            elif node.type == TaskType.CCSR:
+                                _pack_ccsr_payload(node, base, guest_mp)
+                                guest_mp.fill_request(
+                                    slot, node,
+                                    dst_y_va=sr_dst_y,
+                                    dst_u_va=sr_dst_u,
+                                    dst_v_va=sr_dst_v,
+                                    dst_y_stride=sr_y_stride,
+                                    dst_uv_stride=sr_uv_stride)
+                            else:
+                                if guest_mp.cc_lkey is not None:
+                                    sges = _sr_payload_sges(_cc, node,
+                                                             guest_mp)
+                                else:
+                                    _pack_sr_payload(_cc, node, base, poff,
+                                                      guest_mp)
+                                guest_mp.fill_request(
+                                    slot, node,
+                                    dst_y_va=sr_dst_y,
+                                    dst_u_va=sr_dst_u,
+                                    dst_v_va=sr_dst_v,
+                                    dst_y_stride=sr_y_stride,
+                                    dst_uv_stride=sr_uv_stride)
+                        except Exception as ex:
+                            sys.stderr.write(
+                                f"[guest-dispatch] pack failed task_id={node.id}"
+                                f" type={node.type}: {ex}\n")
+                            guest_mp.release_slot(slot)
+                            slot = None
+                            queue_mgr.task_done(node.id, ok=False,
+                                                 error=f"pack: {ex}")
+                            continue
+
+                        if os.environ.get("CLUSTER_SPLIT_DEBUG", "0") == "1":
+                            sys.stderr.write(
+                                f"[guest-dispatch] peer={worker_ip} task_id={node.id} "
+                                f"type={TaskType(node.type).name} "
+                                f"frame_idx={node.frame_idx} → slot={slot}\n")
+                            sys.stderr.flush()
+                        try:
+                            guest_mp.notify_submit(slot, payload_sges=sges)
+                        except Exception as ex:
+                            # A partial multi-rail post may still be in
+                            # flight. The watchdog closes all QPs before
+                            # requeuing its task and releasing its slot.
+                            sys.stderr.write(
+                                f"[guest-dispatch] notify_submit failed "
+                                f"task_id={node.id}: {ex}\n")
+                            _guest_transport_error(f"submit: {ex}")
+                            return
+                        slot = None   # consumed — claim a fresh one next round
+                        if _prof_on:
+                            _prof["cpu_ms"] += (_time.perf_counter() - _t_pop) * 1000
+                            _prof["claim_retries"] += _claim_retries
+                            _prof["n"] += 1
+                            if (_time.perf_counter() - _prof["last_report"]) >= 2.0:
+                                n = _prof["n"]
+                                sys.stderr.write(
+                                    f"[profile] GUEST-DISP n={n} "
+                                    f"cpu_per_task={_prof['cpu_ms']/n:.2f}ms "
+                                    f"claim_retries={_prof['claim_retries']} "
+                                    f"dst_va_waits={_prof['dst_va_waits']}\n")
+                                sys.stderr.flush()
+                                _prof = {"cpu_ms": 0.0, "claim_retries": 0,
+                                          "dst_va_waits": 0, "n": 0,
+                                          "last_report": _time.perf_counter()}
+
+                # CLUSTER_FORCE_HOST=1 disables guest-dispatch so all tasks
+                # run on host_mp. Useful for isolating single-machine PSNR
+                # behavior from cross-machine races.
+                if os.environ.get("CLUSTER_FORCE_HOST", "0") == "1":
+                    sys.stderr.write("[native_dispatcher] CLUSTER_FORCE_HOST=1 — "
+                                     "guest-dispatch NOT started (host-only "
+                                     "tasks run via host_mp)\n")
+                    sys.stderr.flush()
+                else:
+                    _guest_thread = threading.Thread(
+                        target=_guest_dispatch_loop, daemon=True,
+                        name="guest-dispatch")
+                    _guest_threads.append(_guest_thread)
+                    _guest_thread.start()
+                    sys.stderr.write("[native_dispatcher] guest-dispatch thread "
+                                     "started\n")
+                    sys.stderr.flush()
+
+                    def _liveness_watchdog():
+                        """Block on the liveness socket for the session's
+                        lifetime. The worker never sends again after the
+                        ready byte, so any recv return — EOF (clean worker
+                        exit) or OSError (RST / keepalive timeout, ~3 s
+                        after an ungraceful death) — means the worker is
+                        gone. Before this watchdog existed nobody read the
+                        socket post-ready: a dead worker left its in-flight
+                        tasks RUNNING forever (1 s black-frame timeout per
+                        pair) and the guest loop wedged once the 4 RDMA
+                        slots leaked."""
+                        try:
+                            while True:
+                                b = _liveness_sock.recv(1)
+                                if not b:
+                                    break
+                                # Stray byte (only 'R' is ever sent, and
+                                # that was consumed before we started) —
+                                # ignore.
+                        except OSError:
+                            pass
+                        if _guest_down.is_set():
+                            return
+                        _guest_down.set()
+                        with _worker_state_lock:
+                            _active_worker_hosts.discard(worker_ip)
+                            remaining = [host for host in _worker_hosts
+                                         if host in _active_worker_hosts]
+                            os.environ["CLUSTER_WORKER_HOSTS"] = ",".join(remaining)
+                            os.environ["CLUSTER_WORKER_HOST"] = remaining[0] if remaining else ""
+                        sys.stderr.write(
+                            "[native_dispatcher] worker liveness lost — "
+                            f"stopping {worker_ip}, retrying its tasks; "
+                            f"remaining workers={len(remaining)}\n")
+                        sys.stderr.flush()
+                        try:
+                            # Stop new posts and destroy the dead QPs
+                            # before another worker can touch the same
+                            # destination buffers.
+                            _guest_thread.join(timeout=3.0)
+                            if _guest_thread.is_alive():
+                                raise RuntimeError("guest dispatch did not stop")
+                            guest_mp.close()
+                            n_failed = guest_mp.fail_inflight(
+                                "worker connection lost")
+                            sys.stderr.write(
+                                f"[native_dispatcher] recovered {n_failed} "
+                                f"in-flight guest task(s)\n")
+                            sys.stderr.flush()
+                        except Exception as ex:
+                            sys.stderr.write(
+                                f"[native_dispatcher] in-flight recovery "
+                                f"failed: {ex}\n")
+                            sys.stderr.flush()
+                        # Publish the degraded state so sr_keys.lua's
+                        # Shift+F9 OSD reflects reality (retriable from a
+                        # single keypress, same as a connect failure).
+                        if all(event.is_set() for event in _guest_down_events):
+                            try:
+                                with open("/tmp/dual_machine_active", "w") as _f:
+                                    _f.write("0")
+                            except OSError:
+                                pass
+
+                    threading.Thread(target=_liveness_watchdog, daemon=True,
+                                      name="worker-liveness").start()
+                    sys.stderr.write("[native_dispatcher] worker liveness "
+                                     "watchdog started\n")
+                    sys.stderr.flush()
+
+        return guest_mp
+
+    _guests = []
+    for worker_ip, _liveness_sock in zip(_worker_hosts, _liveness_socks):
+        _guest = _setup_guest(worker_ip, _liveness_sock)
+        if _guest is not None:
+            _guests.append(_guest)
+        else:
+            with _worker_state_lock:
+                _active_worker_hosts.discard(worker_ip)
+                remaining = [host for host in _worker_hosts
+                             if host in _active_worker_hosts]
+                os.environ["CLUSTER_WORKER_HOSTS"] = ",".join(remaining)
+                os.environ["CLUSTER_WORKER_HOST"] = remaining[0] if remaining else ""
+            try: _liveness_sock.shutdown(_sock_mod.SHUT_RDWR)
+            except OSError: pass
+            _liveness_sock.close()
+    guest_mp = _guests[0] if _guests else None
 
     # ── State ─────────────────────────────────────────────────────
     interp_kw = dict(size=(ocH, ocW), mode=chroma_kernel)
@@ -1548,20 +1689,20 @@ def make_dispatcher(
     _fps_lock = threading.Lock()
     _fps_state = {"count": 0, "t_first": 0.0, "t_last": 0.0,
                    "in_flight": 0, "max_in_flight": 0}
-    _report_every = int(os.environ.get("DUAL_REPORT_FPS", "0"))
-    _warmup_skip = int(os.environ.get("DUAL_REPORT_WARMUP", "30"))
+    _report_every = int(os.environ.get("CLUSTER_REPORT_FPS", "0"))
+    _warmup_skip = int(os.environ.get("CLUSTER_REPORT_WARMUP", "30"))
 
     # ── Probe: mpv frame_thread gap + compute() breakdown ────────
-    # DUAL_PROBE_MPV_GAP=1 enables per-thread "gap" timing (between
+    # CLUSTER_PROBE_MPV_GAP=1 enables per-thread "gap" timing (between
     # this thread's _leave() and its next _enter() — the alleged
     # ~16 ms mpv-internal overhead) plus a submit / wait / post
     # breakdown for the split-task path. Aggregates p50/p95/p99/max
-    # over a sliding window and dumps every DUAL_PROBE_EVERY frames
+    # over a sliding window and dumps every CLUSTER_PROBE_EVERY frames
     # plus on cleanup. Zero cost when off (one env check at init).
-    _probe_on = os.environ.get("DUAL_PROBE_MPV_GAP", "0") == "1"
-    _probe_every = int(os.environ.get("DUAL_PROBE_EVERY", "200"))
-    _probe_warm = int(os.environ.get("DUAL_PROBE_WARMUP", "30"))
-    _probe_buf = int(os.environ.get("DUAL_PROBE_BUF", "4096"))
+    _probe_on = os.environ.get("CLUSTER_PROBE_MPV_GAP", "0") == "1"
+    _probe_every = int(os.environ.get("CLUSTER_PROBE_EVERY", "200"))
+    _probe_warm = int(os.environ.get("CLUSTER_PROBE_WARMUP", "30"))
+    _probe_buf = int(os.environ.get("CLUSTER_PROBE_BUF", "4096"))
     _probe_local = threading.local()
     _probe_state = {
         "n": 0,
@@ -1724,6 +1865,38 @@ def make_dispatcher(
         except Exception:
             pass
 
+    def _speculative_neighbor(pair_k, epoch, y, u, v, y_stride, uv_stride):
+        if not queue_mgr.needs_speculative_neighbor(pair_k, epoch):
+            return
+
+        def pack(addr, rows, row_bytes, stride):
+            if not addr or stride < row_bytes:
+                raise ValueError("invalid speculative source plane")
+            buf = ctypes.create_string_buffer(rows * row_bytes)
+            target = ctypes.addressof(buf)
+            if stride == row_bytes:
+                _memmove(target, addr, rows * row_bytes)
+            else:
+                for row in range(rows):
+                    _memmove(target + row * row_bytes, addr + row * stride, row_bytes)
+            return buf
+
+        source_buffers = (pack(y, H, W * 2, y_stride),
+                          pack(u, cH, cW * 2, uv_stride),
+                          pack(v, cH, cW * 2, uv_stride))
+        source = {"src_y": ctypes.addressof(source_buffers[0]),
+                  "src_u": ctypes.addressof(source_buffers[1]),
+                  "src_v": ctypes.addressof(source_buffers[2]),
+                  "src_y_stride": W * 2, "src_uv_stride": cW * 2,
+                  "_retry_source_backing": source_buffers}
+        output = {"y": ctypes.create_string_buffer(oH * oW * 2),
+                  "u": ctypes.create_string_buffer(ocH * ocW * 2),
+                  "v": ctypes.create_string_buffer(ocH * ocW * 2),
+                  "y_stride": oW * 2, "uv_stride": ocW * 2}
+        if queue_mgr.install_speculative_neighbor(pair_k, epoch, source=source, output=output):
+            if os.environ.get("CLUSTER_SPECULATIVE_DEBUG", "0") == "1":
+                sys.stderr.write(f"[native_dispatcher] prepared speculative frame {pair_k + 1}\n")
+
     def _compute_split_task(pair_k, phase,
                               sa_y, sa_u, sa_v, sb_y, sb_u, sb_v,
                               dst_y, dst_u, dst_v,
@@ -1737,14 +1910,18 @@ def make_dispatcher(
         # two). Falls back to the split version if queue_mgr doesn't
         # expose the fused API yet.
         _t_sub0 = _time.perf_counter() if _probe_on else 0.0
+        _submit_epoch = None
         if _qm_submit_with_phase_dst is not None:
-            _qm_submit_with_phase_dst(
+            _submit_epoch = queue_mgr.current_seek_epoch()
+            if not _qm_submit_with_phase_dst(
                 pair_k, phase,
                 sa_y=sa_y, sa_u=sa_u, sa_v=sa_v,
                 sb_y=sb_y, sb_u=sb_u, sb_v=sb_v,
                 sa_y_stride=sa_y_stride, sa_uv_stride=sa_uv_stride,
                 dst_y=dst_y, dst_u=dst_u, dst_v=dst_v,
-                dst_y_stride=dst_y_stride, dst_uv_stride=dst_uv_stride)
+                dst_y_stride=dst_y_stride, dst_uv_stride=dst_uv_stride,
+                expected_epoch=_submit_epoch):
+                return
         else:
             va = _FrameVA(
                 pair_k=pair_k,
@@ -1767,20 +1944,24 @@ def make_dispatcher(
         # per-phase wait lets each compute() return as soon as its own
         # output is in mpv VA.
         #
-        # Cold first pair completes in <250 ms (prewarm already done
-        # in make_dispatcher); steady-state is <100 ms. Default 1 s
-        # is the safety-net upper bound for the "seek hits a K
-        # waiting on its successor's submit AND lua seek-flush hook
-        # missed firing" worst case. With CF=24 mpv may park up to
-        # ~24 compute() threads in wait_phase_done at seek time;
-        # if any of them hit the trailing-K corner case AND the lua
-        # flush is late, they each timeout in series — keeping this
-        # short minimises the user-visible seek pause. 1 s is well
-        # above steady-state (100 ms) and the cold first-pair
-        # (250 ms), so legitimate computes never trip it.
-        _phase_timeout = float(os.environ.get("DUAL_PHASE_TIMEOUT", "1"))
-        _wait_result = queue_mgr.wait_phase_done(
-            pair_k, phase, timeout=_phase_timeout)
+        # If the next source frame has not been requested after a short
+        # wait, prepare it using owned buffers. This breaks the tail
+        # dependency during low-concurrency playback and seek teardown.
+        _phase_timeout = float(os.environ.get("CLUSTER_PHASE_TIMEOUT", "1"))
+        _wait_start = _time.monotonic()
+        if phase > 0 and _submit_epoch is not None and _phase_timeout > 0.2:
+            _wait_result = queue_mgr.wait_phase_done(
+                pair_k, phase, timeout=0.15, expected_epoch=_submit_epoch)
+            if _wait_result is False:
+                _speculative_neighbor(pair_k, _submit_epoch, sb_y, sb_u, sb_v,
+                                      sa_y_stride, sa_uv_stride)
+                _remaining = max(0.001, _phase_timeout - (_time.monotonic() - _wait_start))
+                _wait_result = queue_mgr.wait_phase_done(
+                    pair_k, phase, timeout=_remaining, expected_epoch=_submit_epoch)
+        else:
+            _wait_result = queue_mgr.wait_phase_done(
+                pair_k, phase, timeout=_phase_timeout,
+                expected_epoch=_submit_epoch)
         if _wait_result == _QM_WAIT_ABANDONED:
             # Seek-flush abandoned the wait. Skip overwriting dst —
             # one frame of buffer-pool residue is acceptable here
@@ -1804,6 +1985,17 @@ def make_dispatcher(
                 f"K={pair_k} phase={phase} — emitted black frame\n")
             sys.stderr.flush()
             return
+        if phase == 0:
+            spec = queue_mgr.speculative_output(pair_k)
+            if spec is not None:
+                from guest_mp import GuestMP
+                GuestMP._copy_plane(ctypes.addressof(spec["y"]), dst_y,
+                                    oH, oW * 2, dst_y_stride)
+                GuestMP._copy_plane(ctypes.addressof(spec["u"]), dst_u,
+                                    ocH, ocW * 2, dst_uv_stride)
+                GuestMP._copy_plane(ctypes.addressof(spec["v"]), dst_v,
+                                    ocH, ocW * 2, dst_uv_stride)
+                queue_mgr.consume_speculative_output(pair_k, spec)
         if _probe_on:
             _t_wait1 = _time.perf_counter()
             _probe_local.bd = (
@@ -1819,7 +2011,7 @@ def make_dispatcher(
     # Read once: per-frame os.environ lookups on the compute hot path
     # cost more than the trace they gate. The env var is a launch-time
     # debug switch, not something toggled mid-session.
-    _compute_trace = os.environ.get("DUAL_COMPUTE_TRACE", "0") == "1"
+    _compute_trace = os.environ.get("CLUSTER_COMPUTE_TRACE", "0") == "1"
 
     def compute(pair_k, phase,
                  sa_y, sa_u, sa_v, sb_y, sb_u, sb_v,
@@ -1872,8 +2064,12 @@ def make_dispatcher(
                 "host_mp": host_mp,
                 "queue_mgr": queue_mgr,
                 "guest_mp": guest_mp,
+                "guests": _guests,
+                "pull_coordinator": _pull_coordinator,
+                "guest_down_events": _guest_down_events,
+                "guest_threads": _guest_threads,
                 "compute": compute,
-                "liveness_sock": _liveness_sock,
+                "liveness_socks": _liveness_socks,
             })
         sys.stderr.write(
             "[native_dispatcher] singleton SAVE — host_mp+queue_mgr+"

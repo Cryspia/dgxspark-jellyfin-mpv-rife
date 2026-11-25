@@ -85,11 +85,19 @@ TT_CCSR        = 5
 # TaskNode.output_phase before the slot is sent.
 
 
+def _output_phase(task_type, node):
+    if task_type == TT_CCSR:
+        return 0
+    return int(getattr(node, "output_phase", node.payload.get("output_phase", 1)))
+
+
 # wr_id encoding for guest_mp's CQ poll loop. Low 16 bits = slot id.
 # Reverse direction (worker → host) is exclusively WRITE_WITH_IMM —
 # slot/stage carried in imm_data, see _imm_encode below. Recv WRs are
 # all dummy placeholders against a tiny MR.
 _WR_SEND_DONE = 0x10000      # host → worker SRC bundle send completion
+_WR_ACK_DONE  = 0x60000      # result slot release WRITE
+_WR_READ_DONE = 0x50000      # leader-initiated result READ
 _WR_RECV_IMM  = 0x40000      # worker → host WRITE_WITH_IMM completion
 _WR_MASK_SLOT = 0xFFFF
 
@@ -116,6 +124,8 @@ class _SlotTask:
     """Per-slot record of the task currently in flight. Populated by
     fill_request, consumed by the CQ thread on response."""
     task_id:        int = 0
+    frame:          int = 0
+    phase:          int = 0
     task_type:      int = 0
     dst_cc_slot:    int = -1   # INTERP — rgb_interp frame 1 destination
     dst_cc_slot_2:  int = -1   # INTERP mult≥3 — frame 2 destination
@@ -125,6 +135,12 @@ class _SlotTask:
     dst_v_va:       int = 0
     dst_y_stride:   int = 0
     dst_uv_stride:  int = 0
+    direct_cc:      bool = False
+    local_inputs:   bool = False
+    keep_worker_data: bool = False
+    prefetched: bool = False
+    fused_sr: bool = False
+    skip_stages:    frozenset = frozenset()
 
 
 class GuestMP:
@@ -143,10 +159,14 @@ class GuestMP:
                  peer_handshake_port: int,
                  cc_cache_writeback_fn: Optional[
                      Callable[[int, "memoryview"], None]] = None,
+                 cc_cache=None,
                  task_done_fn: Optional[Callable[[int], None]] = None,
-                 task_fail_fn: Optional[Callable[[int, str], None]] = None,
+                 task_fail_fn: Optional[Callable[[int, str, Optional[dict]], None]] = None,
+                 transport_error_fn: Optional[Callable[[str], None]] = None,
                  task_stage_done_fn: Optional[
                      Callable[[int, int], None]] = None,
+                 task_prefetch_ready_fn: Optional[Callable[[int], None]] = None,
+                 task_compute_done_fn: Optional[Callable[[int], None]] = None,
                  log=lambda m: None):
         """
         H, W                  source resolution (1080×1920 default)
@@ -165,6 +185,11 @@ class GuestMP:
                               ready. Called AFTER cc_cache_writeback / mpv
                               VA writeback completes.
         """
+        self._pull_enabled = os.environ.get("CLUSTER_PULL_RESULTS", "0") == "1"
+        self._pull_normal = os.environ.get("CLUSTER_PULL_NORMAL", "0") == "1"
+        self._pull_controller = None
+        self._pull_detached = False
+        self._pull_control = None
         self.H, self.W = H, W
         self.scale = scale
         self.sub_w, self.sub_h = sub_w, sub_h
@@ -180,11 +205,13 @@ class GuestMP:
         self.peer_handshake_port = peer_handshake_port
         self.log = log
         self.cc_cache_writeback_fn = cc_cache_writeback_fn
+        self.cc_cache = cc_cache
         self.task_done_fn = task_done_fn
         # (task_id, reason) → None; the dispatcher wires this to
         # queue_mgr.task_done(ok=False) so a dead-worker / QP-error
         # slot doesn't leave its task RUNNING forever.
         self.task_fail_fn = task_fail_fn
+        self.transport_error_fn = transport_error_fn
         # Set by register_cc_cache(); None = zero-copy sends unavailable.
         self._cc_mr = None
         self._cc_mrs: list = []
@@ -195,6 +222,8 @@ class GuestMP:
         # unblock downstream INTERP before the FULL stage completes.
         # None ⇒ skip the mid path.
         self.task_stage_done_fn = task_stage_done_fn
+        self.task_prefetch_ready_fn = task_prefetch_ready_fn
+        self.task_compute_done_fn = task_compute_done_fn
         # Mid-delivery gating env. When set both worker and host post
         # the split sends/recvs (early delivery of mid stages).
         # Default ON (the designed pipeline behaviour; A/B-verified
@@ -203,7 +232,7 @@ class GuestMP:
         # the worker, so both sides always agree. Full rationale at
         # worker_3proc's twin flag.
         self._mid_delivery_enabled = os.environ.get(
-            "DUAL_MID_DELIVERY", "1") == "1"
+            "CLUSTER_MID_DELIVERY", "1") == "1"
 
         # Per-slot dst layout: 4K SR output (yao/uao/vao) plus CCSR
         # mid-out (rgb_padded + rife_features).
@@ -232,7 +261,7 @@ class GuestMP:
         self._rife_features_bytes = 1 * self._enc_ch * self._pH * self._pW * 2
         # Processing dims (= H/downsample_pre); for SR_INTERP input
         # (rgb_interp ferry) and for sizing the RGB writeback.
-        self._downsample_pre = int(os.environ.get("DUAL_DOWNSAMPLE_PRE", "1"))
+        self._downsample_pre = int(os.environ.get("CLUSTER_DOWNSAMPLE_PRE", "1"))
         self._proc_h = H // self._downsample_pre
         self._proc_w = W // self._downsample_pre
         self._sr_y_bytes  = H * W * 2
@@ -248,7 +277,7 @@ class GuestMP:
         for name, off, nbytes, shape, dtype in self.dst_layout:
             self._sr_dst_offs[name] = (off, nbytes, shape, dtype)
 
-        self._interp_mult = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+        self._interp_mult = int(os.environ.get("CLUSTER_INTERP_MULT", "2"))
         if self._interp_mult not in (1, 2, 3, 4):
             self._interp_mult = 2
         # Assert dense-pack INTERP fits in slot.dst (only mult>=2 needs
@@ -259,7 +288,7 @@ class GuestMP:
                 f"INTERP mult={self._interp_mult} needs "
                 f"{_interp_total} B but slot.dst is {self.dst_size} B "
                 f"(proc_h={self._proc_h}, proc_w={self._proc_w}); "
-                f"reduce DUAL_INTERP_MULT or use a smaller source")
+                f"reduce CLUSTER_INTERP_MULT or use a smaller source")
 
         # Per-task SEND lengths (host → worker). slot.src is sized for
         # the worst case (the INTERP overlay), but each task type only
@@ -284,10 +313,10 @@ class GuestMP:
         # ── RDMA setup (one context + one QP per rail) ──────────────
         # 200 Gb/s on a CX7 needs two PCIe paths driven at once, and a
         # context is one PCI function, so a rail here == a context ==
-        # a QP. DUAL_RDMA_DEVS lists them; unset keeps the single-rail
+        # a QP. CLUSTER_RDMA_DEVS lists them; unset keeps the single-rail
         # config, which is the old behaviour byte for byte.
-        self.rails = resolve_rails(os.environ.get("DUAL_RDMA_DEVS"),
-                                    os.environ.get("DUAL_RDMA_GIDS"),
+        self.rails = resolve_rails(os.environ.get("CLUSTER_RDMA_DEVS"),
+                                    os.environ.get("CLUSTER_RDMA_GIDS"),
                                     fallback_dev=rdma_dev,
                                     fallback_gid=rdma_gid_index)
         self.n_rails = len(self.rails)
@@ -311,7 +340,10 @@ class GuestMP:
         # recv per rail at these offsets, so both ends must derive the
         # same partition — it goes over the wire in the blob below
         # rather than being recomputed from assumptions.
-        self.src_parts = src_partition(self.src_size, self.n_rails)
+        balanced = os.environ.get("CLUSTER_BALANCED_SRC", "0") == "1"
+        self.src_parts = src_partition(
+            self.src_size, self.n_rails,
+            balanced_prefix=self._task_send_len[TT_CCSR] if balanced else None)
 
         # Handshake blob (rail 0 carries everything; later rails only
         # need to pair QPs). Layout:
@@ -340,6 +372,29 @@ class GuestMP:
                 max_wr=8 * n_slots,
                 extra_payload=_extra if r == 0 else b""))
         self.ch = self.chs[0]
+        if self._pull_enabled:
+            raw = self.ch.peer_extra
+            if len(raw) < 8:
+                raise RuntimeError("worker did not negotiate result pull")
+            nr, ns = struct.unpack_from("!II", raw)
+            base_size = 8 + 8 * ns + 4 * nr
+            expected_size = base_size + (8 * ns if self._pull_normal else 0)
+            if nr != self.n_rails or not 1 <= ns <= 16 or len(raw) != expected_size:
+                raise RuntimeError("invalid worker result memory table")
+            self._pull_addrs = struct.unpack_from(f"!{ns}Q", raw, 8)
+            self._pull_rkeys = struct.unpack_from(f"!{nr}I", raw, 8 + 8 * ns)
+            if self._pull_normal:
+                from mp_pipeline import ST_PULL_DONE
+                self._pull_state_addrs = struct.unpack_from(f"!{ns}Q", raw, base_size)
+                self._pull_ack_buf = RDMAStagingBuffer(self.ctxs[0], 4)
+                ctypes.c_uint32.from_address(self._pull_ack_buf.addr).value = ST_PULL_DONE
+                self._pull_mid_cv = threading.Condition()
+                self._pull_mid_seen = [set() for _ in range(n_slots)]
+                self._pull_abort = threading.Event()
+            self._pull_events = [threading.Event() for _ in range(n_slots)]
+            self._pull_remaining = [0] * n_slots
+            self._pull_error = [None] * n_slots
+            self._pull_event_lock = threading.Lock()
         log(f"[guest_mp] {self.n_rails} RDMA QP(s) RTS")
 
         # Dummy recv pool, per rail. WRITE_WITH_IMM consumes one recv
@@ -415,6 +470,7 @@ class GuestMP:
                 self._cv.wait(timeout=wait_for)
             slot = self._free.popleft()
             self._state[slot] = ST_FILLED
+            self._task[slot] = _SlotTask()
             return slot
 
     def fill_request(self, slot: int, node,
@@ -455,9 +511,85 @@ class GuestMP:
         # ignore it.
         hdr_buf[_HDR_DST_CC_SLOT_2] = int(
             node.payload.get("dst_cc_slot_2", -1))
+        hdr_buf[9] = int(node.payload.get("dst_cc_slot", -1))
+
+        # Protocol 3 can write CCSR's early features or a single
+        # INTERP result directly into the registered destination slot.
+        # A zero flag retains the existing staged response path.
+        hdr_buf[5] = hdr_buf[6] = hdr_buf[7] = hdr_buf[8] = 0
+        local_inputs = bool(node.payload.get("worker_local_inputs", False))
+        keep_worker_data = bool(node.payload.get("worker_keep_data", False))
+        prefetched = bool(node.payload.get("worker_prefetch", False))
+        fused_sr = bool(node.payload.get("worker_fused_sr", False))
+        if fused_sr and (os.environ.get("CLUSTER_WORKER_FUSED", "0") != "1"
+                         or tt != TT_INTERP or not local_inputs
+                         or not keep_worker_data or self._interp_mult != 2):
+            raise ValueError("fused interpolation requires negotiated x2 local mode")
+        if prefetched and (tt != TT_CCSR
+                           or os.environ.get("CLUSTER_WORKER_PREFETCH", "0") != "1"
+                           or os.environ.get("CLUSTER_WORKER_FRAME_IO", "0") != "1"
+                           or not keep_worker_data):
+            raise ValueError("worker prefetch requires a resident CCSR task")
+        if keep_worker_data and (os.environ.get("CLUSTER_WORKER_FRAME_IO", "0") != "1"
+                                 or os.environ.get("CLUSTER_LOCAL_FRAME_CACHE", "0") != "1"
+                                 or tt not in (TT_CCSR, TT_INTERP)
+                                 or (tt == TT_INTERP and not local_inputs)):
+            raise ValueError("worker-resident results require frame I/O mode")
+        if local_inputs:
+            if (os.environ.get("CLUSTER_WORKER_FRAME_IO", "0") != "1"
+                    or os.environ.get("CLUSTER_LOCAL_FRAME_CACHE", "0") != "1"
+                    or tt not in (TT_INTERP, TT_SR_INTERP)):
+                raise ValueError("worker-local inputs require local cache mode")
+            hdr_buf[8] = 2
+            hdr_buf[_HDR_CC_FIELD] = -2
+            hdr_buf[_HDR_CC_SLOT_A] = int(node.payload["worker_src_cc_slot_a"])
+            hdr_buf[_HDR_CC_SLOT_B] = int(node.payload.get("worker_src_cc_slot_b", -1))
+            hdr_buf[9] = int(node.payload.get("worker_dst_cc_slot", -1))
+            hdr_buf[_HDR_DST_CC_SLOT_2] = int(node.payload.get("worker_dst_cc_slot_2", -1))
+            hdr_buf[5] = int(node.payload.get("worker_dst_cc_slot_3", -1))
+            hdr_buf[6] = 1 if keep_worker_data else 0
+            hdr_buf[7] = 1 if fused_sr else 0
+        elif keep_worker_data:
+            hdr_buf[8] = 3
+            hdr_buf[7] = 1 if prefetched else 0
+        direct = False
+        dst_slot = int(node.payload.get("dst_cc_slot", -1))
+        if ((not self._pull_normal or tt == TT_CCSR)
+                and os.environ.get("CLUSTER_DIRECT_CC", "0") == "1"
+                and os.environ.get("CLUSTER_LOCAL_FRAME_CACHE", "0") != "1"
+                and self._mid_delivery_enabled and self.cc_cache is not None
+                and self._cc_mrs and self.n_rails <= 2 and dst_slot >= 0
+                and not node.payload.get("retry_skipped_stages")):
+            from cc_cache import FIELD_RGB_PADDED, FIELD_RGB_INTERP
+            layout = self.cc_cache.layout
+            if (tt == TT_CCSR and layout.off_rife_features
+                    == layout.off_rgb_padded + self._rgb_padded_bytes):
+                addr = self.cc_cache.field_addr(dst_slot, FIELD_RGB_PADDED)
+                direct = True
+            elif tt == TT_INTERP and self._interp_mult == 2:
+                addr = self.cc_cache.field_addr(dst_slot, FIELD_RGB_INTERP)
+                direct = True
+            if direct:
+                hdr_buf[5] = addr
+                hdr_buf[6] = self._cc_mrs[0].rkey
+                hdr_buf[7] = self._cc_mrs[1].rkey if self.n_rails == 2 else 0
+                hdr_buf[8] = 1
+                if os.environ.get("CLUSTER_SPLIT_DEBUG", "0") == "1":
+                    self.log(f"[guest_mp] direct cc_cache task={node.id} type={tt}")
 
         st = self._task[slot]
         st.task_id       = node.id
+        if self._pull_enabled and self._pull_normal:
+            with self._pull_mid_cv:
+                self._pull_mid_seen[slot].clear()
+        st.frame         = node.frame_idx
+        st.phase         = _output_phase(tt, node)
+        st.direct_cc     = direct
+        st.local_inputs  = local_inputs
+        st.keep_worker_data = keep_worker_data
+        st.prefetched    = prefetched
+        st.fused_sr      = fused_sr
+        st.skip_stages   = frozenset(node.payload.get("retry_skipped_stages", ()))
         st.task_type     = tt
         st.dst_cc_slot   = node.payload.get("dst_cc_slot", -1)
         st.dst_cc_slot_2 = node.payload.get("dst_cc_slot_2", -1)
@@ -534,9 +666,13 @@ class GuestMP:
         with self._cv:
             assert self._state[slot] == ST_FILLED, (
                 f"notify_submit on slot {slot} but state={self._state[slot]}")
-            self._state[slot] = ST_IN_FLIGHT
             send_len = self._task_send_len.get(
                 self._task[slot].task_type, self.src_size)
+            if self._task[slot].local_inputs:
+                if payload_sges is not None:
+                    raise ValueError("worker-local inputs do not accept a payload")
+                send_len = self._hdr_bytes
+            self._state[slot] = ST_IN_FLIGHT
         # WRITE_WITH_IMM unified protocol: worker writes directly into
         # recv_bufs[slot] at the correct offset; the dummy-recv pool
         # pre-posted at __init__ catches IMM events. notify_submit
@@ -627,6 +763,9 @@ class GuestMP:
                     n, wcs = self.ctxs[rail].cq.poll(8)
                 except Exception as exc:
                     self.log(f"[guest_mp-cq] rail{rail} poll failed: {exc}")
+                    if self.transport_error_fn is not None:
+                        self.transport_error_fn(f"rail {rail} poll failed: {exc}")
+                        return
                     time.sleep(0.001)
                     continue
                 if n == 0:
@@ -641,6 +780,11 @@ class GuestMP:
 
     def _drain_wcs(self, rail: int, wcs, n: int) -> None:
         for wc in wcs[:n]:
+            if wc.status != 0 and self._pull_enabled and (wc.wr_id & ~_WR_MASK_SLOT) == _WR_READ_DONE:
+                slot = int(wc.wr_id & _WR_MASK_SLOT)
+                with self._pull_event_lock:
+                    self._pull_error[slot] = f"RDMA READ status={wc.status}"
+                    self._pull_events[slot].set()
             if wc.status != 0:
                 # A failed SEND (QP error / flush) means the slot's
                 # task will never produce a response — recover the
@@ -652,13 +796,21 @@ class GuestMP:
                 self.log(f"[guest_mp-cq] rail{rail} wc.status={wc.status} "
                           f"wr_id={hex(wc.wr_id)}")
                 op = wc.wr_id & ~_WR_MASK_SLOT
-                if op == _WR_SEND_DONE:
+                if self.transport_error_fn is not None:
+                    self.transport_error_fn(f"rdma completion error status={wc.status}")
+                elif op == _WR_SEND_DONE:
                     self._fail_slot(int(wc.wr_id & _WR_MASK_SLOT),
-                                    "rdma send error "
-                                    f"status={wc.status}")
+                                    f"rdma send error status={wc.status}")
                 continue
             op = wc.wr_id & ~_WR_MASK_SLOT
-            if op == _WR_SEND_DONE:
+            if op in (_WR_SEND_DONE, _WR_ACK_DONE):
+                continue
+            if op == _WR_READ_DONE and self._pull_enabled:
+                slot = int(wc.wr_id & _WR_MASK_SLOT)
+                with self._pull_event_lock:
+                    self._pull_remaining[slot] -= 1
+                    if self._pull_remaining[slot] == 0:
+                        self._pull_events[slot].set()
                 continue
             if op == _WR_RECV_IMM:
                 # WRITE_WITH_IMM landed in recv_bufs[slot] at the
@@ -674,15 +826,105 @@ class GuestMP:
                     self._dummy_recv_bufs[rail].addr, 16,
                     self._dummy_recv_bufs[rail].lkey,
                     wr_id=_WR_RECV_IMM)
+                if self._pull_enabled and stage_code == 12:
+                    if self._pull_controller is None:
+                        raise RuntimeError("result pull coordinator is unavailable")
+                    try:
+                        self._pull_controller.enqueue(self, slot, _part)
+                    except Exception as exc:
+                        if self.transport_error_fn is not None:
+                            self.transport_error_fn(f"invalid result notification: {exc}")
+                        return
+                    continue
                 if not self._parts_complete(slot, stage_code, n_parts):
                     continue
                 if stage_code == _STAGE_FINAL:
                     self._handle_recv(slot)
                 else:
                     self._handle_mid_recv(slot, stage_code)
+                    if self._pull_enabled and self._pull_normal:
+                        with self._pull_mid_cv:
+                            self._pull_mid_seen[slot].add(stage_code)
+                            self._pull_mid_cv.notify_all()
                 continue
             self.log(f"[guest_mp-cq] rail{rail} unknown wr_id "
                       f"{hex(wc.wr_id)}")
+
+    def pull_result(self, slot, worker_slot, task_id):
+        if not 0 <= worker_slot < len(self._pull_addrs):
+            raise ValueError("invalid worker result slot")
+        task = self._task[slot]
+        if task.task_id != task_id or task.task_type not in (TT_CCSR, TT_SR_INTERP, TT_INTERP):
+            raise ValueError("stale or invalid pull task")
+        offset = 0
+        size = self._sr_dst_offs["rgb_padded"][0]
+        if self._pull_normal:
+            if task.task_type == TT_INTERP:
+                size = self._interp_dst_rgb_bytes
+                if self._mid_delivery_enabled and self._interp_mult > 2:
+                    offset = (self._interp_mult - 2) * size
+                elif not self._mid_delivery_enabled:
+                    size *= self._interp_mult - 1
+            elif task.task_type == TT_CCSR and not self._mid_delivery_enabled and self._interp_mult > 1:
+                size += self._rgb_padded_bytes + self._rife_features_bytes
+        elif task.task_type == TT_INTERP and not task.fused_sr:
+            raise ValueError("unexpected non-fused interpolation result")
+        if offset + size > self.dst_size:
+            raise ValueError("result READ exceeds destination buffer")
+        pieces = [(rail, off, length) for rail, off, length in
+                  stripe(offset, size, self.n_rails, rotate=slot) if length]
+        with self._pull_event_lock:
+            self._pull_events[slot].clear()
+            self._pull_remaining[slot] = len(pieces)
+            self._pull_error[slot] = None
+        with self._io_lock:
+            if self._closed:
+                raise RuntimeError("guest closed before result read")
+            for rail, off, length in pieces:
+                self.chs[rail].post_read(
+                    dst_addr=self.recv_bufs[slot].addr + off,
+                    dst_lkey=self.recv_bufs[slot].lkeys[rail], length=length,
+                    remote_addr=self._pull_addrs[worker_slot] + off,
+                    rkey=self._pull_rkeys[rail], wr_id=_WR_READ_DONE | slot)
+        deadline = time.monotonic() + 15
+        while not self._pull_events[slot].wait(0.05):
+            if self._pull_normal and self._pull_abort.is_set():
+                raise RuntimeError("result READ interrupted by shutdown")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("result READ did not complete")
+        if self._pull_error[slot] is not None:
+            raise RuntimeError(self._pull_error[slot])
+        if self._pull_normal:
+            with self._io_lock:
+                self.chs[0].post_write(
+                    src_addr=self._pull_ack_buf.addr, src_lkey=self._pull_ack_buf.lkey,
+                    length=4, remote_addr=self._pull_state_addrs[worker_slot],
+                    rkey=self._pull_rkeys[0], wr_id=_WR_ACK_DONE | slot)
+        else:
+            ack = self._pull_control.submit("release_result", "scheduler",
+                                            slot=worker_slot, task_id=task_id)
+            def check_ack(future):
+                error = future.exception()
+                if error is not None and self.transport_error_fn is not None:
+                    self.transport_error_fn(f"result release failed: {error}")
+            ack.add_done_callback(check_ack)
+
+    def finish_pull(self, slot, task_id):
+        task = self._task[slot]
+        if task.task_id != task_id:
+            raise RuntimeError("result slot changed before writeback")
+        if self._pull_normal and self._mid_delivery_enabled:
+            count = (1 if task.task_type == TT_CCSR else
+                     max(0, self._interp_mult - 2) if task.task_type == TT_INTERP else 0)
+            expected = set(range(count))
+            if expected:
+                with self._pull_mid_cv:
+                    ready = self._pull_mid_cv.wait_for(
+                        lambda: expected.issubset(self._pull_mid_seen[slot])
+                        or self._pull_abort.is_set(), timeout=15)
+                    if not ready or self._pull_abort.is_set():
+                        raise RuntimeError("intermediate result did not arrive")
+        self._handle_recv(slot)
 
     def _parts_complete(self, slot: int, stage_code: int,
                          n_parts: int) -> bool:
@@ -717,12 +959,26 @@ class GuestMP:
         still has to land first. _handle_recv handles the final."""
         task = self._task[slot]
         recv_addr = self.recv_bufs[slot].addr
+        if stage_idx == 13:
+            if self.task_compute_done_fn is not None:
+                self.task_compute_done_fn(task.task_id)
+            return
+        if stage_idx == 14 and task.prefetched:
+            if self.task_prefetch_ready_fn is not None:
+                self.task_prefetch_ready_fn(task.task_id)
+            return
         try:
-            if task.task_type == TT_CCSR:
+            if stage_idx in task.skip_stages or task.keep_worker_data:
+                # A prior attempt already published this stage. Its cc
+                # slot may now be in use or have been recycled.
+                pass
+            elif task.task_type == TT_CCSR:
                 if stage_idx != 0:
                     self.log(f"[guest_mp-cq] CCSR slot={slot} got "
                               f"unexpected mid stage_idx={stage_idx}")
-                if ("rgb_padded" in self._sr_dst_offs
+                if task.direct_cc:
+                    self.cc_cache_writeback_fn(task.dst_cc_slot, ("direct_ccsr",))
+                elif ("rgb_padded" in self._sr_dst_offs
                         and "rife_features" in self._sr_dst_offs
                         and self.cc_cache_writeback_fn is not None
                         and task.dst_cc_slot >= 0):
@@ -736,7 +992,7 @@ class GuestMP:
             elif task.task_type == TT_INTERP:
                 # Dense-pack: frame k+1 sits at offset k * frame_sz.
                 dst_cc = self._interp_stage_dst_cc(task, stage_idx)
-                if (self.cc_cache_writeback_fn is not None
+                if (not task.keep_worker_data and self.cc_cache_writeback_fn is not None
                         and dst_cc >= 0):
                     rgb_addr = (recv_addr
                                 + stage_idx * self._interp_dst_rgb_bytes)
@@ -757,6 +1013,9 @@ class GuestMP:
         # CCSR → INTERP edge and INTERP → SR_INTERP phase=1 edge
         # (mult ≥ 3); stages 1+ cover INTERP → SR_INTERP phase ≥ 2
         # edges (mult = 4).
+        if os.environ.get("CLUSTER_SPLIT_DEBUG", "0") == "1":
+            self.log(f"[guest_mp] peer={self.peer_ip} task={task.task_id} "
+                     f"type={task.task_type} delivered_stage={stage_idx}")
         if (self.task_stage_done_fn is not None
                 and task.task_id > 0):
             try:
@@ -783,7 +1042,7 @@ class GuestMP:
         task = self._task[slot]
         recv_addr = self.recv_bufs[slot].addr
         try:
-            if task.task_type == TT_INTERP:
+            if task.task_type == TT_INTERP and not task.fused_sr:
                 # Dense-pack layout: frame k at slot.dst[k * frame_sz].
                 # mult=N has frames 0..N-2; the final stage is frame
                 # N-2. Mid frames 0..N-3 are written by _handle_mid_recv
@@ -791,14 +1050,16 @@ class GuestMP:
                 # write the final frame here; we also belt-and-suspenders
                 # rewrite earlier frames when mid delivery is off (i.e.
                 # the worker never issued mid stages).
-                if (self.cc_cache_writeback_fn is not None
+                if (not task.keep_worker_data and self.cc_cache_writeback_fn is not None
                         and self._interp_mult >= 2):
                     mult = self._interp_mult
                     frame_sz = self._interp_dst_rgb_bytes
                     final_stage = mult - 2
                     final_dst_cc = self._interp_stage_dst_cc(task,
                                                               final_stage)
-                    if final_dst_cc >= 0:
+                    if final_dst_cc >= 0 and task.direct_cc:
+                        self.cc_cache_writeback_fn(final_dst_cc, ("direct_interp",))
+                    elif final_dst_cc >= 0:
                         self.cc_cache_writeback_fn(
                             final_dst_cc,
                             ("rgb_interp",
@@ -817,7 +1078,7 @@ class GuestMP:
                                 ("rgb_interp",
                                  recv_addr + k * frame_sz,
                                  frame_sz))
-            elif task.task_type == TT_SR_INTERP:
+            elif task.task_type == TT_SR_INTERP or task.fused_sr:
                 # Memmove yao/uao/vao to mpv VA
                 if task.dst_y_va and task.dst_u_va and task.dst_v_va:
                     yao_off, _, _, _ = self._sr_dst_offs["yao"]
@@ -838,7 +1099,7 @@ class GuestMP:
                 #   4K SR (yao/uao/vao) → mpv VA at dst_a (phase 0)
                 #   rgb_padded + rife_features → host cc_cache[dst_cc_slot]
                 # Both regions live in recv_bufs[slot].
-                # When DUAL_MID_DELIVERY=1, the rgb_padded + features
+                # When CLUSTER_MID_DELIVERY=1, the rgb_padded + features
                 # writeback already happened in _handle_mid_recv;
                 # skip it here.
                 yao_off, _, _, _ = self._sr_dst_offs["yao"]
@@ -874,9 +1135,10 @@ class GuestMP:
         except Exception as e:
             self.log(f"[guest_mp-cq] writeback failed slot={slot} "
                       f"tid={task.task_id} type={task.task_type}: {e}")
+            self._fail_slot(slot, f"result writeback failed: {e}")
+            return
 
-        # task_done + release. Always fire so the queue mgr doesn't
-        # stall, even if the writeback errored.
+        # Publish completion only after the result has been copied.
         if self.task_done_fn is not None and task.task_id > 0:
             try:
                 self.task_done_fn(task.task_id)
@@ -930,10 +1192,29 @@ class GuestMP:
             for k in [k for k in self._imm_parts if k[0] == slot]:
                 self._imm_parts.pop(k, None)
         tid = 0
+        source_backup = None
         with self._cv:
             t = self._task[slot]
             if self._state[slot] != ST_FREE:
                 tid = t.task_id
+                if tid > 0 and t.task_type == TT_CCSR:
+                    # The mpv frame that supplied this task may already
+                    # have returned after mid-stage delivery. Retain a
+                    # private packed copy before retrying its final SR.
+                    size = self._task_send_len[TT_CCSR]
+                    backing = ctypes.create_string_buffer(size)
+                    ctypes.memmove(ctypes.addressof(backing),
+                                   self.send_bufs[slot].addr, size)
+                    offsets = {name: off for name, off, *_ in self.src_layout}
+                    base = ctypes.addressof(backing)
+                    source_backup = {
+                        "src_y": base + offsets["ya"],
+                        "src_u": base + offsets["ua"],
+                        "src_v": base + offsets["va"],
+                        "src_y_stride": self.W * 2,
+                        "src_uv_stride": self.cW * 2,
+                        "_retry_source_backing": backing,
+                    }
                 t.task_id = 0
                 self._state[slot] = ST_FREE
                 self._free.append(slot)
@@ -942,7 +1223,7 @@ class GuestMP:
             self.log(f"[guest_mp] slot {slot} task {tid} failed: {reason}")
             if self.task_fail_fn is not None:
                 try:
-                    self.task_fail_fn(tid, reason)
+                    self.task_fail_fn(tid, reason, source_backup)
                 except Exception as e:
                     self.log(f"[guest_mp] task_fail_fn({tid}) raised: {e}")
 
@@ -958,7 +1239,39 @@ class GuestMP:
         return n
 
     def close(self):
+        if self._pull_enabled and self._pull_normal:
+            self._pull_abort.set()
+            with self._pull_mid_cv:
+                self._pull_mid_cv.notify_all()
+        if self._pull_controller is not None:
+            self._pull_controller.detach(self)
         with self._cv:
+            if self._closed:
+                return
             self._closed = True
             self._cv.notify_all()
-        # Daemon thread will exit on next poll iteration.
+        # Stop completion processing before destroying QPs and MRs. In
+        # particular, direct cc_cache writes must be disabled before the
+        # owner unmaps the cache at shutdown or filter rebuild.
+        if threading.current_thread() is not self._cq_thread:
+            self._cq_thread.join(timeout=5.0)
+        if self._cq_thread.is_alive():
+            raise RuntimeError("guest CQ thread did not stop")
+        for channel in self.chs:
+            channel.qp.close()
+        for mr in self._cc_mrs:
+            mr.close()
+        self._cc_mrs.clear()
+        self._cc_mr = None
+        for buf in self.send_bufs + self.recv_bufs:
+            for mr in buf.mrs:
+                mr.close()
+            buf.mrs.clear()
+        for buf in self._dummy_recv_bufs:
+            buf.mr.close()
+        if self._pull_enabled and self._pull_normal:
+            self._pull_ack_buf.mr.close()
+        for ctx in self.ctxs:
+            ctx.cq.close()
+            ctx.pd.close()
+            ctx.ctx.close()

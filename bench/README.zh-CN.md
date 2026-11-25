@@ -2,7 +2,7 @@
 
 `dgxspark-jellyfin-mpv-rife` 单机 + 双机的颜色 / fps / 每任务 timing 基准
 脚本。所有脚本共享 `_common.sh`，路径 + IP 全从环境变量读 （默认假设
-本机刚跑过 `install.sh install --dual-host`）。
+本机刚跑过 `install.sh install --cluster-host`）。
 
 [English](./README.md)
 
@@ -10,7 +10,7 @@
 
 ## 前置条件
 
-- 已经跑过 `install.sh install` （或 `--dual-host`）；mpv + vapoursynth
+- 已经跑过 `install.sh install` （或 `--cluster-host`）；mpv + vapoursynth
   + `rife.vpy` + `vs_gpu_helpers.py` + `fsrcnnx-cudnn` 都在位。
 - 双机 bench： 另一台 DGX Spark 通过 200G RoCE 链路可达 `WORKER_IP`，
   conda env 一致。 bench 会 rsync worker 脚本到 `$WORKER_DIR` 然后 ssh
@@ -33,6 +33,22 @@ bench/gen_clips.sh
 要用真实素材就设 `CLIP_24` / `CLIP_120` 覆盖。
 
 ## 脚本
+
+### `bench/cluster_fps.sh` — 已安装多机管线的吞吐
+
+```bash
+N=3000 MODE=auto MULT=2 bench/cluster_fps.sh
+N=3000 MODE=tictac MULT=4 bench/cluster_fps.sh
+```
+
+脚本使用已安装的 worker 服务，不重启服务或杀死其他进程。`MODE` 可为
+`auto`、`normal` 或 `tictac`，`MULT` 可为 2、3 或 4；`CLIP`、`CF`、
+`BF` 分别覆盖片源、并发帧数和缓冲帧数。脚本会确认多机管线已启用，并
+输出 dispatcher 吞吐及日志路径。如果 F9 已指定倍率，必须与 `MULT` 一致。
+
+较早的 `color.sh`、`fps.sh`、`timing.sh` 和 `robustness.sh` 面向双机普通
+模式，会操作共享播放标志和 worker 进程；仅在没有其他播放或 worker
+会话时运行。
 
 ### `bench/color.sh` — 单机 vs 双机 PSNR
 
@@ -63,7 +79,7 @@ bench/robustness.sh                # N=60 帧, RECOVERY_SLA=5 s
 RECOVERY_SLA=3 N=40 bench/robustness.sh
 ```
 
-九个场景，每个验证双机链能在 `RECOVERY_SLA` 秒内恢复（或干净 fallback 到单机）：
+八个场景，每个验证双机链能在 `RECOVERY_SLA` 秒内恢复（或干净 fallback 到单机）：
 
 1. `worker_down`   — mpv 启动前停掉 worker.service。 期望 liveness probe
    快速失败 → 单机 fallback.
@@ -82,11 +98,7 @@ RECOVERY_SLA=3 N=40 bench/robustness.sh
 7. `repeated_vf_reload` — 单个带 IPC 的 mpv，先进 dual，再用 IPC 触发
    `vf set` 强制重建 filter graph → 同一 mpv 进程内 dual handshake
    重做一次。 验证链路存活 + 至少 1 次 dual-active。
-8. `trt_cache_miss` — 把 host 和 worker 双方的 1080p RIFE TRT engine
-   cache 都改名，重启 worker 再开 mpv：必须重新编译 TRT （这套栈下
-   30–60 秒），验证最终能进 dual 且渲染出帧。 退出时还原 cache。
-   用 `TRT_BENCH_TIMEOUT` 调上限 （默认 300 s）。
-9. `seek_storm` — 对存活的 dual 会话用 IPC 连发 seek，验证 SLA 内恢复
+8. `seek_storm` — 对存活的 dual 会话用 IPC 连发 seek，验证 SLA 内恢复
    播放。同时覆盖 seek-flush 的 cc_cache 槽位回收（高频拖动不允许耗尽
    槽池）。
 
@@ -101,8 +113,8 @@ MODE=dual_no_sr bench/timing.sh
 MODE=dual_no_interp N=800 bench/timing.sh
 ```
 
-worker 端开 `DUAL_PROFILE=1` + `DUAL_RDMA_PROF=1` +
-`DUAL_GPU_IDLE_DBG=1` 跑一档，然后 tail-parse 主机 + worker log 输出：
+worker 端开 `CLUSTER_PROFILE=1` + `CLUSTER_RDMA_PROF=1` +
+`CLUSTER_GPU_IDLE_DBG=1` 跑一档，然后 tail-parse 主机 + worker log 输出：
 
 - worker 总量：`kernel_total` / `idle_total` / `GPU_util`
 - worker 每任务类型：`kernel` / `idle_before` / `claim_wait`
@@ -121,13 +133,13 @@ worker 端开 `DUAL_PROFILE=1` + `DUAL_RDMA_PROF=1` +
 | `MPV` / `PY` | `$ENV_ROOT/bin/mpv` / `python` | 可执行文件 |
 | `MPV_CFG`    | `~/.config/mpv` | mpv 配置目录 （`rife.vpy`, `vs_gpu_helpers.py`, `fsrcnnx-cudnn/`） |
 | `VPY`        | `$MPV_CFG/rife.vpy` | vapoursynth 入口 |
-| `DUAL_CFG_FILE` | `~/.config/dgxspark-mpv/dual.conf` | source 进来用 `DUAL_HOST_IP`/`DUAL_WORKER_HOST`/`DUAL_WORKER_USER`/`DUAL_RDMA_*` 当默认 （由 `install.sh install --dual-host` 写入） |
-| `HOST_IP`    | 来自 `$DUAL_HOST_IP` | RoCE 链路上的本机 |
-| `WORKER_IP`  | 来自 `$DUAL_WORKER_HOST` | RoCE 链路上的 worker |
-| `WORKER_USER`| 来自 `$DUAL_WORKER_USER`，否则 `ubuntu` | worker ssh 用户 |
-| `WORKER_DIR` | 来自 `$DUAL_WORKER_DIR`，否则 `~/.local/share/dgxspark-mpv/worker` | rsync 目标 |
-| `RDMA_DEV`   | 来自 `$DUAL_RDMA_DEV`，否则 `rocep1s0f0` | 本机 RDMA 设备 |
-| `RDMA_PORT`  | 来自 `$DUAL_RDMA_PORT`，否则 `29900` | worker 端 RDMA 监听端口 |
+| `CLUSTER_CFG_FILE` | `~/.config/dgxspark-mpv/cluster.conf` | source 进来用 `CLUSTER_HOST_IP`/`CLUSTER_WORKER_HOST`/`CLUSTER_WORKER_USER`/`CLUSTER_RDMA_*` 当默认 （由 `install.sh install --cluster-host` 写入） |
+| `HOST_IP`    | 来自 `$CLUSTER_HOST_IP` | RoCE 链路上的本机 |
+| `WORKER_IP`  | 来自 `$CLUSTER_WORKER_HOST` | RoCE 链路上的 worker |
+| `WORKER_USER`| 来自 `$CLUSTER_WORKER_USER`，否则 `ubuntu` | worker ssh 用户 |
+| `WORKER_DIR` | 来自 `$CLUSTER_WORKER_DIR`，否则 `~/.local/share/dgxspark-mpv/worker` | rsync 目标 |
+| `RDMA_DEV`   | 来自 `$CLUSTER_RDMA_DEV`，否则 `rocep1s0f0` | 本机 RDMA 设备 |
+| `RDMA_PORT`  | 来自 `$CLUSTER_RDMA_PORT`，否则 `29900` | worker 端 RDMA 监听端口 |
 | `CLIP_24` / `CLIP_120` | `bench/clips/sample-1080p-{24,120}.mp4` | 输入 |
 
 ## 模式 （单机 + 双机共享按键）

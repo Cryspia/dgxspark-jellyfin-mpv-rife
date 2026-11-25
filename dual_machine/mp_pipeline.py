@@ -128,14 +128,14 @@ class SlotMeta(ctypes.Structure):
         # mid_size == 0 ⇒ single-stage task (no MID send / no MID_READY
         # transition). For INTERP mult ≥ 4 the worker derives
         # intermediate stage offsets (k * frame_sz) on the fly from
-        # DUAL_INTERP_MULT; mid_off/mid_size still describe stage 0
+        # CLUSTER_INTERP_MULT; mid_off/mid_size still describe stage 0
         # only.
         ("mid_off",   ctypes.c_uint32),
         ("mid_size",  ctypes.c_uint32),
         ("full_off",  ctypes.c_uint32),
         ("full_size", ctypes.c_uint32),
         # Single INTERP task produces N-1 interp frames per source pair
-        # via dual flownet. The worker reads DUAL_INTERP_MULT env at
+        # via dual flownet. The worker reads CLUSTER_INTERP_MULT env at
         # startup; per-task timestep fields kept for binary compat.
         ("interp_timestep_num",   ctypes.c_uint32),
         ("interp_timestep_denom", ctypes.c_uint32),
@@ -212,6 +212,9 @@ ST_FILLING      = 6
 ST_MID_READY    = 7    # Use as ST_MID_READY + stage_idx (0..MID_READY_MAX_STAGE-1)
 ST_MID_READY_MAX_STAGE = 8   # supports up to 8 mid stages (mult ≤ 9)
 ST_MID_SENT     = 16   # moved above MID_READY range to avoid collision
+ST_PREFETCH_READY = 17  # CCSR input arrived; completion notice not yet posted
+ST_PULL_DONE = 19  # leader has completed all READs for this result
+ST_PREFETCH_HELD = 18   # input resident, waiting for an explicit activation
 def is_mid_ready_state(st: int) -> bool:
     """True when state encodes a MID_READY transition. Use this instead
     of `st == ST_MID_READY` to handle multi-stage encoding."""
@@ -226,6 +229,7 @@ ST_NAMES = {
     ST_DST_READY: "DST_READY", ST_SEND_PENDING: "SEND_PENDING",
     ST_FILLING: "FILLING", ST_MID_READY: "MID_READY",
     ST_MID_SENT: "MID_SENT",
+    ST_PREFETCH_READY: "PREFETCH_READY", ST_PREFETCH_HELD: "PREFETCH_HELD",
 }
 
 
@@ -343,7 +347,7 @@ class SlotRingLayout:
         0..dst_size WRITE used to ship up to ~40 MB of dead bytes per
         task over the wire.
 
-        mid_delivery=False (DUAL_MID_DELIVERY=0; default is on)
+        mid_delivery=False (CLUSTER_MID_DELIVERY=0; default is on)
         collapses everything into one terminal WRITE: the union of
         the mid + final regions, since the single response carries
         both.
@@ -879,7 +883,7 @@ class MPPipelineBase:
         cmd = [py_bin, "-B", "-c", bootstrap]
         fds = [ef.fd for ef in self.efs.values()]
         # Inherit the parent's env so external cluster config (NCCL_*,
-        # DUAL_RDMA_*, MASTER_*) is visible; the IPC config goes via
+        # CLUSTER_RDMA_*, MASTER_*) is visible; the IPC config goes via
         # stdin and only that updates os.environ inside the child.
         pythonpath = (
             f"/usr/lib/python3/dist-packages:"

@@ -1,0 +1,10 @@
+{
+  "max_source_fps": 60,
+  "native_4k_max_source_fps": 24,
+  "x4_1080_max_source_fps": 24,
+  "x3_max_source_fps": 30,
+  "lowres_max_height": 720,
+  "fourk_min_height": 1129,
+  "fourk_min_width": 2049,
+  "lowres_max_width": 1328
+}

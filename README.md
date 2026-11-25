@@ -6,8 +6,9 @@ Reproducible installer for a **Jellyfin client + RIFE realtime frame
 interpolation + FSRCNNX luma upscaling** stack on **NVIDIA DGX Spark**
 (GB10, ARM64, CUDA 13, Ubuntu 24.04, GNOME Wayland).
 
-Optional **dual-machine mode** (experimental) splits the chain across
-two Sparks over a 200 G RoCE link for roughly 2× the steady-state fps.
+Optional **multi-machine mode** distributes video processing across DGX
+Spark systems connected by RoCE. Two machines default to shared computation;
+three or more default to tic-tac, with the leader dedicated to playback.
 
 ## Usage
 
@@ -15,8 +16,8 @@ two Sparks over a 200 G RoCE link for roughly 2× the steady-state fps.
 ./install.sh install                 # single-machine, full clean install
 ./install.sh install --no-mirrors    # outside China — skip USTC mirrors
 ./install.sh install --no-danmaku    # skip the bullet-chat plugin
-./install.sh install --dual-host     # primary box for dual mode
-./install.sh install --dual-secondary # worker box for dual mode (worker.py + tray only)
+./install.sh install --cluster-host     # leader (player + shim)
+./install.sh install --cluster-worker # worker (compute service + tray)
 ./install.sh status                  # show what's currently installed
 ./install.sh uninstall               # remove (keeps apt + miniforge)
 ```
@@ -26,12 +27,12 @@ a fresh install so GNOME picks up the new launchers + autostart entry.
 
 ## Stack (single-machine)
 
-- **mpv 0.41** built from source — vapoursynth + vulkan + wayland + x11
+- **mpv 0.42** built from source — vapoursynth + vulkan + wayland + x11
   + lua. The conda-forge aarch64 mpv is a headless library build with
   no display backends, so the installer builds its own.
 - **vsrife + TensorRT** RIFE picked per source resolution **and** fps,
   with the budget split engineered so each combination just fits the
-  GB10's per-frame envelope. Full table in [Default config](#default-config).
+  GB10's per-frame envelope. Full table in [Single-machine defaults](#single-machine-defaults).
 - **GPU YUV↔RGB color conversion** (`vs_gpu_helpers.rife_yuv`) — matrix
   multiply + chroma resample on GPU instead of zimg's CPU round-trip,
   which costs ~30 ms / frame at 4K on the Grace CPU. Supports YUV
@@ -47,7 +48,7 @@ a fresh install so GNOME picks up the new launchers + autostart entry.
 - **jellyfin-mpv-shim** — Python client that drives mpv via IPC.
 - **Danmaku** (bullet chat) — [Cryspia/mpv-dandanplay-danmaku](https://github.com/Cryspia/mpv-dandanplay-danmaku).
 
-## Default config
+## Single-machine defaults
 
 | Source | Frame rate | RIFE | FSRCNNX (auto) |
 |---|---|---|---|
@@ -72,33 +73,36 @@ fitting the heavier 4.26 + 16-layer family on interp frames.
 Display target defaults to 4K. Override with `FSRCNNX_TARGET_W` /
 `FSRCNNX_TARGET_H` before launching mpv for smaller screens.
 
-## Dual-machine mode (experimental)
+## Multi-machine mode
 
-Two DGX Spark boxes over a 200 G RoCE link split CCSR / INTERP /
-SR_INTERP across both GB10 GPUs. Roughly 1.95× sustained throughput vs
-single-machine, with byte-identical real frames and visually-identical
-interpolated frames.
+Install the player on the leader and the worker service on each other node:
 
-Install:
 ```bash
-# Primary box (has mpv + shim + dual host service)
-./install.sh install --dual-host
-
-# Worker box (worker.py + tray quit app only, no mpv main)
-./install.sh install --dual-secondary
+./install.sh install --cluster-host
+./install.sh install --cluster-worker
 ```
 
-Both runs prompt for cluster networking (RDMA device, port, self IP,
-peer IP); defaults come from `ip link` / `ip a`. Pre-set the env vars
-listed by `--help` to script-install without prompts.
+The leader installer accepts a comma-separated list of worker rail-0 addresses
+and optional SSH management addresses. Non-interactive installs can set
+`CLUSTER_SELF_IP`, `CLUSTER_WORKER_HOSTS`, and optionally
+`CLUSTER_WORKER_SSH_HOSTS` and `CLUSTER_WORKER_USER` before running the
+installer. Workers use `CLUSTER_SELF_IP` and `CLUSTER_PEER_IP`. The resulting
+settings are saved in `~/.config/dgxspark-mpv/cluster.conf`; keep this file
+private. Two PCIe paths are needed to use the full 200 Gb/s fabric bandwidth.
 
-In playback: **Shift+F9** toggles dual offload on/off. Connection
-failure falls back silently to single-machine mode (press again to
-retry) — and so does a worker death mid-session: the host's liveness
-watchdog detects it in ~3 s, recovers the in-flight work, and playback
-continues single-machine.
+Two machines default to normal mode with the leader participating in compute.
+Three or more default to tic-tac, where workers process whole frames and the
+leader plays them. Three-machine normal mode can have higher average throughput,
+but tic-tac avoids host compute/display competition and has steadier throughput
+in the measured workload. Set `CLUSTER_TICTAC=0` to select normal mode. Four
+or more machines default to native-resolution optical flow at ×2 for 4K sources
+at or below 24 fps; actual real-time performance depends on the source.
 
-→ Full design + per-component breakdown: [`dual_machine/README.md`](./dual_machine/README.md).
+**Shift+F9** toggles cluster processing. On worker loss, the pipeline retries
+with the remaining workers; with one worker it returns to normal mode, and if
+none remain it falls back to the local pipeline. See the
+[multi-machine guide](./dual_machine/README.md) for network setup, policy
+thresholds, and configuration compatibility.
 
 ## Performance and color accuracy
 
@@ -118,12 +122,12 @@ local-path dependencies).
 - **F8** — cycle FSRCNNX variant (`16x4 → 16x3 → 16x2 → 8x2 → OFF →
   loop`); each press triggers a vapoursynth filter reload (1–3 s
   freeze). Cycle resets to auto on next file load.
-- **F9** — single: toggle RIFE on/off. Dual: cycle interp multiplier
-  (4 → 3 → 2 → 1 → off).
+- **F9** — single: toggle RIFE on/off. Cluster: cycle interp multiplier
+  (4 → 3 → 2 → 1).
 - **Shift+F8** — toggle the KrigBilateral display-stage chroma GLSL.
   Instant (no vf reload); persists across files.
-- **Shift+F9** — toggle dual-machine offload (no-op without
-  `--dual-host` install). Falls back silently on connection failure.
+- **Shift+F9** — toggle cluster offload (no-op without
+  `--cluster-host` install). Falls back silently on connection failure.
 - All mpv defaults intact (`i` for stats, `s` for screenshot, etc.).
 
 ## What lives where after install
@@ -137,7 +141,7 @@ local-path dependencies).
 | `~/.config/mpv/fsrcnnx-cudnn/` | Upstream fsrcnnx-cudnn bundle (includes `chroma_krig` CUDA kernel) |
 | `~/.config/mpv/scripts/dandanplay/` | Danmaku script bundle |
 | `~/.config/jellyfin-mpv-shim/conf.json` | Shim's own config (server creds, etc.) |
-| `~/.config/dgxspark-mpv/dual.conf` | Dual-machine cluster config (host/worker IPs, RDMA dev) — only present after `--dual-host` / `--dual-secondary` |
+| `~/.config/dgxspark-mpv/cluster.conf` | Cluster config (leader/worker addresses, RDMA devices) — only present after `--cluster-host` / `--cluster-worker` |
 | `~/.local/bin/{mpv-conda,jellyfin-mpv-shim}` | Wrappers (PYTHONHOME / GI_TYPELIB_PATH) |
 | `~/.local/share/applications/*.desktop` | App-launcher entries |
 | `~/.config/autostart/jellyfin-mpv-shim.desktop` | Auto-start shim on login |
@@ -151,19 +155,19 @@ local-path dependencies).
 - Ubuntu 24.04 (other distros likely work but untested).
 - GNOME Wayland session for the AppIndicator tray icon path.
 - `sudo` for the apt-install step. ~5 GB free disk per box.
-- For dual mode: two boxes + 200 G RoCE link with static IPs on the
+- For cluster mode: at least two boxes + RoCE links with static IPs on the
   RDMA-capable interface.
 
 ## Project layout
 
 ```
 dgxspark-jellyfin-mpv-rife/
-├── install.sh           # installer / status / uninstall (single + dual variants)
+├── install.sh           # installer / status / uninstall (single + cluster modes)
 ├── vs_gpu_helpers.py    # rife_yuv: GPU YUV↔RGB + vsrife wrapper
 ├── sr_keys_helper.py    # F8/F9 side-channel + apply_fsrcnnx
 ├── scripts/             # sr_keys.lua + warmup.lua mpv plugins
 ├── shaders/             # vendored mpv GLSL shaders (KrigBilateral)
-├── dual_machine/        # dual-machine offload — see its README
+├── dual_machine/        # cluster offload — see its README
 ├── docs/                # performance + color-accuracy data tables
 ├── bench/               # color / fps / timing bench scripts
 └── icons/               # app icons for shim + mpv-conda launchers
@@ -177,7 +181,7 @@ dgxspark-jellyfin-mpv-rife/
   launched outside conda activation can't find the embedded Python's
   stdlib → vapoursynth filter init aborts.
 - **`gpu-context=waylandvk`** is ~1 ms lower latency than `x11vk` but
-  loses GNOME-drawn window decorations (mpv 0.41 has no libdecor).
+  loses GNOME-drawn window decorations (mpv has no libdecor).
 - **`hidpi-window-scale=yes`** is what makes FSRCNNX trigger on a 4K
   HiDPI display — without it mpv renders at logical 1080p and the
   ratio gate stays at 1.0.

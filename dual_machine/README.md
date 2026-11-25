@@ -1,420 +1,112 @@
-# Dual-machine RIFE + FSRCNNX pipeline
+# Multi-machine RIFE + FSRCNNX
 
 [简体中文](./README.zh-CN.md)
 
-Split the mpv vapoursynth filter chain across two DGX Spark boxes so
-each frame's RIFE interpolation + FSRCNNX super-resolution work runs
-on two GB10 GPUs in parallel. Same 4K output as single-machine mode,
-roughly twice the steady-state fps.
+The cluster pipeline runs interpolation and super-resolution across DGX Spark
+machines connected by RoCE. The leader runs mpv and jellyfin-mpv-shim; each
+worker runs the cluster worker service. The local single-machine pipeline
+remains available.
 
-> Status: **experimental**. The single-machine path is the supported
-> default; dual mode is opt-in via `install.sh install --dual-host` on
-> the primary box plus `--dual-secondary` on the worker.
+## Install and network
 
-## What it does
+Configure RoCE addresses before installation. The installer detects usable
+interfaces and GID indices. It can use multiple RDMA rails; using both PCIe
+paths is necessary to use the full 200 Gb/s interconnect. Depending on the
+fabric, those paths can use one 200G cable or two 100G cables. Each rail must
+be reachable between the leader and its workers.
 
-For every source frame pair (a, b) the pipeline produces:
+```bash
+# Leader: player, shim and cluster configuration
+./install.sh install --cluster-host
 
-- **Real frames** (a, b): chroma-upsample → FSRCNNX luma SR → 4K
-  output. Bit-identical to the single-machine output for these frames.
-- **Interpolated frames** (between a and b): RIFE flownet → chroma-
-  upsample → FSRCNNX luma SR → 4K output. `DUAL_INTERP_MULT=2/3/4`
-  controls how many in-betweens (F9 cycles through 4 → 3 → 2 → 1).
-
-The split is by task type, not by frame, so both GPUs stay busy on
-overlapping work. See [§ Components](#components) for the breakdown.
-
-## Requirements
-
-- **Two DGX Spark boxes** (GB10, ARM64, Ubuntu 24.04, CUDA 13).
-- **RoCE link** between them. Reaching 200 Gb/s on the CX7 means
-  driving two PCIe paths at once, so the fabric addresses two rails
-  (`enp1s0f0np0` and `enP2p1s0f1np1`, each in its own /24) on separate
-  paths — not a bond. This pipeline drives one rail, so it runs at
-  ~98 Gb/s; see
-  [Why the link runs at ~98 Gb/s, not 200](#why-the-link-runs-at-98-gbs-not-200).
-  Static IPs on the link (no DHCP); the install script prompts for
-  self-IP + peer-IP and writes them to a config file.
-- **Identical software**: same conda env, same `install.sh` build of
-  mpv / vapoursynth / vsrife / fsrcnnx-cudnn. The host's `install.sh
-  install --dual-host` writes the full stack; the worker's
-  `install.sh install --dual-secondary` writes only what `worker.py`
-  needs (no mpv main binary, no shim).
-
-## Why dual
-
-Steady-state at 1080p / 24 fps source → 4K / 48 fps output
-(dispatcher steady fps — full tables in
-[`bench/results.md`](../bench/results.md)):
-
-| mode | dispatcher fps (steady) |
-|---|---|
-| dual, mult=2 | 95 – 96 |
-| dual, mult=3 | 87 |
-| dual, RIFE only (no SR) | 153 – 156 |
-| dual, SR only (mult=1) | 145 – 147 |
-
-Roughly 2× the single-machine steady state. Quality matches single
-(real frames byte-identical; interpolated frames carry RIFE cross-GPU
-non-determinism on luma, ~50–70 dB Y-PSNR vs single, well above
-visible threshold).
-
-## Design philosophy
-
-Three principles drove every architectural choice:
-
-1. **Keep both GPUs saturated.** The 3-queue priority dispatcher
-   (CCSR / SR_INTERP / INTERP) is asymmetric on purpose — host favours
-   CCSR + SR_INTERP (heavy GPU work close to mpv VA), guest favours
-   INTERP (RIFE engine, throughput-bound). Each side falls back to
-   the other queues when its preferred one drains, so neither GPU
-   waits.
-
-2. **Hide transit behind compute — and ship only live bytes.** RDMA
-   WRITE_WITH_IMM moves frames in parallel with the next task's
-   kernel; the wire is never the critical path. Every task sends and
-   returns only the byte ranges its type actually uses (an INTERP
-   mult=2 response is 12.4 MB, not the slot's 54 MB worst case; a
-   CCSR/SR_INTERP request is ~12.5 MB, not 58.5 MB), and INTERP /
-   SR_INTERP request payloads are zero-copy: the cc_cache region is
-   registered as an MR and the NIC gathers the fields via an SGE
-   list — the dispatch thread never memmoves payloads through the
-   slow (~5 GB/s) cudaHostRegister'd CPU read path. The one-time
-   handshake (an
-   int64[19] struct describing dims / formats / variant / interp_mult
-   / encode channels) goes over the liveness TCP socket; all
-   per-frame data is RDMA.
-
-3. **Granular tasks, auto-assigned.** CCSR / INTERP / SR_INTERP are
-   small enough (~2–12 ms on GB10) that the priority scheduler can
-   keep both sides loaded without per-frame coordination. The
-   dispatcher decides who runs what based on current queue depth, not
-   round-robin.
-
-## Components
-
-```mermaid
-flowchart LR
-    subgraph HOST["HOST (primary box)"]
-        direction TB
-        mpv[mpv frame_thread<br/>CF=24]
-        HW[_hmp_watcher<br/>polls shm slots]
-        SD[C++ SplitDual filter<br/>vapoursynth]
-        ND[native_dispatcher]
-        QM[queue_mgr<br/>DAG + 3 priority heaps]
-        HMP["HostMP (host_3proc)<br/>compute_proc writes slot.dst"]
-        GMP[GuestMP<br/>RDMA client to worker]
-        CC[(cc_cache<br/>cuda-pinned shm:<br/>rgb_padded · rife_features<br/>rgb_interp · sr_yuv · rgb_4K)]
-        HSHM[(slot.dst<br/>SR output staging)]
-        HG[/Host GB10 GPU/]
-        mpv --> SD --> ND --> QM
-        QM -->|"pop_for_host<br/>SR > CC > INTERP"| HMP
-        QM -->|"pop_for_guest<br/>INTERP > CC > SR"| GMP
-        HMP --- HG
-        HMP -->|writes intermediates| CC
-        HMP -->|writes 4K SR output| HSHM
-        GMP -->|reads INTERP inputs| CC
-        GMP -->|writes rgb_interp on recv| CC
-        HW -->|local memmove<br/>shm to frame VA| mpv
-        HSHM --> HW
-    end
-    subgraph WORKER["WORKER (secondary box)"]
-        direction TB
-        WP[worker.py<br/>NCCL rank 1]
-        WMP["WorkerMP (worker_3proc)<br/>rdma_proc + buffer_mgr_proc<br/>compute_proc"]
-        WSHM[(slot.src/slot.dst<br/>RDMA-MR shm)]
-        WG[/Worker GB10 GPU/]
-        WP --> WMP
-        WMP --- WG
-        WG -.zero-copy CUDA view.-> WSHM
-    end
-    GMP ==>|"RDMA WRITE (src bundle)<br/>data + imm-encoded control"| WSHM
-    WSHM ==>|"RDMA WRITE_WITH_IMM (rgb_interp)<br/>data + imm-encoded control"| GMP
-    ND <-.->|"liveness TCP (29905)<br/>handshake 152 B + ready 'R'<br/>+ FIN-watchdog"| WP
+# Each worker: worker service and tray application
+./install.sh install --cluster-worker
 ```
 
-`cc_cache` is passive cuda-pinned shm — it stores intermediate task
-results on the host side only and does no I/O itself. All copies are
-initiated by `compute_proc` (kernel writes via CUDA views), `guest_mp`
-(local `ctypes.memmove` from RDMA recv buffer), or `_hmp_watcher`
-(mpv-side `ctypes.memmove` from `slot.dst` into mpv's frame VA).
-The worker has no view of `cc_cache`: it only sees its own
-`slot.src` / `slot.dst` (the RDMA-registered shm), with the bytes
-arriving via WRITE_WITH_IMM.
+The leader prompts for its rail-0 address and a comma-separated list of worker
+rail-0 addresses. An optional SSH address list, in the same order, is used for
+deployment and benchmarks. Each worker prompts for its own address and the
+leader address. Interface names, RDMA devices and ports can also be supplied
+via environment variables. For unattended installation, set
+`CLUSTER_SELF_IP`, `CLUSTER_WORKER_HOSTS` and optionally
+`CLUSTER_WORKER_SSH_HOSTS` and `CLUSTER_WORKER_USER` on the leader; set
+`CLUSTER_SELF_IP` and `CLUSTER_PEER_IP` on each worker.
 
-| component | role |
-|---|---|
-| `native_filter/SplitDual` (C++ vapoursynth filter) | hand-off point from mpv frame_thread to Python dispatcher; submits frame pair to `compute_callable` |
-| `native_dispatcher.py` | top-level orchestrator; creates HostMP + GuestMP + queue_mgr; runs the host- and guest-side dispatch loops |
-| `queue_mgr.py` | DAG (CCSR → INTERP → SR_INTERP per pair) + 3 priority heaps; `pop_for_host` and `pop_for_guest` enforce host/guest preference with cross-fallback |
-| `host_3proc.py` | host-side 3-process wrapper (HostMP). `dma_proc` does `process_vm_readv` from mpv into shm; `compute_proc` runs the host GPU kernels; `buffer_mgr_proc` mediates the shared state machine |
-| `guest_mp.py` | host-resident RDMA client. Packs frames into pinned RDMA buffers, posts WRITE\_WITH\_IMM to the worker, drains completion queue, calls `cc_cache_writeback_fn` + `task_done_fn` |
-| `worker.py` | worker entry point. Accepts the host's liveness TCP connection, reads the 152-byte handshake, spawns the 3-process pipeline. Persists across sessions; FIN/RST on the liveness socket trips the per-session watchdog and returns to accept-loop |
-| `worker_3proc.py` | worker-side 3-process pipeline (WorkerMP). `rdma_proc` polls the CQ; `compute_proc` runs the worker GPU kernels; `buffer_mgr_proc` runs the slot state machine |
-| `rdma_transport.py` | pyverbs wrapper. WRITE\_WITH\_IMM with the slot/stage encoded in the imm field; recv MR is the slot.dst region itself (zero-copy) |
-| `cc_cache.py` | cuda-pinned shm pool shared between host's `compute_proc` and `guest_mp`. Holds intermediate `rgb_padded` / `rife_features` / `rgb_interp` / `sr_yuv` per slot; lifecycle reference-counted by queue_mgr |
-| `mp_pipeline.py` | shared framework for `MPPipelineBase` (HostMP / WorkerMP) + `SlotRingShm` + eventfd channels |
+Settings are stored in `~/.config/dgxspark-mpv/cluster.conf`; do not publish
+this file. The leader launches workers through the addresses in
+`CLUSTER_WORKER_HOSTS`, falling back to `CLUSTER_WORKER_HOST` for a single
+worker. `CLUSTER_RDMA_DEVS` and `CLUSTER_RDMA_GIDS` list the local rails and
+GID indices in matching order. The default RDMA and liveness ports are 29900
+and 29905; additional rails use consecutive RDMA ports.
 
-## Task split
+The current service is `dgxspark-cluster-worker.service`. Existing `dual.conf`,
+`DUAL_*` environment variables, old install flags and the old service name
+remain compatible. A `CLUSTER_*` environment value takes precedence over its
+`DUAL_*` counterpart. Reinstalling with `--reuse-cluster-config` preserves an
+existing cluster configuration.
 
-Each source pair `k` is split into three task types and DAG-ordered:
+## Operating modes
 
-```
-CCSR(k)  ──▶  INTERP(k)  ──▶  SR_INTERP(k, phase=1..mult-1)
-   │
-   └─▶  (CCSR feeds rgb_padded + rife_features into cc_cache; INTERP reads
-        them, runs flownet(s), writes mult-1 rgb_interp frames; each
-        SR_INTERP reads one rgb_interp and runs FSRCNNX)
-```
+- **Normal:** the leader participates in GPU computation. This is the default
+  with one worker. Its priority queues distribute work between the leader and
+  available workers.
+- **Tic-tac:** the leader handles playback while workers dynamically claim
+  source frames and process their interpolation intervals. Two or more workers
+  are required. This is the default with three or more configured machines and
+  an interpolation multiplier of 2, 3 or 4. Set `CLUSTER_TICTAC=0` to force
+  normal mode, or `CLUSTER_TICTAC=1` to request tic-tac when eligible.
 
-Default queue priorities:
+Three-machine normal mode had higher average throughput in a measured workload;
+tic-tac had less variation and avoids leader GPU contention between playback
+and compute. Results depend on the video and system load.
 
-- **Host** prefers `SR_INTERP → CCSR → INTERP`. The host GPU is closest
-  to mpv VA (writeback is local memcpy), and SR_INTERP / CCSR finish
-  with a 4K output destined for mpv, so doing them on the host saves
-  the wire round-trip.
-- **Guest** prefers `INTERP → CCSR → SR_INTERP`. RIFE is throughput-
-  bound and the dominant per-task cost; running it on the guest GPU
-  while the host runs SR keeps both saturated.
+In tic-tac, each worker prioritizes available source-frame work. Workers send
+prepared frame features directly to the worker that owns the preceding interval.
+Source work, peer transfers and output delivery can overlap. The leader pulls
+finished results in playback order by default. Normal mode also uses leader
+pull for final results. `CLUSTER_TICTAC_PULL=0` selects worker-initiated output
+for tic-tac. A worker failure triggers recovery with the remaining workers;
+with one worker the pipeline uses normal mode, and with none it falls back to
+local processing. Recovery and real-time playback depend on the workload.
 
-Both sides fall back to the other priorities when their preferred
-queue drains — no static partitioning.
+**Shift+F9** toggles cluster offload. **F9** cycles interpolation multipliers
+4 → 3 → 2 → 1. **F8** toggles cluster super-resolution where supported. A
+filter rebuild is required for these changes.
 
-## Dataflow per frame pair
+## Default interpolation
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant mpv
-    participant Dispatcher as native_dispatcher
-    participant HostGPU as Host GB10
-    participant GuestMP
-    participant Worker as Worker rdma_proc
-    participant WorkerGPU as Worker GB10
-    mpv->>Dispatcher: submit pair (a, b)
-    Dispatcher->>HostGPU: CCSR(k) — CC + krig + FSRCNNX
-    HostGPU-->>Dispatcher: cc_cache (sr_yuv + rgb_padded + rife_features)
-    Dispatcher->>GuestMP: INTERP(k) — pack rgb_padded + features
-    GuestMP->>Worker: RDMA WRITE_WITH_IMM (~56 MB)
-    Worker->>WorkerGPU: RIFE flownet × (mult-1)
-    WorkerGPU-->>Worker: rgb_interp × (mult-1)
-    Worker->>GuestMP: RDMA WRITE_WITH_IMM (slot.dst)
-    GuestMP-->>Dispatcher: memmove rgb_interp into cc_cache, task_done
-    Dispatcher->>HostGPU: SR_INTERP(k, phase=p) × (mult-1)
-    HostGPU-->>mpv: 4K interp frames (mpv-side memmove)
-    Note over mpv: pair's output = a's CCSR sr_yuv + (mult-1) SR_INTERP + b's CCSR sr_yuv
-```
+Unknown source frame rates use ×2. `CLUSTER_INTERP_MULT` pins the multiplier;
+F9 can change it during playback. For two or three machines, or explicitly
+selected normal mode:
 
-## Default interp_mult per source
+| Source | Source fps | Default |
+|---|---:|---:|
+| ≤720p | ≤25 | ×4 |
+| ≤720p | >25–30 | ×3 |
+| 1080p or 4K | ≤25 | ×3 |
+| 1080p or 4K | >25–30 | ×2 |
+| Any | >30 | ×1 |
 
-`F9` cycles `DUAL_INTERP_MULT` at runtime. The default the chain
-picks on file-load is resolution + framerate dependent — the
-per-frame budget at 4K output is the constraint.
+With four or more configured machines in tic-tac mode:
 
-| source resolution | source fps | default `DUAL_INTERP_MULT` | output rate |
-|---|---|---|---|
-| ≤ 720p          | ≤ 25 fps        | **4** | up to 100 fps |
-| ≤ 720p          | 26 – 30 fps     | **3** | 78 – 90 fps   |
-| 1080p, 4K       | ≤ 25 fps        | **3** | up to 75 fps  |
-| 1080p, 4K       | 26 – 30 fps     | **2** | 52 – 60 fps   |
-| any             | > 30 fps        | **1** (interp off) | source rate |
+| Source | Source fps | Default |
+|---|---:|---|
+| ≤720p | ≤30 | ×4, native-resolution optical flow |
+| 1080p | ≤24 | ×4, native-resolution optical flow |
+| 1080p | >24–30 | ×3, native-resolution optical flow |
+| 4K | ≤24 | ×2, native-resolution optical flow |
+| 4K | >24–30 | ×3, downsampled optical flow |
+| Supported resolution | >30–60 | ×2; downsampled at 4K |
+| Any | >60 | ×1 |
 
-`mult=1` keeps both GPUs busy on CCSR + SR (no RIFE), reducing the
-chain to a pure 4K SR pipeline. `mult=4` only fits the 4K output
-budget at ≤ 720p source because the heavier resolutions saturate the
-GPU on the SR_INTERP step alone.
+The low-resolution bucket is at most 1328×720; the 4K bucket starts above
+2048×1128. Set `CLUSTER_TICTAC_4K_NATIVE=0` to disable automatic native 4K
+flow, or `=1` to request it explicitly. Native 4K ×2 has limited measured
+headroom. Defaults are not a guarantee of real-time playback.
 
-These thresholds are picked so the worker's slowest task type (INTERP
-at full multiplier × source-size frame) just fits the inter-frame
-budget at the output rate. Push higher (e.g. mult=4 at 1080p / 30 fps
-= 120 fps target) and the chain still runs, but dispatcher fps drops
-below the output rate and mpv stutters.
+## Development
 
-## Tech selection rationale
-
-| choice | alternative | why |
-|---|---|---|
-| **RDMA WRITE_WITH_IMM** for per-frame data | NCCL collectives | NCCL on Grace can't use GPUDirect (peermem won't load, dmabuf export fails) — has a ~14 ms transit floor. Pyverbs WRITE_WITH_IMM bypasses NCCL entirely; effective transit ~0 ms when fully pipelined behind compute |
-| **All control over a single TCP socket** | NCCL + TCP split | the entire control plane (handshake bytes, ready signal, FIN-watchdog) goes over one liveness TCP socket on port 29905. NCCL is gone — it only ever carried a small handshake, and its per-collective deadline (3 s) made cold TRT compile on the worker impossible to wait for. One socket + `struct.pack` removes ~80 lines of glue, kills the `TORCH_NCCL_*` env zoo, and drops the TCPStore port (29500) |
-| **3-process worker** | single process | separates RDMA poll (latency-sensitive, busy-loop on CQ), GPU compute (latency-tolerant, batched), and slot state machine (CPU-bound bookkeeping). Each can be pinned to a different core; GIL contention disappears |
-| **`process_vm_readv` host → shm** | DMA from mpv VA | mpv frames live in mpv's heap, not a shared mapping; readv crosses the address-space boundary in one syscall. Throughput ~30 GB/s on Grace — enough for 4K 4:2:0 at 100+ fps |
-| **mpv-side `memmove` for writeback** | `process_vm_writev` from dma_proc | shm is mapped in both mpv and dma_proc, so mpv can memcpy locally at ~30 GB/s; cross-process writev is ~2.5 GB/s (page-fault overhead). Saves ~8 ms per SR task at 4K |
-| **3-queue priority dispatch** | unified single heap | symmetric heap would have host and guest contending on every pop; per-side queues with cross-fallback keep the lock contention low while still letting either side drain idle work |
-| **cc_cache cuda-pinned shm** | cudaMemcpy per task | host's compute_proc and guest_mp's send packer both need the same `rgb_padded` bytes; a single pinned region is mapped into both at zero cost. Avoids HtoD/DtoH bounce |
-| **Asymmetric host/guest priorities** | symmetric | host's GPU writes directly to mpv VA (no wire); guest's writes go over RDMA. Preferring SR_INTERP/CCSR on host keeps the wire idle for INTERP, which is heavier anyway. Symmetric scheduling tested ~1.5 fps slower |
-| **`DUAL_INTERP_MULT` toggle (1–4)** | fixed mult=2 | F9 cycles 4 → 3 → 2 → 1 at runtime. mult=1 is "SR-only dual" (CCSR on both sides, no interp). Per-file auto-default driven by (source resolution, source fps) — see the table above; ffprobe + lua hook write `/tmp/dual_machine_mult_override` before rife.vpy reads it |
-| **Dispatcher singleton across vf-rebuild** | re-init host_mp + reload TRT per seek | mpv tears down and rebuilds the vapoursynth filter on every seek. Caching the host_mp / queue_mgr / guest_mp / compute closure in a module-level dict in `_dispatcher_singleton.py` survives the rebuild — no respawn of 3 host children, no TRT engine reload, no RDMA QP re-handshake. Drops the seek recovery from ~8 s to ~3 s |
-| **lua side-channel for seek / shutdown events** | mpv vapoursynth API surfacing them to the filter | mpv's vf API doesn't expose seek or exit events to the filter, so the dispatcher can't see them from inside python. `scripts/dual_seek_flush.lua` writes `/tmp/dual_machine_seek_epoch` on `seeking` property going true (fires before vf teardown, so parked compute() threads unpark in time) and `/tmp/dual_machine_shutdown` on the `shutdown` event (mpv's embedded python doesn't fire atexit, so this is the only reliable close hook) |
-| **inotify-driven seek-flush watcher** | 100 ms poll loop | the watcher blocks on `inotify_init1` + `os.read` (ctypes, no extra dep). lua's file write wakes it in microseconds vs the polling path's ~50 ms average — felt as instant on a progress-bar drag instead of a noticeable freeze |
-| **wait_phase_done returns silently on timeout** | raises RuntimeError | a python exception out of `compute_callable` becomes a vapoursynth filter error, which mpv treats as fatal and exits the process. Return silently (and let mpv display whatever was in the dst VA — usually black, replaced within a couple of vsyncs by the next frame) so a worker stall or trailing-K corner case never crashes playback |
-
-## Why the link runs at ~98 Gb/s, not 200
-
-The fabric is 200 Gb/s per node. This pipeline uses half of it, and
-that is a property of the transport, not of the config or the cabling.
-
-### What the CX7 actually looks like
-
-A DGX Spark has **one** ConnectX-7 ASIC — all four PCI functions report
-the same `phys_switch_id` — with two physical ports. It attaches to the
-host over **two PCIe5 x4 root complexes**, and each port is exposed on
-*both* of them (socket direct). So the four netdevs are 2 ports x 2
-PCIe paths, not four ports:
-
-| netdev | PCI function | `devlink` port | PCIe path |
-|---|---|---|---|
-| `enp1s0f0np0` | `0000:01:00.0` | port 0 | A |
-| `enP2p1s0f0np0` | `0002:01:00.0` | port 0 | B |
-| `enp1s0f1np1` | `0000:01:00.1` | port 1 | A |
-| `enP2p1s0f1np1` | `0002:01:00.1` | port 1 | B |
-
-Two facts set the ceiling:
-
-- **Each port is 200G-capable.** `ethtool` advertises
-  `200000baseCR4/Full` and `200000baseCR2/Full`. The ports negotiate
-  100 Gb/s here only because the DACs and switch ports are QSFP28 100G
-  (`ethtool -m` reports `Identifier: QSFP28`, `100G Base-CR4`).
-- **Each PCIe path is x4 at 32 GT/s** (`LnkSta: Speed 32GT/s, Width
-  x4`) — about 128 Gb/s raw. One path cannot carry 200G. That is the
-  entire reason the NIC is wired to two root complexes.
-
-So **200 Gb/s always means driving two PCIe paths in parallel**, i.e.
-two rdma devices. How many cables are plugged in is an independent
-choice — both of these reach 200 Gb/s:
-
-- one 200G cable in port 0, driven by `enp1s0f0np0` (path A) +
-  `enP2p1s0f0np0` (path B);
-- two 100G cables, driven by one netdev per port on *different* paths.
-
-What is never possible is 200 Gb/s through a single netdev, a single
-PCIe path, or a single QP.
-
-This fabric uses the two-cable form because the switch and DACs are
-100G. It addresses `enp1s0f0np0` (port 0, path A) and `enP2p1s0f1np1`
-(port 1, path B) and leaves the other two without an IP: their port's
-wire is already saturated by the path that owns it. Pairing
-`enp1s0f0np0` with `enp1s0f1np1` instead would put both rails on path A
-and cap the node near 100 Gb/s.
-
-A bond does not change this. mlx5 hardware RoCE LAG only forms between
-PFs of the *same* PCI device — two netdevs behind one PCIe path, which
-adds no PCIe bandwidth — and RoCE LAG hashes per QP, so a single QP
-lands on a single port either way. Bonding across the two root
-complexes gives a plain Linux bond with no bonded RDMA device, and RoCE
-falls back to one port.
-
-### How the transport uses them
-
-`guest_mp.py` (host) and `worker_3proc.py` (worker) open one
-`RDMAContext` and one RC QP per rail, and split every transfer across
-them.
-
-Rails come from `DUAL_RDMA_DEVS` / `DUAL_RDMA_GIDS` (host) and
-`WMP_RDMA_DEVS` / `WMP_RDMA_GIDS` (worker), both comma-separated and
-both written by `install.sh`, which enumerates the rails at config
-time. Rail *r* handshakes on TCP `DUAL_RDMA_PORT + r`, so a two-rail
-install uses 29900 and 29901. Unset — or a single entry — gives the
-single-rail transport, unchanged from before multi-rail existed; that
-is the fallback if a rail misbehaves.
-
-The two directions split differently, because they use different verbs:
-
-- **worker → host** is `RDMA WRITE_WITH_IMM`. The sender picks the
-  remote address, so a range can be cut anywhere and the pieces
-  reassemble at the destination. The `imm` carries `(slot, stage,
-  part, n_parts)`; the host runs a writeback only once it has counted
-  `n_parts` arrivals for that `(slot, stage)`. Writes under 1 MB go
-  whole onto one rail, rotating so a stream of them still spreads.
-- **host → worker** is `SEND`/`RECV`. A message lands at the start of
-  the next pre-posted recv WR on that QP, so the cut points are fixed
-  in advance (`src_partition`) and the per-rail recv queues must stay
-  in lockstep. Every message therefore posts exactly one piece per
-  rail — zero-length on a rail whose window holds no bytes — and the
-  host's `io_lock` keeps message order identical on all rails. Skipping
-  a rail for a short message would desynchronise its queue and land
-  every later message in the wrong slot's buffer.
-
-An MR belongs to one PD, so every staging buffer, the `cc_cache` region
-and the worker's slot ring are registered once per rail
-(`MultiRailBuffer`). The dispatcher still builds SGEs with rail 0's
-lkey; `notify_submit` remaps them per rail.
-
-Link capacity, `ib_write_bw` between two nodes (2026-09-19, `-q 8
--s 65536 -D 15`):
-
-| | Gb/s |
-|---|---|
-| rail 0 alone (`rocep1s0f0`) | 98.01 |
-| rail 1 alone (`roceP2p1s0f1`) | 98.01 |
-| both in parallel | 196.02 |
-
-Measured on the striped `SEND` path with the pipeline's real message
-sizes (CCSR 6.2 MB, SR_INTERP 12.4 MB, INTERP 58.5 MB, 4 slots,
-60 messages, 2026-09-19): **156 Gb/s**, against a single rail's 98.
-It is not 196 because a message shorter than rail 0's window lands
-entirely on rail 0 — the windows are fixed, which is what SEND/RECV
-requires. Only INTERP spans both rails, and INTERP is ~92 % of the
-bytes in this direction, so the imbalance costs little. The
-`WRITE_WITH_IMM` direction has no such constraint and splits every
-range evenly.
-
-
-## `VK_LAYER_PRIORITY_BOOST`
-
-Vulkan instance layer that elevates mpv's present queue to
-`VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR`, so the GPU scheduler favours
-vsync presentation over the host-side CUDA work (RIFE post-flownet +
-FSRCNNX + krig + CCSR) on the shared GB10. ~+10% display fps on
-1080p24×mult=3 to a 60 Hz panel; default-on after `install.sh
---dual-host`.
-
-Wired up by `install.sh`:
-- builds + installs the layer to `/usr/local/lib/` and
-  `/usr/share/vulkan/implicit_layer.d/` (one-time sudo); the Vulkan
-  loader ignores user-local paths under `AT_SECURE=1`, so a system
-  path is required;
-- `setcap cap_sys_nice+ep` on the mpv binary (HIGH/REALTIME require
-  the cap);
-- `mpv-conda` + `jellyfin-mpv-shim` wrappers export
-  `VK_PRIORITY_BOOST_LEVEL=high`;
-- `uninstall` reverses all three.
-
-`native_dispatcher` calls `_mpv_relax_for_dual_under_caps()` at module
-load (drop file caps + `PR_SET_DUMPABLE=1` + `PR_SET_PTRACER_ANY`) so
-the cap-bearing mpv still lets the `host_3proc` dma_proc child use
-`process_vm_readv` on it. No-op on no-cap installs.
-
-Override the level per launch with `VK_PRIORITY_BOOST_LEVEL` (`low` /
-`medium` / `high` / `realtime`); kill globally with
-`VK_PRIORITY_BOOST_DISABLE=1`. Source + build in
-[`vk_priority_layer/`](./vk_priority_layer/).
-
-## Server-mode worker
-
-The worker process persists across host sessions. The host's
-`native_dispatcher.cleanup()` closes the liveness TCP socket;
-the worker's watchdog thread sees the EOF (or keepalive RST on host
-crash) and tears down the current session's pipeline, then loops back
-to `listener.accept_session()` waiting for the next host. A new
-host playback session reattaches without a daemon restart — typically
-under 3 s end-to-end. There is no NCCL group to re-init; the entire
-control plane is a single TCP socket.
-
-The watchdog is symmetric: the **host** also parks a thread on the
-same socket for the session's lifetime. If the worker dies
-mid-session (crash, power, link), the host detects it in ~3 s, fails
-the in-flight guest tasks (instead of letting each pending pair eat a
-1 s black-frame timeout), requeues claimed work to the host
-dispatcher, and playback continues single-machine. Shift+F9 retries
-dual from a single keypress, same as a connect failure.
-
-Seeks are cheap on a long-lived session: the seek-flush sweep frees
-any cc_cache slots whose consumers were flushed, so heavy
-progress-bar dragging never drains the 32-slot pool.
-
-## See also
-
-- [`bench/README.md`](../bench/README.md) — color / fps / timing benches.
-- [`../docs/`](../docs/) — measured performance + color accuracy tables.
-- [`native_filter/README.md`](./native_filter/README.md) — C++ vapoursynth
-  filter that hands frames to `native_dispatcher`.
+`scripts/dev_deploy.sh --worker` installs the current host files and copies the
+worker modules to every configured worker. Restart the worker services after a
+copy. `tests/` contains scheduler, transport, fallback and installer tests;
+`bench/README.md` describes the hardware benchmarks.

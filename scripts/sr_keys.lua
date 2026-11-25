@@ -15,7 +15,7 @@
 --   Shift+F8: toggle the krig-bilateral chroma GLSL shader (mpv's
 --             display-time chroma upsample; orthogonal to the in-
 --             vapoursynth krig). Instant — no vf reload.
---   Shift+F9: toggle dual-machine offload (no-op if DUAL_WORKER_HOST
+--   Shift+F9: toggle dual-machine offload (no-op if CLUSTER_WORKER_HOST
 --             isn't set).
 --
 -- F8 / F9 / Shift+F9 all force a vapoursynth filter reload (~1-3 s
@@ -40,7 +40,7 @@
 --   /tmp/dual_machine_mult_override — F9 dual cycle writes "2"/"3"/"4"
 --                                     /"off" here. rife.vpy mirrors
 --                                     numeric values into
---                                     DUAL_INTERP_MULT and passes via
+--                                     CLUSTER_INTERP_MULT and passes via
 --                                     handshake.
 --   /tmp/dual_machine_sr_disabled   — F8 dual writes (touch/remove).
 --                                     rife.vpy reads -> passes no_sr=1
@@ -49,17 +49,25 @@
 --                                     reporting whether SR actually ran
 --                                     in dual on the last load.
 
+local function cluster_getenv(name)
+    local value = os.getenv(name)
+    if value == nil and name:sub(1, 8) == "CLUSTER_" then
+        return os.getenv("DUAL_" .. name:sub(9))
+    end
+    return value
+end
+
 local mp = require "mp"
 
 local OVERRIDE_FILE      = "/tmp/fsrcnnx_variant"
 local ACTIVE_FILE        = "/tmp/fsrcnnx_active_variant"
 local RIFE_OFF_FILE      = "/tmp/rife_disabled"
-local DUAL_OFF_FILE      = "/tmp/dual_machine_disabled"
-local DUAL_STATE_FILE    = "/tmp/dual_machine_active"
-local DUAL_MULT_FILE     = "/tmp/dual_machine_mult"
-local DUAL_MULT_OVERRIDE = "/tmp/dual_machine_mult_override"
-local DUAL_SR_OFF_FILE   = "/tmp/dual_machine_sr_disabled"
-local DUAL_SR_STATE_FILE = "/tmp/dual_machine_sr_active"
+local CLUSTER_OFF_FILE      = "/tmp/dual_machine_disabled"
+local CLUSTER_STATE_FILE    = "/tmp/dual_machine_active"
+local CLUSTER_MULT_FILE     = "/tmp/dual_machine_mult"
+local CLUSTER_MULT_OVERRIDE = "/tmp/dual_machine_mult_override"
+local CLUSTER_SR_OFF_FILE   = "/tmp/dual_machine_sr_disabled"
+local CLUSTER_SR_STATE_FILE = "/tmp/dual_machine_sr_active"
 
 -- Fallback path used if the user starts mpv with glsl-shaders empty
 -- and then presses Shift+F8. install.sh writes KrigBilateral.glsl under
@@ -70,7 +78,7 @@ local SINGLE_CYCLE    = { "x4_16", "x3_16", "x2_16", "x2_8", "off" }
 -- Dual mult cycle: "1" = no_interp (SplitDual emits CCSR-only, INTERP
 -- + SR_INTERP skipped end-to-end). Distinct from single-mode "off"
 -- (rife_disabled) — F9 in dual never touches /tmp/rife_disabled.
-local DUAL_MULT_CYCLE = { "4", "3", "2", "1" }
+local CLUSTER_MULT_CYCLE = { "4", "3", "2", "1" }
 
 local function cycle_index(list, value)
   for i, v in ipairs(list) do
@@ -113,12 +121,12 @@ local function is_dual_active()
   -- "dual is the active branch" = rife.vpy reported dual_active=1 on
   -- the last reload AND Shift+F9 hasn't toggled it off since. The
   -- disable-flag check guards the case where the user just hit
-  -- Shift+F9 (DUAL_OFF_FILE present) but the reload hasn't happened
-  -- yet (DUAL_STATE_FILE still says "1"), and then mashes F8/F9 —
+  -- Shift+F9 (CLUSTER_OFF_FILE present) but the reload hasn't happened
+  -- yet (CLUSTER_STATE_FILE still says "1"), and then mashes F8/F9 —
   -- we'd otherwise cycle the dual files for an about-to-be-single
   -- session.
-  return read_file(DUAL_STATE_FILE) == "1"
-         and not file_exists(DUAL_OFF_FILE)
+  return read_file(CLUSTER_STATE_FILE) == "1"
+         and not file_exists(CLUSTER_OFF_FILE)
 end
 
 local function cycle_fsrcnnx_single()
@@ -144,12 +152,12 @@ local function toggle_fsrcnnx_dual()
   -- and needs SR to upscale back). rife.vpy enforces the gate downstream
   -- and re-publishes /tmp/dual_machine_sr_active to surface the actual
   -- post-reload state — we just toggle the request flag here.
-  local now = read_file(DUAL_SR_STATE_FILE)
+  local now = read_file(CLUSTER_SR_STATE_FILE)
   if now == "1" then
-    write_file(DUAL_SR_OFF_FILE, "")
+    write_file(CLUSTER_SR_OFF_FILE, "")
     mp.osd_message("dual SR: OFF (reloading...)", 2)
   else
-    os.remove(DUAL_SR_OFF_FILE)
+    os.remove(CLUSTER_SR_OFF_FILE)
     mp.osd_message("dual SR: ON (reloading...)", 2)
   end
   reload_vf()
@@ -177,13 +185,13 @@ end
 local function cycle_mult_dual()
   -- Current effective state: prefer the override file (most-recent
   -- press), fall back to rife.vpy's published-effective mult.
-  local cur = read_file(DUAL_MULT_OVERRIDE)
+  local cur = read_file(CLUSTER_MULT_OVERRIDE)
   if cur == nil or cur == "" then
-    cur = read_file(DUAL_MULT_FILE) or "2"
+    cur = read_file(CLUSTER_MULT_FILE) or "2"
   end
-  local idx = cycle_index(DUAL_MULT_CYCLE, cur)
-  local nxt = DUAL_MULT_CYCLE[(idx and (idx % #DUAL_MULT_CYCLE) + 1) or 1]
-  write_file(DUAL_MULT_OVERRIDE, nxt)
+  local idx = cycle_index(CLUSTER_MULT_CYCLE, cur)
+  local nxt = CLUSTER_MULT_CYCLE[(idx and (idx % #CLUSTER_MULT_CYCLE) + 1) or 1]
+  write_file(CLUSTER_MULT_OVERRIDE, nxt)
   if nxt == "1" then
     -- mult=1 == no_interp dual mode: SplitDual emits CCSR-only, no
     -- INTERP/SR_INTERP scheduled, worker CCSR skips rgb_padded +
@@ -208,24 +216,27 @@ local function toggle_dual_machine()
   -- Hard gate: env not configured -> nothing to toggle. We don't even
   -- touch the disable flag, so a stale flag from a previous install
   -- (where the env was set) doesn't flip behaviour now.
-  local env_host = os.getenv("DUAL_WORKER_HOST")
+  local env_host = cluster_getenv("CLUSTER_WORKER_HOSTS")
+  if not env_host or env_host == "" then
+    env_host = cluster_getenv("CLUSTER_WORKER_HOST")
+  end
   if not env_host or env_host == "" then
     mp.osd_message(
-      "dual-machine: DUAL_WORKER_HOST not set (toggle disabled)", 2)
+      "dual-machine: worker host not configured (toggle disabled)", 2)
     return
   end
 
   -- State-aware: rely on what .vpy reports it's actually doing, not
   -- the disable flag, so a failed-connect fallback still retries on
   -- the next press (rather than appearing to "double-disable").
-  local active = read_file(DUAL_STATE_FILE)
+  local active = read_file(CLUSTER_STATE_FILE)
   if active == "1" then
     -- Going dual -> single. Dual x3/x4 have no production
     -- single-mode equivalent (single x3/x4 exists for AB only, too
     -- slow to use). Warn that output rate drops back to 2x; rife.vpy
     -- builds single-mode at rife_factor=2 unless SINGLE_INTERP_MULT
     -- is set in the env.
-    local mult = read_file(DUAL_MULT_FILE)
+    local mult = read_file(CLUSTER_MULT_FILE)
     if mult == "3" or mult == "4" then
       mp.osd_message(
         "dual-machine: OFF -- single mode drops to x2 "
@@ -233,9 +244,9 @@ local function toggle_dual_machine()
     else
       mp.osd_message("dual-machine: OFF (reloading...)", 2)
     end
-    write_file(DUAL_OFF_FILE, "")
+    write_file(CLUSTER_OFF_FILE, "")
   else
-    os.remove(DUAL_OFF_FILE)
+    os.remove(CLUSTER_OFF_FILE)
     mp.osd_message("dual-machine: connecting... (reloading)", 2)
   end
   reload_vf()
@@ -286,10 +297,10 @@ mp.register_event("file-loaded", reset_on_file_load)
 -- we detect that here, OSD-warn, and reload the vf so rife.vpy picks
 -- the single chain. Without this auto-recovery a dead worker just
 -- raises into mpv → playback halts.
-local DUAL_WORKER_DEAD_FILE = "/tmp/dual_machine_worker_dead"
+local CLUSTER_WORKER_DEAD_FILE = "/tmp/dual_machine_worker_dead"
 local function check_worker_death()
-  if file_exists(DUAL_WORKER_DEAD_FILE) then
-    os.remove(DUAL_WORKER_DEAD_FILE)
+  if file_exists(CLUSTER_WORKER_DEAD_FILE) then
+    os.remove(CLUSTER_WORKER_DEAD_FILE)
     mp.osd_message(
       "dual worker died — falling back to single (reloading...)", 4)
     -- The dispatcher already touched /tmp/dual_machine_disabled, so

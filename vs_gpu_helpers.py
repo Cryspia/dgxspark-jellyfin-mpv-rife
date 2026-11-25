@@ -418,12 +418,30 @@ def _vsrife_engine_paths(model: str, ph: int, pw: int, scale: float,
     import tensorrt
     model_dir = Path(vsrife.__file__).parent / "models"
     gpu_name = torch.cuda.get_device_name(device)
-    base = (f"flownet_v{model}.pkl_{pw}x{ph}"
+    # The installer assigns a cache tag when it patches vsrife's warp.
+    # Keep engines compiled from different model graphs separate.
+    cache_tag = getattr(vsrife, "_WARP_CACHE_TAG", "")
+    base = (f"flownet_v{model}.pkl{cache_tag}_{pw}x{ph}"
             f"_{'fp16' if fp16 else 'fp32'}_scale-{scale}"
             f"_ensemble-False_{gpu_name}_trt-{tensorrt.__version__}.ts")
     flow = model_dir / base
     enc = model_dir / (base + ".encode")
     return flow, (enc if enc.exists() else None)
+
+
+def rife_engine_metadata(model: str, h: int, w: int, scale: float = 1.0) -> dict:
+    """Describe supported worker engines without initializing host CUDA.
+
+    These are the two models accepted by the worker handshake. Refuse
+    unsupported models instead of guessing the encoded feature layout.
+    """
+    channels = {"4.26": 4, "4.6": 0}
+    if model not in channels:
+        raise ValueError(f"unsupported worker RIFE model: {model}")
+    if h < 1 or w < 1 or scale <= 0:
+        raise ValueError("invalid RIFE input dimensions or scale")
+    ph, pw = _vsrife_padded_shape(model, h, w, scale)
+    return {"ph": ph, "pw": pw, "encode_channel": channels[model]}
 
 
 def _ensure_engines(model: str, h: int, w: int, scale: float,

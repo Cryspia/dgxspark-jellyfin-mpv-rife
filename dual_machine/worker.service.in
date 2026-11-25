@@ -1,11 +1,11 @@
 [Unit]
-Description=DGX Spark dual-machine RIFE+FSRCNNX worker (rank 1)
+Description=DGX Spark cluster RIFE+FSRCNNX worker
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=@DUAL_CONFIG_FILE@
+EnvironmentFile=@CLUSTER_CONFIG_FILE@
 ExecStart=@PYTHON_BIN@ -B @WORKER_PY@
 # `always` (not `on-failure`) — worker's SIGTERM handler calls
 # sys.exit(0) for graceful shm/NCCL cleanup, which on-failure would
@@ -22,3 +22,4 @@ KillSignal=SIGTERM
 
 [Install]
 WantedBy=default.target
+Alias=dgxspark-dual-worker.service

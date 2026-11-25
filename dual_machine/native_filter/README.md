@@ -26,7 +26,7 @@ cmake --build build -j
 ```
 
 The plugin lands at `build/libdgxspark_split_dual.so`. The host
-install (`install.sh install --dual-host`) compiles + places it in
+install (`install.sh install --cluster-host`) compiles + places it in
 the right spot automatically.
 
 ## API

@@ -1,178 +1,37 @@
-# Bench results — DGX Spark reference machines
+# Benchmark results
 
-Snapshot of the most recent full run, kept under version control so it
-doubles as a regression baseline.
+These measurements are workload-specific observations, not real-time playback
+guarantees. See [bench/README.md](./README.md) for benchmark prerequisites.
 
-- **Date:** 2026-06-10
-- **Hardware:** 2 × DGX Spark (GB10, ARM64, CUDA 13), 200 G RoCE link
-- **Software:** `main`
-- **Test clips:** `bench/clips/sample-1080p-24.mp4` for color,
-  `bench/clips/sample-1080p-120.mp4` for fps — both committed in-repo
-  (synthesised by `bench/gen_clips.sh`), so anyone can reproduce.
+## Four-machine tic-tac, 1080p → 4K
 
-Reproduce with:
-```bash
-bench/color.sh
-bench/fps.sh
-MODE=dual bench/timing.sh
-bench/robustness.sh
-```
+Measured 2026-11-25 with one playback leader, three workers and two RDMA rails.
+The input was a synthetic 1080p24 YUV420P clip. mpv used `--vo=null --untimed`,
+12 buffered frames and 24 concurrent frames; each run requested 3,000 output
+frames. GPU utilisation was sampled every 500 ms with `nvidia-smi`, without
+per-task CUDA synchronisation. The means below use the shared steady interval
+across all three workers.
 
-## bench/color.sh — single vs dual PSNR
+| Interpolation | Dispatcher fps | Worker GPU utilisation means |
+|---|---:|---|
+| ×2 | 152.3 | 95.7%, 95.9%, 96.0% |
+| ×4 | 108.6 | 79.6%, 82.0%, 81.4% |
 
-`N=20`, `CF=2`, comparing the FFV1-encoded outputs of each pair.
+GPU utilisation indicates whether work was present during a sample; it is not
+SM occupancy. This comparison uses the same source and output size, but ×4
+performs more interpolation work per output frame. Source content, playback,
+network, worker count and background load affect results.
 
-| pair | single bytes | dual bytes | Y avg | U avg | V avg | overall avg |
-|---|---:|---:|---:|---:|---:|---:|
-| full        (RIFE + FSRCNNX) | 53,356,785 | 53,331,494 | 58.31 | 49.93 | 49.03 | 53.22 |
-| no\_sr      (RIFE only)       | 26,235,552 | 12,739,136 | 61.46 | 47.14 | 47.38 | 51.71 |
-| no\_interp  (FSRCNNX only)    | 52,623,730 | 54,733,061 | 63.79 | 37.69 | 36.56 | 41.84 |
+In two alternating comparisons of the installed pipeline and the cleaned
+development tree under the same conditions, ×2 measured 152.3/153.1 fps before
+and 152.7/151.8 fps after. ×4 measured 108.6/109.9 fps before and 109.2/107.8
+fps after. These short runs showed no clear systematic regression; they do not
+rule out small differences on other workloads.
 
-`SR_SRC` (real-frame) outputs are **byte-identical** between single
-and dual (`psnr_y=inf` every frame). `SR_INTERP` frames carry RIFE
-cross-GPU non-determinism: 54–61 dB Y on the full pair in this run.
+## Correctness
 
-PSNR here measures single-vs-dual *consistency* and is strongly
-content-dependent — the synthetic clip's sharp, saturated chroma reads
-much lower on U/V than real video does. Numbers are only comparable
-across runs of the **same** clip; re-baseline whenever the clip
-changes.
-
-## 2026-09-19 — multi-rail transport + dependency bump
-
-Two changes landed together. Same host, same clip, `SKIP_SINGLE=1
-N=200 CF=24`; dispatcher fps is the comparable figure because wall fps
-still carries fixed init cost and N differs from the baseline run below.
-
-### Transport: one RDMA device -> one per rail, striped
-
-| mode | single rail (2026-06-10) | two rails |
-|---|---:|---:|
-| dual            | 94.9 – 99.8   | 105.7 |
-| dual\_no\_sr     | 152.8 – 156.1 | 156.7 |
-| dual\_no\_interp | 145.1 – 146.6 | 164.2 |
-
-Fabric capacity (`ib_write_bw`, `-q 8 -s 65536 -D 15`): 98.01 Gb/s per
-rail, 196.02 both in parallel. Striped `SEND` with the pipeline's real
-message sizes: 156 Gb/s.
-
-### Dependencies
-
-Taken: `jellyfin-mpv-shim` 2.10.0 -> 3.0.0, `nvidia-cudnn-frontend`
-1.26.0 -> 1.29.0, miniforge/conda 26.5.0 -> 26.7.2. mpv (v0.41.0),
-vsrife (5.7.0) and fsrcnnx-cudnn (v0.2.2) were already current.
-
-cudnn-frontend 1.29 is worth its own line: `dual_no_interp` — the only
-mode that never touches RIFE — went 159.6 -> 164.2 (+2.9%) and stayed
-there across a TensorRT rollback, so the win is cuDNN's, not TRT's.
-Output is bit-identical (see PSNR below).
-
-**Not taken: torch 2.13.0 / torch\_tensorrt 2.13.0 / tensorrt
-11.0.0.114.** The set installs and runs clean but builds a slower RIFE
-engine on GB10:
-
-| task | TRT 10.16.1.11 | TRT 11.0.0.114 |
-|---|---:|---:|
-| INTERP kernel    | 17.6 ms | 20.86 ms (+18.5%) |
-| SR\_INTERP kernel | 8.5 ms  | 8.2 ms |
-| CCSR kernel      | 11.4 ms | 11.44 ms |
-
-Only the TRT-compiled path moved. Dispatcher fps fell to dual 96.5 and
-dual\_no\_sr 137.0 (two runs, <2% apart), while dual\_no\_interp was
-unaffected. Neither knob recovers it, measured on the real vsrife
-filter at 1920x1088: builder `optimization_level=5` gives 16.09 vs
-16.39 ms/frame (+10.5 s build time), and removing the mixed-precision
-patch gives 16.34 — so the patch is not implicated and stays. Re-test
-when torch\_tensorrt ships a newer TRT 11 pairing.
-
-### PSNR (`bench/color.sh`, `N=20`, `CF=2`)
-
-Unchanged within the RIFE cross-GPU non-determinism the baseline
-already documents. `no_interp` is bit-identical across the single-rail
-baseline, the multi-rail run and the post-rollback run:
-
-| pair | Y | U | V | overall | baseline overall |
-|---|---:|---:|---:|---:|---:|
-| full       | 57.82 | 49.89 | 48.97 | 53.08 | 53.22 |
-| no\_sr      | 61.23 | 47.14 | 47.38 | 51.69 | 51.71 |
-| no\_interp  | 63.79 | 37.69 | 36.56 | 41.84 | 41.84 |
-
-## bench/fps.sh — sustained throughput
-
-`N=400`, `CF=24`, bf=2, 1080p source → 4K output. `wall` includes
-~3 s of engine / cuDNN warm overhead (reads low); `dispatcher` is the
-rolling 30-frame estimate (steady state). Run-to-run noise is ±3 %;
-the very first dual session after a worker cold start can read far
-lower — discard the first run when benchmarking.
-
-| chain | mode | wall fps | dispatcher fps |
-|---|---|---:|---:|
-| single | single          | 29.7 | — |
-| single | single\_no\_sr   | 43.8 | — |
-| single | single\_no\_rife | 53.0 | — |
-| dual   | dual            | 26.2 |  94.9 – 99.8 |
-| dual   | dual\_no\_sr     | 31.9 | 152.8 – 156.1 |
-| dual   | dual\_no\_interp | 29.1 | 145.1 – 146.6 |
-
-### dual at higher interp_mult
-
-`N=300`, `CF=24`, mult forced via env (`DUAL_INTERP_MULT=N`);
-production auto-defaults are listed in dual_machine/README.md.
-
-| `DUAL_INTERP_MULT` | dispatcher fps (steady) |
-|---|---:|
-| 2 | 94.9 – 99.8 (mean ≈ 97) |
-| 3 | 86.7 |
-
-`DUAL_MID_DELIVERY` (stage early-delivery) is **on** by default and
-carried in the handshake so both sides always agree. Interleaved A/B
-(3+3 runs, mult=2): on 97.4 vs off 94.8 fps mean, bit-clean PSNR;
-neutral at mult=3 (86.6 vs 86.7). Set `DUAL_MID_DELIVERY=0` on the
-host to disable for A/B.
-
-## bench/timing.sh — per-task GPU + comm (MODE=dual, N=600)
-
-Numbers below are with full instrumentation enabled
-(`DUAL_PROFILE=1`, `DUAL_GPU_IDLE_DBG`, `DUAL_RDMA_PROF`), which
-costs ~13 % steady-state fps (83 vs 95) — compare within this table,
-not against fps.sh. Measured with an idle desktop: no shim, no other
-GPU clients on either box.
-
-Worker side per task type (last `PROFILE` sample, GB10):
-
-| task type | kernel (ms) | idle\_before (ms) |
-|---|---:|---:|
-| INTERP    | 17.6 | 0.3 |
-| SR\_INTERP | 8.5  | 0.6 – 6 |
-| CCSR      | 11.4 | 7.7 |
-
-Worker GPU stream utilisation (rolling): **80 – 88 %**.
-
-Worker RDMA per task (`DUAL_RDMA_PROF=1`):
-
-| task | send (ms) | recv-rtt (ms) |
-|---|---:|---:|
-| INTERP    | 4.3 | 15.1 |
-| SR\_INTERP | 4.6 | 17.3 |
-| CCSR      | 6.4 | 41.3 |
-
-`recv-rtt` is **not** wire latency: it measures "previous send-CQ on
-this slot → next recv on this slot", attributed to the *incoming*
-task's type — i.e. slot-reuse cadence including all host-side think
-time. Task types the guest receives rarely (CCSR is mostly consumed
-host-side) therefore read high by construction. Transit pipelines
-behind the next task's compute; effective critical-path cost ≈ 0 ms.
-
-Host queue depth + lock-hold (`DUAL_PROFILE=1`):
-- HOST pops ≈ 69 / s (cc 29, sr 33, interp 6); GUEST ≈ 57 / s
-  (interp 35, cc 13, sr 8). `wait_avg ≈ 4 ms` (dispatchers wait on
-  work, not slots).
-- Queue depth at pop ≈ 0.6 – 1.5; DAG size ≈ 38 (peak 51).
-- Lock-hold: pops ≈ 0.05 ms, task_done ≈ 0.15 ms, submit ≈ 0.08 ms.
-
-## bench/robustness.sh
-
-All **9/9 scenarios PASS**: worker_down (clean single fallback),
-clean_restart ×2, force_kill_restart, two_mpvs, host_child_crash,
-queue_saturation, repeated_vf_reload, trt_cache_miss (full recompile,
-118.9 s wall), seek_storm.
+A 120-frame FFV1 comparison of four-machine ×4 output before and after the
+source-frame scheduling change was byte-identical. A separate 60-frame test
+that interrupted one worker and recovered with the remaining workers also
+matched the reference output frame-for-frame. These checks cover the tested
+clips and configurations, not every possible source.

@@ -1,5 +1,5 @@
 """Dual-machine worker daemon. Listens on a single TCP socket
-(`DUAL_LIVENESS_PORT`, default 29905) for host sessions; per session
+(`CLUSTER_LIVENESS_PORT`, default 29905) for host sessions; per session
 reads a 20-int64 handshake, spawns the 3-proc RDMA pipeline, sends a
 ready byte, then parks watchdog-style on the same socket until the
 host disconnects (FIN/RST → keepalive 1+1+2 ≈ 3 s detection).
@@ -10,7 +10,7 @@ killed the 3 s per-collective deadline that used to gate the slow
 worker prep path (cold TRT compile takes minutes).
 
 Handshake wire format (`<20q`, 160 bytes, little-endian signed int64):
-  [0] mode (== 2; only mode left)
+  [0] mode                5–9 = tic-tac, 10–11 = normal result pull
   [1] H, [2] W            source dimensions
   [3] scale                fsrcnnx upscale factor (=2)
   [4] variant_idx          VARIANTS index
@@ -32,7 +32,8 @@ Handshake wire format (`<20q`, 160 bytes, little-endian signed int64):
                            hardcoded worker-side 4 would silently
                            corrupt data the day a 4.6 dual session is
                            enabled.
-  [19] mid_delivery        1 = stage early-delivery (mid SENDs) on.
+  [19] mid_delivery/layout  1 = early delivery; 2 = early delivery with
+                           balanced source striping in frame-owned modes.
                            Host decides; worker mirrors into its
                            children's env so both sides always agree.
 """
@@ -46,6 +47,8 @@ from pathlib import Path
 # Avoid hardcoding any path here.
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
+from cluster_env import normalize_cluster_environment
+normalize_cluster_environment()
 _PY_BIN = str(Path(sys.executable).parent)
 if _PY_BIN not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _PY_BIN + os.pathsep + os.environ.get("PATH", "")
@@ -238,12 +241,23 @@ def _recv_exact(conn: socket.socket, n: int) -> bytes:
 
 
 def _parse_handshake(buf: bytes) -> dict | None:
-    """Decode 160-byte handshake into a dict, or None if mode != 2."""
+    """Decode the handshake and its worker memory-layout version."""
     hs = struct.unpack(_HANDSHAKE_FMT, buf)
-    if hs[0] != 2:
+    if hs[0] not in (5, 6, 7, 8, 9, 10, 11):
+        return None
+    if hs[0] in (4, 5, 6, 7, 8, 9) and hs[19] not in (1, 2, 5, 6):
+        return None
+    if hs[0] in (10, 11) and hs[19] not in (0, 1):
+        return None
+    if hs[0] == 11 and hs[19] != 1:
+        return None
+    if hs[19] in (2, 5, 6) and hs[0] not in (5, 6, 7, 8, 9):
         return None
     return {
         "mode": hs[0],
+        "balanced_src": hs[19] in (2, 6),
+        "pull_results": hs[0] in (10, 11) or hs[19] in (5, 6),
+        "normal_pull": hs[0] in (10, 11),
         "H": hs[1], "W": hs[2], "scale": hs[3],
         "variant": VARIANTS[hs[4]],
         "chroma_mode": CHROMA_MODES[hs[5]],
@@ -259,7 +273,7 @@ def _parse_handshake(buf: bytes) -> dict | None:
         "interp_mult": hs[16] if hs[16] in (1, 2, 3, 4) else 2,
         "no_sr": 1 if hs[17] == 1 else 0,
         "enc_ch": hs[18] if hs[18] >= 0 else 0,
-        "mid_delivery": 1 if hs[19] == 1 else 0,
+        "mid_delivery": 1 if hs[19] in (1, 2, 5, 6) else 0,
     }
 
 
@@ -288,7 +302,7 @@ def serve_session(dev, conn: socket.socket, addr: tuple):
     cfg = _parse_handshake(raw)
     if cfg is None:
         log(f"unsupported mode={struct.unpack('<q', raw[:8])[0]} in handshake; "
-            "only mode 2 (CCSR + 3-proc) is implemented")
+            "only modes 5 through 11 (CCSR + 3-proc) are implemented")
         return
     log(f"session mode={cfg['mode']} {cfg['W']}x{cfg['H']}->x{cfg['scale']} "
         f"variant={cfg['variant']} chroma={cfg['chroma_mode']} "
@@ -299,18 +313,27 @@ def serve_session(dev, conn: socket.socket, addr: tuple):
         f"downsample_pre={cfg['downsample_pre']} "
         f"interp_mult={cfg['interp_mult']} no_sr={cfg['no_sr']}")
 
-    rdma_port = int(os.environ.get("DUAL_RDMA_PORT", "29900"))
-    rdma_dev = os.environ.get("DUAL_RDMA_DEV", "rocep1s0f0")
-    rdma_gid = int(os.environ.get("DUAL_RDMA_GID", "3"))
-    n_slots = 4  # must match host's _guest_slots in native_dispatcher
-    log(f"mode-2 MP: peer_port={rdma_port} dev={rdma_dev} slots={n_slots}")
+    rdma_port = int(os.environ.get("CLUSTER_RDMA_PORT", "29900"))
+    rdma_dev = os.environ.get("CLUSTER_RDMA_DEV", "rocep1s0f0")
+    rdma_gid = int(os.environ.get("CLUSTER_RDMA_GID", "3"))
+    n_slots = 6 if cfg["pull_results"] else 4
+    log(f"mode-{cfg['mode']} MP: peer_port={rdma_port} dev={rdma_dev} slots={n_slots}")
 
     wmp_box = {"wmp": None}
 
     def _watchdog():
         try:
-            data = conn.recv(8)
-            log(f"watchdog: liveness recv returned {len(data)} bytes")
+            if cfg["mode"] in (5, 6, 7, 8, 9):
+                sys.path.insert(0, "/usr/lib/python3/dist-packages")
+                from rdma_transport import resolve_rails
+                from peer_control import serve_peer_commands
+                rails = resolve_rails(os.environ.get("CLUSTER_RDMA_DEVS"),
+                                      os.environ.get("CLUSTER_RDMA_GIDS"),
+                                      fallback_dev=rdma_dev, fallback_gid=rdma_gid)
+                serve_peer_commands(conn, wmp_box, rails, log)
+            else:
+                data = conn.recv(8)
+                log(f"watchdog: liveness recv returned {len(data)} bytes")
         except Exception as e:
             log(f"watchdog: liveness socket {type(e).__name__}: {e}")
         finally:
@@ -328,7 +351,7 @@ def serve_session(dev, conn: socket.socket, addr: tuple):
     def _signal_ready():
         """Sent via TCP (not NCCL) so cold TRT compile on compute_proc
         doesn't blow any collective deadline. Host has settimeout
-        `DUAL_WORKER_READY_TIMEOUT` (default 300 s) on this recv."""
+        `CLUSTER_WORKER_READY_TIMEOUT` (default 300 s) on this recv."""
         try:
             conn.sendall(b"R")
             log("signaled 'ready' to host via liveness")
@@ -336,6 +359,16 @@ def serve_session(dev, conn: socket.socket, addr: tuple):
             log(f"failed to send ready: {type(e).__name__}: {e}")
 
     import worker_3proc as _mp
+    # Mode 11 supports direct delivery of early CCSR features while
+    # all normal-mode final results remain available for host READ.
+    os.environ["CLUSTER_DIRECT_CC"] = "1" if cfg["mode"] == 11 else "0"
+    os.environ["CLUSTER_WORKER_FRAME_IO"] = "1" if cfg["mode"] in (5, 6, 7, 8, 9) else "0"
+    os.environ["CLUSTER_WORKER_PREFETCH"] = "1" if cfg["mode"] in (6, 7, 8, 9) else "0"
+    os.environ["CLUSTER_WORKER_FUSED"] = "1" if cfg["mode"] in (7, 8, 9) else "0"
+    os.environ["CLUSTER_WORKER_OVERLAP"] = "1" if cfg["mode"] in (8, 9) else "0"
+    os.environ["CLUSTER_PULL_NORMAL"] = "1" if cfg["normal_pull"] else "0"
+    os.environ["CLUSTER_PULL_RESULTS"] = "1" if cfg["pull_results"] else "0"
+    os.environ["CLUSTER_BALANCED_SRC"] = "1" if cfg["balanced_src"] else "0"
     _mp.run_worker_3proc_pipeline(
         H=cfg["H"], W=cfg["W"], scale=cfg["scale"],
         sub_w=cfg["sub_w"], sub_h=cfg["sub_h"],
@@ -351,6 +384,7 @@ def serve_session(dev, conn: socket.socket, addr: tuple):
         enc_ch=cfg["enc_ch"],
         interp_mult=cfg["interp_mult"], no_sr=cfg["no_sr"],
         mid_delivery=cfg["mid_delivery"],
+        local_cache_slots=32 if cfg["mode"] in (4, 5, 6, 7, 8, 9) else 0,
         wmp_out=wmp_box,
     )
 
@@ -392,9 +426,9 @@ def _install_signal_handlers():
 
     def _term(signo, _frame):
         log(f"received signal {signo}; shutting down")
-        import glob
-        for f in glob.glob(f"/dev/shm/dgxspark_worker_3p_{os.getpid()}.dat"):
-            try: os.unlink(f)
+        for name in (f"dgxspark_worker_3p_{os.getpid()}.dat",
+                     f"dgxspark_worker_3p_{os.getpid()}_frame_cache.dat"):
+            try: os.unlink(f"/dev/shm/{name}")
             except OSError: pass
         sys.exit(0)
 
@@ -412,9 +446,9 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     listener = LivenessListener(
-        port=int(os.environ.get("DUAL_LIVENESS_PORT", "29905")))
+        port=int(os.environ.get("CLUSTER_LIVENESS_PORT", "29905")))
 
-    log_path = os.environ.get("DUAL_WORKER_LOG", "/tmp/dual_worker.log")
+    log_path = os.environ.get("CLUSTER_WORKER_LOG", "/tmp/dual_worker.log")
     waiting_logged = False
     while True:
         # Print the idle banner once per idle period, not on every

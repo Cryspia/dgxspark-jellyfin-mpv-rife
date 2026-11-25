@@ -11,7 +11,7 @@
 # It reports two numbers:
 #   • vf-fps (mean/median) — mpv's measured output rate of the vapoursynth
 #     chain, sampled by display_fps_probe.lua. THIS is the on-screen FPS.
-#   • dispatcher fps — the dual compute() return rate (DUAL_REPORT_FPS),
+#   • dispatcher fps — the dual compute() return rate (CLUSTER_REPORT_FPS),
 #     a cross-check on whether compute or render is the limiter.
 #
 # Env knobs:
@@ -23,13 +23,18 @@
 #   MULT        1..4               (optional, forces dual interp mult)
 #   LABEL       log/tag suffix     (default derived from KRIG)
 #
-# Any DUAL_* env already exported is passed through, so pacing experiments
-# just prefix e.g. DUAL_RENDER_PACING=1 DUAL_RENDER_BUDGET_MS=16.7 …
+# Any CLUSTER_* env already exported is passed through, so pacing experiments
+# just prefix e.g. CLUSTER_RENDER_PACING=1 CLUSTER_RENDER_BUDGET_MS=16.7 …
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/../scripts/cluster_env.sh"
+cluster_normalize_env
 
 MPV="${MPV:-$HOME/miniforge3/envs/vsmpv/bin/mpv}"
-DUAL_CONF="${DUAL_CONF:-$HOME/.config/dgxspark-mpv/dual.conf}"
+CLUSTER_CONF="${CLUSTER_CONF:-$HOME/.config/dgxspark-mpv/cluster.conf}"
+if [[ ! -f "$CLUSTER_CONF" && -f "$HOME/.config/dgxspark-mpv/dual.conf" ]]; then
+  CLUSTER_CONF="$HOME/.config/dgxspark-mpv/dual.conf"
+fi
 PROBE="$HERE/display_fps_probe.lua"
 
 CLIP="${CLIP:-/tmp/sample-1080p24-hdr10.mp4}"   # NOT produced by gen_clips.sh — supply your own HDR10 clip via CLIP=
@@ -40,7 +45,7 @@ FULLSCREEN="${FULLSCREEN:-1}"
 LABEL="${LABEL:-krig-$KRIG}"
 
 [[ -f "$CLIP" ]] || { echo "ERROR: clip missing: $CLIP"; exit 1; }
-[[ -f "$DUAL_CONF" ]] || { echo "ERROR: dual.conf missing — run install --dual-host"; exit 1; }
+[[ -f "$CLUSTER_CONF" ]] || { echo "ERROR: cluster.conf missing — run install --cluster-host"; exit 1; }
 
 # Talk to the live GNOME/Wayland session (this shell has no display env).
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
@@ -49,10 +54,11 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 # Replicate the mpv-conda wrapper environment.
 export PYTHONHOME="$HOME/miniforge3/envs/vsmpv"
 export PATH="$HOME/miniforge3/envs/vsmpv/bin:$PATH"
-set -a; . "$DUAL_CONF"; set +a
+set -a; . "$CLUSTER_CONF"; set +a
+cluster_normalize_env
 
-export DUAL_REPORT_FPS="${DUAL_REPORT_FPS:-120}"
-export DUAL_REPORT_WARMUP="${DUAL_REPORT_WARMUP:-200}"
+export CLUSTER_REPORT_FPS="${CLUSTER_REPORT_FPS:-120}"
+export CLUSTER_REPORT_WARMUP="${CLUSTER_REPORT_WARMUP:-200}"
 export DISPLAYPROBE_WARMUP_S="$WARMUP_S"
 
 # Optional forced interp multiplier (bypasses the ffprobe heuristic).
@@ -81,8 +87,8 @@ fi
 echo "=========================================================="
 echo "=== display_fps — LABEL=$LABEL  KRIG=$KRIG  FS=$FULLSCREEN"
 echo "===   clip=$CLIP  dur=${DURATION}s warmup=${WARMUP_S}s"
-echo "===   DUAL_WORKER_HOST=$DUAL_WORKER_HOST mult=${MULT:-auto}"
-echo "===   render-pacing=${DUAL_RENDER_PACING:-0} pace-ms=${DUAL_RENDER_PACE_MS:-} reactive=${DUAL_RENDER_PACE_REACTIVE:-0} budget=${DUAL_RENDER_BUDGET_MS:-}"
+echo "===   CLUSTER_WORKER_HOST=$CLUSTER_WORKER_HOST mult=${MULT:-auto}"
+echo "===   render-pacing=${CLUSTER_RENDER_PACING:-0} pace-ms=${CLUSTER_RENDER_PACE_MS:-} reactive=${CLUSTER_RENDER_PACE_REACTIVE:-0} budget=${CLUSTER_RENDER_BUDGET_MS:-}"
 echo "=========================================================="
 
 "$MPV" \

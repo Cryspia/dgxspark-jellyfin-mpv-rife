@@ -45,7 +45,7 @@ from mp_pipeline import *  # noqa: F401,F403
 # (host_3proc, etc) keep working.
 from mp_pipeline import (  # noqa: F401
     _align_up, _setup_logging, _parse_layout_from_env, _ef_from_env,
-    _PAGE, _WR3_RECV_SRC, _WR3_SEND_DST, _WR3_SEND_MID,
+    _install_atexit_unlink, _PAGE, _WR3_RECV_SRC, _WR3_SEND_DST, _WR3_SEND_MID,
 )
 
 
@@ -60,6 +60,11 @@ def rdma_proc_main():
       - send_handler: blocks on ef_mgr_to_rdma; when notified, scans
         shm for DST_READY slots and post_send's them.
     """
+    # Short control messages should not wait for the default 5 ms Python
+    # thread-switch interval while the other RDMA thread is running.
+    # This process is dedicated to transport; other processes keep their
+    # own interpreter settings.
+    sys.setswitchinterval(0.0005)
     import threading
     log = _setup_logging("rdma")
     layout = _parse_layout_from_env()
@@ -90,10 +95,11 @@ def rdma_proc_main():
     # sync_worker); 2026-06 interleaved A/B (3+3 runs, mult=2) measures
     # ON at 97.4 vs OFF at 94.8 fps mean, bit-clean PSNR, neutral at
     # mult=3. The value arrives via the handshake (host decides), so
-    # both sides always agree; DUAL_MID_DELIVERY=0 on the HOST disables
+    # both sides always agree; CLUSTER_MID_DELIVERY=0 on the HOST disables
     # for A/B.
     _mid_delivery_enabled = os.environ.get(
-        "DUAL_MID_DELIVERY", "1") == "1"
+        "CLUSTER_MID_DELIVERY", "1") == "1"
+    _direct_cc_enabled = os.environ.get("CLUSTER_DIRECT_CC", "0") == "1"
     # One context + one QP per rail. A context is one PCI function and
     # the CX7 only reaches 200 Gb/s across two PCIe paths, so rails are
     # how bandwidth is bought here. Unset WMP_RDMA_DEVS == single rail
@@ -109,6 +115,29 @@ def rdma_proc_main():
             for d, g in rails]
     ctx = ctxs[0]
 
+    local_frame_cache = None
+    local_cache_mrs = []
+    if os.environ.get("WMP_LOCAL_FRAME_CACHE", "0") == "1":
+        from cc_cache import CCCacheLayout, CCCacheShm
+        local_layout = CCCacheLayout(
+            n_slots=int(os.environ["HMP_CC_CACHE_NSLOTS"]),
+            H_src=int(os.environ["HMP_CC_CACHE_H_SRC"]),
+            W_src=int(os.environ["HMP_CC_CACHE_W_SRC"]),
+            H_out=int(os.environ["HMP_CC_CACHE_H_OUT"]),
+            W_out=int(os.environ["HMP_CC_CACHE_W_OUT"]),
+            pH=int(os.environ["HMP_CC_CACHE_PH"]),
+            pW=int(os.environ["HMP_CC_CACHE_PW"]),
+            enc_channels=int(os.environ["HMP_CC_CACHE_ENC_CH"]),
+            sub_h=int(os.environ["HMP_CC_CACHE_SUB_H"]),
+            sub_w=int(os.environ["HMP_CC_CACHE_SUB_W"]))
+        if local_layout.off_rife_features != local_layout.rgb_padded_size:
+            raise RuntimeError("worker cache feature fields are not contiguous")
+        local_frame_cache = CCCacheShm(local_layout, os.environ["HMP_CC_CACHE_NAME"])
+        local_frame_cache.open()
+        local_cache_mrs = [ctx.register_region(local_frame_cache.addr,
+                                                local_layout.total_size)
+                           for ctx in ctxs]
+
     access = (e.IBV_ACCESS_LOCAL_WRITE |
               e.IBV_ACCESS_REMOTE_WRITE |
               e.IBV_ACCESS_REMOTE_READ)
@@ -123,16 +152,33 @@ def rdma_proc_main():
     # Fixed per-rail split of slot.src — where each rail's pre-posted
     # recv WR points. Must equal the host's src_partition() of the same
     # src_size, which both ends derive from the shared layout.
-    src_parts = src_partition(layout.src_size, n_rails)
+    balanced = os.environ.get("CLUSTER_BALANCED_SRC", "0") == "1"
+    src_fields = {name: (offset, size) for name, offset, size, *_ in layout.src_layout}
+    ccsr_end = sum(src_fields["va"])
+    src_parts = src_partition(layout.src_size, n_rails,
+                              balanced_prefix=ccsr_end if balanced else None)
 
     # Listen for host, one port per rail. RDMAChannel(is_server=True)
     # blocks on accept.
+    pull_results = os.environ.get("CLUSTER_PULL_RESULTS", "0") == "1"
+    normal_pull = os.environ.get("CLUSTER_PULL_NORMAL", "0") == "1"
+    pull_extra = b""
+    if pull_results:
+        pull_extra = struct.pack("!II", n_rails, layout.n_slots)
+        for slot in range(layout.n_slots):
+            pull_extra += struct.pack("!Q", shm.slot_dst_addr(slot))
+        for mr in mrs:
+            pull_extra += struct.pack("!I", mr.rkey)
+        if normal_pull:
+            for slot in range(layout.n_slots):
+                pull_extra += struct.pack("!Q", shm.addr + layout.slot_state_off(slot))
     chs = []
     for r in range(n_rails):
         log(f"rail{r} listening on port {rdma_port + r}…")
         chs.append(RDMAChannel(ctxs[r], is_server=True, peer_ip="",
                                 peer_port=rdma_port + r,
-                                max_wr=max(64, 8 * layout.n_slots)))
+                                max_wr=max(64, 8 * layout.n_slots),
+                                extra_payload=pull_extra if r == 0 else b""))
         log(f"rail{r} connected. my_qpn={chs[r].my_qpn} "
             f"peer_qpn={chs[r].peer_qpn}")
     ch = chs[0]
@@ -151,7 +197,7 @@ def rdma_proc_main():
         host_rails, peer_n = _struct.unpack_from("!II", ch.peer_extra, 0)
         if host_rails != n_rails:
             log(f"FATAL: host advertises {host_rails} rail(s), worker has "
-                f"{n_rails}. Set WMP_RDMA_DEVS to match DUAL_RDMA_DEVS.")
+                f"{n_rails}. Set WMP_RDMA_DEVS to match CLUSTER_RDMA_DEVS.")
             raise RuntimeError(
                 f"rail count mismatch: host={host_rails} worker={n_rails}")
         off = 8
@@ -188,7 +234,7 @@ def rdma_proc_main():
     # Per-slot lock to avoid races on state transitions (only matters
     # between the two threads in THIS process; cross-process slot
     # ownership is enforced by the state machine itself).
-    state_lock = threading.Lock()
+    state_lock = threading.RLock()
 
     def _post_slot_recv(i: int) -> None:
         """Post one recv per rail for worker slot i, at that rail's
@@ -212,6 +258,7 @@ def rdma_proc_main():
     recv_parts = [0] * layout.n_slots
     send_parts = [1] * layout.n_slots   # expected pieces of the final WRITE
     send_done  = [0] * layout.n_slots   # pieces drained so far
+    mid_inflight = [0] * layout.n_slots
 
     # Pre-post recv on all slots.
     for i in range(layout.n_slots):
@@ -230,7 +277,7 @@ def rdma_proc_main():
     #   _recv_done_ts[i]      = time of last RECV CQ completion for slot i
     #   _rdma_stats[task_type]= dict of accumulated timings per task type
     import time as _rdma_time
-    _rdma_prof = os.environ.get("DUAL_RDMA_PROF", "0") == "1"
+    _rdma_prof = os.environ.get("CLUSTER_RDMA_PROF", "0") == "1"
     _post_send_ts = [0.0] * layout.n_slots
     _recv_done_ts = [0.0] * layout.n_slots
     _send_task_type = [0] * layout.n_slots   # task_type at post_send time
@@ -238,7 +285,7 @@ def rdma_proc_main():
     _rdma_stats_lock = threading.Lock()
     _rdma_last_report = _rdma_time.perf_counter()
     _rdma_report_interval = float(os.environ.get(
-        "DUAL_RDMA_PROF_INTERVAL_S", "2.0"))
+        "CLUSTER_RDMA_PROF_INTERVAL_S", "2.0"))
 
     def _rdma_stats_add(tt: int, key: str, val_ms: float):
         with _rdma_stats_lock:
@@ -297,9 +344,34 @@ def rdma_proc_main():
         #   stage_code 15    = final (terminal write, fires task_done)
         _STAGE_FINAL = STAGE_FINAL
 
+        def _direct_target(worker_slot: int, src_off: int):
+            if not _direct_cc_enabled:
+                return None
+            hdr = (ctypes.c_int64 * 16).from_address(shm.slot_src_addr(worker_slot))
+            if hdr[8] != 1:
+                return None
+            if n_rails > 2 or hdr[5] <= 0:
+                raise RuntimeError("invalid direct cc_cache target")
+            # _write_striped adds the source offset to the remote base.
+            return int(hdr[5]) - src_off, [int(hdr[6 + rail]) for rail in range(n_rails)]
+
+        def _local_interp_source(worker_slot: int, stage: int):
+            if local_frame_cache is None:
+                return None, None
+            hdr = (ctypes.c_int64 * 16).from_address(shm.slot_src_addr(worker_slot))
+            if int(hdr[8]) != 2:
+                return None, None
+            from cc_cache import FIELD_RGB_INTERP
+            slots = (int(hdr[9]), int(hdr[15]), int(hdr[5]))
+            if not 0 <= stage < len(slots) or not 0 <= slots[stage] < local_layout.n_slots:
+                raise ValueError("invalid worker-local interpolation output slot")
+            return (local_frame_cache.field_addr(slots[stage], FIELD_RGB_INTERP),
+                    [mr.lkey for mr in local_cache_mrs])
+
         def _write_striped(worker_slot: int, src_off: int, size: int,
                             raddr: int, rkeys: list, host_slot: int,
-                            stage_code: int, wr_op: int) -> int:
+                            stage_code: int, wr_op: int,
+                            src_addr=None, src_keys=None) -> int:
             """Split one logical WRITE across the rails and post a piece
             on each. Returns the number of pieces posted, which is what
             the CQ side counts down before treating the write as done.
@@ -312,16 +384,24 @@ def rdma_proc_main():
             pieces = [(rail, o, sz) for rail, o, sz in
                       stripe(src_off, size, n_rails,
                              rotate=host_slot + stage_code) if sz > 0]
+            if size == 0:
+                # An immediate-only write publishes completion without
+                # returning worker-resident intermediate tensors.
+                pieces = [(0, src_off, 0)]
             n_parts = max(1, len(pieces))
             # Publish the expected count before posting: a WRITE can
             # complete the instant it is posted, and the CQ thread reads
             # this to decide when the slot is fully drained.
             if wr_op == _WR3_SEND_DST:
                 send_parts[worker_slot] = n_parts
+            elif wr_op == _WR3_SEND_MID:
+                with state_lock:
+                    mid_inflight[worker_slot] += n_parts
             for part, (rail, sub_off, sub_size) in enumerate(pieces):
                 chs[rail].post_write_with_imm(
-                    src_addr=shm.slot_dst_addr(worker_slot) + sub_off,
-                    src_lkey=mrs[rail].lkey,
+                    src_addr=(shm.slot_dst_addr(worker_slot) + sub_off
+                              if src_addr is None else src_addr + sub_off - src_off),
+                    src_lkey=(mrs[rail].lkey if src_keys is None else src_keys[rail]),
                     length=sub_size,
                     remote_addr=raddr + sub_off,
                     rkey=rkeys[rail],
@@ -330,8 +410,8 @@ def rdma_proc_main():
             return n_parts
         # Debug: count WRITEs per (slot, stage_code) to verify the
         # N-stage protocol on host-slot basis. Enable via
-        # DUAL_STAGE_COUNT_DBG=1; dump on bench exit.
-        _stage_count_dbg = os.environ.get("DUAL_STAGE_COUNT_DBG", "0") == "1"
+        # CLUSTER_STAGE_COUNT_DBG=1; dump on bench exit.
+        _stage_count_dbg = os.environ.get("CLUSTER_STAGE_COUNT_DBG", "0") == "1"
         _stage_counts: dict[tuple[int, int], int] = {}
         try:
             while not stopping.is_set():
@@ -339,6 +419,26 @@ def rdma_proc_main():
                     with state_lock:
                         meta = shm.slot_state(i)
                         st = meta.state
+                        if pull_results and st == ST_PULL_DONE:
+                            if mid_inflight[i]:
+                                del meta
+                                continue
+                            _post_slot_recv(i)
+                            meta.state = ST_RECV_PENDING
+                            meta.n_send += 1
+                            del meta
+                            ef_to_mgr.notify()
+                            continue
+                        if st == ST_PREFETCH_READY:
+                            host_slot = int(meta.host_slot)
+                            meta.state = ST_PREFETCH_HELD
+                            del meta
+                            if host_dst_remote is None or host_slot >= len(host_dst_remote):
+                                raise RuntimeError("prefetch has no host completion target")
+                            raddr, rkeys = host_dst_remote[host_slot]
+                            _write_striped(i, 0, 0, raddr, rkeys, host_slot,
+                                           14, _WR3_SEND_MID)
+                            continue
                         if is_mid_ready_state(st):
                             # N-stage: stage_idx is encoded directly in
                             # the state value (st - ST_MID_READY) so
@@ -361,9 +461,26 @@ def rdma_proc_main():
                             if (stage_size > 0 and host_dst_remote is not None
                                     and host_slot < len(host_dst_remote)):
                                 raddr, rkeys = host_dst_remote[host_slot]
-                                _write_striped(i, stage_off, stage_size,
+                                direct = _direct_target(i, stage_off) if tt == TT_CCSR else None
+                                if direct is not None:
+                                    raddr, rkeys = direct
+                                src_addr = src_keys = None
+                                if local_frame_cache is not None and tt == TT_CCSR:
+                                    from cc_cache import FIELD_RGB_PADDED
+                                    hdr = (ctypes.c_int64 * 16).from_address(shm.slot_src_addr(i))
+                                    src_addr = local_frame_cache.field_addr(int(hdr[9]), FIELD_RGB_PADDED)
+                                    src_keys = [mr.lkey for mr in local_cache_mrs]
+                                elif tt == TT_INTERP:
+                                    src_addr, src_keys = _local_interp_source(i, stage_idx)
+                                hdr = (ctypes.c_int64 * 16).from_address(shm.slot_src_addr(i))
+                                keep_data = ((tt == TT_CCSR and hdr[8] == 3)
+                                             or (tt == TT_INTERP and hdr[8] == 2
+                                                 and hdr[6] == 1))
+                                _write_striped(i, stage_off,
+                                               0 if keep_data else stage_size,
                                                raddr, rkeys, host_slot,
-                                               stage_idx, _WR3_SEND_MID)
+                                               stage_idx, _WR3_SEND_MID,
+                                               src_addr=src_addr, src_keys=src_keys)
                                 if _stage_count_dbg:
                                     k = (host_slot, stage_idx)
                                     _stage_counts[k] = _stage_counts.get(k, 0) + 1
@@ -389,6 +506,38 @@ def rdma_proc_main():
                             f"{host_slot}; worker slot {i} dropped")
                         continue
                     raddr, rkeys = host_dst_remote[host_slot]
+                    if os.environ.get("CLUSTER_WORKER_OVERLAP", "0") == "1":
+                        _write_striped(i, 0, 0, raddr, rkeys, host_slot,
+                                       13, _WR3_SEND_MID)
+                    if tt_for_send == TT_INTERP:
+                        direct = _direct_target(i, full_off_l)
+                        if direct is not None:
+                            raddr, rkeys = direct
+                    src_addr = src_keys = None
+                    if tt_for_send == TT_INTERP:
+                        downsample = int(os.environ.get("WMP_DOWNSAMPLE_PRE", "1"))
+                        frame_size = 3 * (layout.H // downsample) * (layout.W // downsample) * 2
+                        hdr = (ctypes.c_int64 * 16).from_address(shm.slot_src_addr(i))
+                        fused_sr = hdr[8] == 2 and hdr[7] == 1
+                        if not fused_sr and frame_size and full_size_l == frame_size:
+                            src_addr, src_keys = _local_interp_source(i, full_off_l // frame_size)
+                        if not fused_sr and hdr[8] == 2 and hdr[6] == 1:
+                            full_size_l = 0
+                    if pull_results and full_size_l > 0:
+                        if src_addr is not None or (full_off_l != 0 and not normal_pull):
+                            raise RuntimeError("unsupported pull result layout")
+                        if i >= 16:
+                            raise RuntimeError("pull worker slot exceeds immediate encoding")
+                        with state_lock:
+                            mid_inflight[i] += 1
+                        chs[0].post_write_with_imm(
+                            src_addr=shm.slot_dst_addr(i), src_lkey=mrs[0].lkey,
+                            length=0, remote_addr=raddr, rkey=rkeys[0],
+                            imm=imm_encode(host_slot, 12, i, 1),
+                            wr_id=_WR3_SEND_MID | i)
+                        continue
+                    if normal_pull:
+                        raise RuntimeError("normal mode cannot push a final result")
                     # N-stage: when at least one mid was sent (mid_size > 0
                     # AND mid delivery enabled), the final WRITE covers only
                     # full_off..full_off+full_size (the final-stage bytes).
@@ -396,7 +545,8 @@ def rdma_proc_main():
                     if _mid_delivery_enabled and mid_size_l > 0:
                         _write_striped(
                             i, full_off_l, full_size_l, raddr, rkeys,
-                            host_slot, _STAGE_FINAL, _WR3_SEND_DST)
+                            host_slot, _STAGE_FINAL, _WR3_SEND_DST,
+                            src_addr=src_addr, src_keys=src_keys)
                         if _stage_count_dbg:
                             k = (host_slot, _STAGE_FINAL)
                             _stage_counts[k] = _stage_counts.get(k, 0) + 1
@@ -411,7 +561,8 @@ def rdma_proc_main():
                         # bytes for SR_INTERP / INTERP mult=2).
                         _write_striped(
                             i, full_off_l, full_size_l, raddr, rkeys,
-                            host_slot, _STAGE_FINAL, _WR3_SEND_DST)
+                            host_slot, _STAGE_FINAL, _WR3_SEND_DST,
+                            src_addr=src_addr, src_keys=src_keys)
         except Exception as ex:
             log(f"send_handler fatal: {type(ex).__name__}: {ex}")
             import traceback; log(traceback.format_exc())
@@ -499,6 +650,37 @@ def rdma_proc_main():
                 # (mult ≥ 3 second frame). -1 or 0 means single-frame
                 # INTERP (mult=2).
                 _dst_cc_slot_2 = int(hdr_ptr[15])
+                local_inputs = int(hdr_ptr[8]) == 2
+                fused_sr = local_inputs and int(hdr_ptr[7]) == 1
+                if fused_sr and (os.environ.get("CLUSTER_WORKER_FUSED", "0") != "1"
+                                 or tt != TT_INTERP
+                                 or int(os.environ.get("CLUSTER_INTERP_MULT", "2")) != 2):
+                    raise ValueError("invalid fused interpolation request")
+                keep_ccsr = int(hdr_ptr[8]) == 3
+                prefetched = keep_ccsr and int(hdr_ptr[7]) == 1
+                if prefetched and os.environ.get("CLUSTER_WORKER_PREFETCH", "0") != "1":
+                    raise ValueError("worker prefetch was not negotiated")
+                if keep_ccsr and (os.environ.get("CLUSTER_WORKER_FRAME_IO", "0") != "1"
+                                  or local_frame_cache is None or tt != TT_CCSR
+                                  or not 0 <= int(hdr_ptr[9]) < local_layout.n_slots):
+                    raise ValueError("invalid worker-resident CCSR request")
+                if local_inputs:
+                    if (os.environ.get("CLUSTER_WORKER_FRAME_IO", "0") != "1"
+                            or local_frame_cache is None or cc_field != -2
+                            or tt not in (TT_INTERP, TT_SR_INTERP)):
+                        raise ValueError("invalid worker-local input request")
+                    slots = [cc_slot_a]
+                    if tt == TT_INTERP:
+                        mult = int(os.environ.get("CLUSTER_INTERP_MULT", "2"))
+                        slots += [cc_slot_b, int(hdr_ptr[9])]
+                        if mult >= 3:
+                            slots.append(_dst_cc_slot_2)
+                        if mult >= 4:
+                            slots.append(int(hdr_ptr[5]))
+                        if len(set(slots)) != len(slots):
+                            raise ValueError("worker-local interpolation slots overlap")
+                    if any(slot < 0 or slot >= local_layout.n_slots for slot in slots):
+                        raise ValueError("worker-local cache slot is out of range")
                 # The worker is guest-side by construction — cc_slot_*
                 # fields in the wire header are HOST-side bookkeeping
                 # for the mpv-side cc_cache; the worker doesn't read
@@ -528,13 +710,14 @@ def rdma_proc_main():
                     meta.src_cc_slot_a = cc_slot_a
                     meta.src_cc_slot_b = cc_slot_b
                     meta.src_cc_field  = cc_field
-                    meta.dst_cc_slot   = -1   # filled by mgr-supplied wire field once it exists
-                    meta.dst_cc_field  = -1
+                    meta.dst_cc_slot   = int(hdr_ptr[9]) if local_frame_cache is not None else -1
+                    meta.dst_cc_field  = -4 if fused_sr else -1
                     # Second cc_cache slot for INTERP mult ≥ 3's
                     # frame 2 (host-side address). Worker writes back
                     # via dst_cc_slot_2 in addition to dst_cc_slot.
                     meta.dst_cc_slot_2 = _dst_cc_slot_2
-                    meta.state = ST_RECV_DONE
+                    meta.dst_cc_slot_3 = int(hdr_ptr[5]) if local_inputs else -1
+                    meta.state = ST_PREFETCH_READY if prefetched else ST_RECV_DONE
                     meta.n_recv += 1
                     del meta
                 ef_to_mgr.notify()
@@ -543,6 +726,10 @@ def rdma_proc_main():
                 # Mid SEND drained. Slot is still in flight for the
                 # FULL SEND; no recv to repost yet. Account for n_send
                 # so RDMA profiling stays accurate.
+                with state_lock:
+                    mid_inflight[s] -= 1
+                    if mid_inflight[s] < 0:
+                        raise RuntimeError("unexpected intermediate completion")
                 n_send += 1
                 continue
             elif op == _WR3_SEND_DST:
@@ -709,10 +896,10 @@ def compute_proc_main():
 
     # Build FSRCNNX runner. Input dim = proc dims (source after optional
     # luma downsample). Output dim = proc * variant scale.
-    # DUAL_NO_SR=1 (set by orchestrator from handshake) → skip runner
+    # CLUSTER_NO_SR=1 (set by orchestrator from handshake) → skip runner
     # build entirely; _run_ccsr / _run_sr_interp take a no-SR branch
     # that copies raw Y to ov["yao"] instead.
-    no_sr = os.environ.get("DUAL_NO_SR", "0") == "1"
+    no_sr = os.environ.get("CLUSTER_NO_SR", "0") == "1"
     from fsrcnnx_cudnn.model.cudnn_runner import FSRCNNXcuDNNRunner
     # chroma_krig import retained for future Step 3 retry — the
     # precompile() in the warmup hook below makes the JIT compile a
@@ -725,7 +912,7 @@ def compute_proc_main():
     WEIGHTS_DIR = os.environ.get(
         "WMP_WEIGHTS_DIR", str(_mpv_home / "fsrcnnx-cudnn" / "weights"))
     if no_sr:
-        log(f"DUAL_NO_SR=1 — skipping FSRCNNX runner build "
+        log(f"CLUSTER_NO_SR=1 — skipping FSRCNNX runner build "
             f"(variant={variant} would have been {proc_w}x{proc_h})")
         runner = None
     else:
@@ -743,6 +930,13 @@ def compute_proc_main():
     log(f"loading vsrife engines model={rife_model} {proc_w}x{proc_h}…")
     t0 = _time.time()
     rife_cfg = vgh._load_engines(rife_model, proc_h, proc_w, 1.0, True, dev)
+    expected = (layout.pH, layout.pW, layout.enc_ch)
+    actual = (int(rife_cfg["ph"]), int(rife_cfg["pw"]),
+              int(rife_cfg.get("encode_channel", 0) or 0))
+    if actual != expected:
+        raise RuntimeError(
+            f"worker RIFE layout differs from session handshake: "
+            f"handshake={expected}, engine={actual}")
     log(f"vsrife engines loaded in {(_time.time()-t0)*1000:.0f}ms")
 
     # Direct CUDA tensor views into shm via __cuda_array_interface__.
@@ -951,8 +1145,10 @@ def compute_proc_main():
     # views have meaningful data. Output for these tasks lives in
     # slot.dst (SR_*: existing yao/uao/vao; INTERP: small region at
     # the start of dst, mirrored to host cc_cache.sr_yuv on read-back).
+    local_worker_cache = os.environ.get("WMP_LOCAL_FRAME_CACHE", "0") == "1"
+    remote_io_mode = cc_shm_local is None or local_worker_cache
     split_src_views = None
-    if cc_shm_local is None:
+    if remote_io_mode:
         # Guest mode: pull pH/pW/enc_ch off the layout itself — they
         # came in via the handshake and are the canonical values for
         # this session.
@@ -1008,7 +1204,7 @@ def compute_proc_main():
     # tensor header). Decoupled from CCSR's named regions so future
     # CCSR field changes don't move INTERP frame anchors.
     split_dst_interp_views = None
-    if cc_shm_local is None:
+    if remote_io_mode:
         downsample_pre_l = int(os.environ.get("WMP_DOWNSAMPLE_PRE", "1"))
         proc_h_l = layout.H // downsample_pre_l
         proc_w_l = layout.W // downsample_pre_l
@@ -1160,7 +1356,7 @@ def compute_proc_main():
             # send_handler so we skip the spin (_hmp_watcher reads
             # MID_READY without flipping it).
             if is_final:
-                if cc_shm_local is None:
+                if remote_io_mode:
                     while True:
                         meta = shm.slot_state(slot_idx)
                         if not is_mid_ready_state(meta.state):
@@ -1177,7 +1373,7 @@ def compute_proc_main():
                 del meta
             else:
                 # stage k>0 (mult=4 only)
-                if cc_shm_local is None:
+                if remote_io_mode:
                     while True:
                         meta = shm.slot_state(slot_idx)
                         if not is_mid_ready_state(meta.state):
@@ -1194,11 +1390,11 @@ def compute_proc_main():
     _sync_t.start()
 
     # Gating env. When enabled both worker and host post the early-
-    # delivery mid SEND (see DUAL_MID_DELIVERY plumbing in guest_mp.py).
+    # delivery mid SEND (see CLUSTER_MID_DELIVERY plumbing in guest_mp.py).
     # Default ON — handshake-propagated; rationale at the rdma_proc
     # twin of this flag above.
     _mid_delivery_enabled = os.environ.get(
-        "DUAL_MID_DELIVERY", "1") == "1"
+        "CLUSTER_MID_DELIVERY", "1") == "1"
 
     # Per-slot helper for N-stage producers to mark an intermediate
     # stage done. CCSR uses stage_idx=0 at the CC+features/SR boundary;
@@ -1228,14 +1424,14 @@ def compute_proc_main():
     # INTERP frame_sz for dense-pack stage byte ranges. Read env
     # mult here (compute_proc reads on each task too via
     # _interp_mult_cache, this is just for task_dst_ranges below).
-    _compute_interp_mult = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+    _compute_interp_mult = int(os.environ.get("CLUSTER_INTERP_MULT", "2"))
     if _compute_interp_mult not in (1, 2, 3, 4):
         _compute_interp_mult = 2
     # mult=1 = no_interp: only CCSR per pair, no INTERP/SR_INTERP. CCSR
     # in this mode skips rgb_padded + rife_features writes (no consumer).
     _compute_no_interp = (_compute_interp_mult == 1)
     _compute_frame_sz = 3 * proc_h * proc_w * 2   # fp16 NCHW
-    REPORT_EVERY = 60
+    REPORT_EVERY = max(1, int(os.environ.get("WMP_PROFILE_EVERY", "60")))
     tsum = {"claim_wait": 0.0, "compute": 0.0, "post": 0.0}
     tcount = 0
     n_done = 0
@@ -1243,8 +1439,8 @@ def compute_proc_main():
     # each kernel finishes; the next iteration computes elapsed_ms from
     # the PREVIOUS task's end to NOW (kernel-start time). That's the
     # GPU's idle gap between consecutive task launches on this stream.
-    _gpu_dbg = os.environ.get("DUAL_GPU_IDLE_DBG", "0") == "1"
-    _profile = os.environ.get("DUAL_PROFILE", "0") == "1"
+    _gpu_dbg = os.environ.get("CLUSTER_GPU_IDLE_DBG", "0") == "1"
+    _profile = os.environ.get("CLUSTER_PROFILE", "0") == "1"
     # Profile mode needs cuda events to break kernel time per-type.
     _need_events = _gpu_dbg or _profile
     _ev_prev_end = torch.cuda.Event(enable_timing=True) if _need_events else None
@@ -1301,7 +1497,7 @@ def compute_proc_main():
     # the debug flag (env read per task), and the flownet timestep
     # tensors (~4 MB full-frame alloc per flownet otherwise; flownet
     # treats them as read-only, so one per t value is safe).
-    _split_debug = os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1"
+    _split_debug = os.environ.get("CLUSTER_SPLIT_DEBUG", "0") == "1"
     _rgb2yuv_m_dev = vgh._RGB2YUV_MATRIX[matrix_s].to(dev)
     _timestep_cache: dict[float, torch.Tensor] = {}
 
@@ -1318,7 +1514,7 @@ def compute_proc_main():
         RIFE flownet, write fp16 RGB into slot.dst (guest mode) or
         cc_cache.rgb_interp (host mode).
 
-        One INTERP task per pair. Worker reads DUAL_INTERP_MULT env
+        One INTERP task per pair. Worker reads CLUSTER_INTERP_MULT env
         at startup; for mult ≥ 3 runs flownet (mult-1) times at
         t=k/mult for k=1..mult-1 and writes EACH frame into separate
         destinations:
@@ -1336,8 +1532,10 @@ def compute_proc_main():
         dst   = int(meta.dst_cc_slot)
         dst2  = int(meta.dst_cc_slot_2)
         dst3  = int(meta.dst_cc_slot_3)
+        dst_field = int(meta.dst_cc_field)
+        local_inputs = local_worker_cache and int(meta.src_cc_field) == -2
         del meta
-        guest_mode = (cc_shm_local is None)
+        guest_mode = remote_io_mode and not local_inputs
         if not guest_mode and (src_a < 0 or src_b < 0 or dst < 0):
             log(f"INTERP slot={cur} task_id={task_id} cc_cache refs "
                 f"missing (a={src_a} b={src_b} dst={dst}); discarded")
@@ -1366,7 +1564,7 @@ def compute_proc_main():
             img1p = view_b["rgb_padded"]
         nonlocal _interp_mult_cache
         if _interp_mult_cache is None:
-            _interp_mult_cache = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+            _interp_mult_cache = int(os.environ.get("CLUSTER_INTERP_MULT", "2"))
             if _interp_mult_cache not in (2, 3, 4):
                 _interp_mult_cache = 2
         mult = _interp_mult_cache
@@ -1385,6 +1583,10 @@ def compute_proc_main():
                 f"dst={dst} dst2={dst2} dst3={dst3}")
         with torch.inference_mode():
             for tstep_idx, tstep in enumerate(timesteps):
+                # A disconnected worker may have already published an
+                # earlier phase. Never write that phase's recycled slot.
+                if dst_field <= -16 and ((-dst_field - 16) & (1 << tstep_idx)):
+                    continue
                 timestep_t = _timestep(tstep)
                 with lock_inf, torch.cuda.stream(stream_inf):
                     if encode is not None:
@@ -1432,8 +1634,9 @@ def compute_proc_main():
         """
         meta = shm.slot_state(cur)
         src_slot = int(meta.src_cc_slot_a)
+        local_inputs = local_worker_cache and int(meta.src_cc_field) == -2
         del meta
-        guest_mode = (cc_shm_local is None)
+        guest_mode = remote_io_mode and not local_inputs
         if not guest_mode and src_slot < 0:
             log(f"SR_INTERP slot={cur} task_id={task_id} — cc_cache or "
                 f"src_cc_slot_a unavailable (src_slot={src_slot}); "
@@ -1553,8 +1756,12 @@ def compute_proc_main():
         """
         meta = shm.slot_state(cur)
         dst_slot = int(meta.dst_cc_slot)
+        retry_mid_already_delivered = int(meta.dst_cc_field) == -3
         del meta
-        guest_mode = (cc_shm_local is None)
+        # In a retry after early feature delivery, use the private slot
+        # output rather than rewriting a cache slot that consumers may
+        # already have released or reused.
+        guest_mode = (cc_shm_local is None or retry_mid_already_delivered)
         if _split_debug:
             log(f"_run_ccsr slot={cur} task_id={task_id} "
                 f"guest={guest_mode} dst_slot={dst_slot} "
@@ -1853,8 +2060,20 @@ def compute_proc_main():
             # else: x2 baseline — ov["uao"]/vao already written in Stage A
         return
 
+    def _run_interp_maybe_fused(cur, src, ov, src_a_idx, src_b_idx, task_id):
+        meta = shm.slot_state(cur)
+        fused = int(meta.dst_cc_field) == -4
+        destination = int(meta.dst_cc_slot)
+        del meta
+        _run_interp(cur, src, ov, src_a_idx, src_b_idx, task_id)
+        if fused:
+            meta = shm.slot_state(cur)
+            meta.src_cc_slot_a = destination
+            del meta
+            _run_sr_interp(cur, src, ov, src_a_idx, src_b_idx, task_id)
+
     HANDLERS = {
-        TT_INTERP:      _run_interp,
+        TT_INTERP:      _run_interp_maybe_fused,
         TT_SR_INTERP:   _run_sr_interp,
         TT_CCSR:        _run_ccsr,
         # Secondary SR_INTERP (mult ≥ 3) uses the same TT_SR_INTERP
@@ -1877,7 +2096,18 @@ def compute_proc_main():
             src_a_idx = 0
             src_b_idx = 0
             while cur < 0:
-                for i in range(layout.n_slots):
+                # Tic-tac source frames unblock peer interpolation. Select
+                # ready CCSR work first without interrupting a running task.
+                preferred = -1
+                if local_worker_cache:
+                    for i in range(layout.n_slots):
+                        meta = shm.slot_state(i)
+                        if meta.state == ST_RECV_DONE and int(meta.task_type) == TT_CCSR:
+                            preferred = i
+                            del meta
+                            break
+                        del meta
+                for i in ([preferred] if preferred >= 0 else range(layout.n_slots)):
                     meta = shm.slot_state(i)
                     if meta.state == ST_RECV_DONE:
                         cur = i
@@ -1893,8 +2123,10 @@ def compute_proc_main():
                         # stage 0 + final are stored; stages 1..mult-3
                         # are derived from stage_idx * mid_size in
                         # send_handler.
+                        range_type = (TT_SR_INTERP if task_type == TT_INTERP
+                                      and int(meta.dst_cc_field) == -4 else task_type)
                         mo, ms, fo, fs = layout.task_dst_ranges(
-                            task_type,
+                            range_type,
                             interp_mult=_compute_interp_mult,
                             rgb_interp_size=_compute_frame_sz,
                             mid_delivery=_mid_delivery_enabled)
@@ -1904,7 +2136,7 @@ def compute_proc_main():
                         meta.full_size = fs
                         # Read back state to verify the COMPUTING
                         # write persisted (debug).
-                        if os.environ.get("DUAL_REFCOUNT_DBG", "0") == "1":
+                        if os.environ.get("CLUSTER_REFCOUNT_DBG", "0") == "1":
                             _readback = int(meta.state)
                             _dst_slot = int(meta.dst_cc_slot)
                             log(f"compute picked slot={i} tid={task_id} "
@@ -2051,22 +2283,82 @@ class WorkerMP(MPPipelineBase):
     ]
 
     def __init__(self, *, rdma_dev: str, rdma_port: int, rdma_gid: int,
-                 **kw):
+                 local_cache_slots: int = 0, **kw):
+        import threading
         super().__init__(**kw)
+        self._shutdown_lock = threading.RLock()
         self.rdma_dev = rdma_dev
         self.rdma_port = rdma_port
         self.rdma_gid = rdma_gid
+        if local_cache_slots < 0:
+            raise ValueError("local cache slot count must be nonnegative")
+        self.local_cache_slots = local_cache_slots
+        self.local_cache = None
+        self.local_cache_layout = None
+        self.peer_manager = None
+
+    def setup(self):
+        super().setup()
+        if not self.local_cache_slots:
+            return
+        # This cache is owned by the worker rather than the playback
+        # host. It is shared with the existing compute and RDMA children.
+        from cc_cache import CCCacheLayout, CCCacheShm
+        L = self.layout
+        self.local_cache_layout = CCCacheLayout(
+            n_slots=self.local_cache_slots,
+            H_src=L.H, W_src=L.W, H_out=L.H * L.scale, W_out=L.W * L.scale,
+            pH=L.pH, pW=L.pW, enc_channels=L.enc_ch,
+            sub_h=L.sub_h, sub_w=L.sub_w)
+        self.local_cache = CCCacheShm(
+            self.local_cache_layout, name=f"{self.shm_name}_frame_cache")
+        try:
+            self.local_cache.create()
+            self.local_cache.register_cuda_pinned()
+            _install_atexit_unlink(self.local_cache, self._log)
+        except Exception:
+            self.shutdown()
+            raise
+
+    def shutdown(self):
+        # Children must stop before their mapped and registered cache is
+        # released, including on failed setup or worker disconnect.
+        with self._shutdown_lock:
+            if self.peer_manager is not None:
+                self.peer_manager.close()
+                self.peer_manager = None
+            super().shutdown()
+            if self.local_cache is not None:
+                self.local_cache.close()
+                self.local_cache.unlink()
+                self.local_cache = None
 
     def _extra_child_config(self, cfg: dict, role: str) -> None:
         cfg["WMP_RDMA_DEV"] = self.rdma_dev
         cfg["WMP_RDMA_PORT"] = str(self.rdma_port)
         cfg["WMP_RDMA_GID"] = str(self.rdma_gid)
+        if self.local_cache is not None:
+            L = self.local_cache_layout
+            cfg.update({
+                "HMP_CC_CACHE_NAME": self.local_cache.name,
+                "HMP_CC_CACHE_NSLOTS": str(L.n_slots),
+                "HMP_CC_CACHE_H_SRC": str(L.H_src),
+                "HMP_CC_CACHE_W_SRC": str(L.W_src),
+                "HMP_CC_CACHE_H_OUT": str(L.H_out),
+                "HMP_CC_CACHE_W_OUT": str(L.W_out),
+                "HMP_CC_CACHE_PH": str(L.pH),
+                "HMP_CC_CACHE_PW": str(L.pW),
+                "HMP_CC_CACHE_ENC_CH": str(L.enc_channels),
+                "HMP_CC_CACHE_SUB_H": str(L.sub_h),
+                "HMP_CC_CACHE_SUB_W": str(L.sub_w),
+                "WMP_LOCAL_FRAME_CACHE": "1",
+            })
         # Rail list. The worker runs on identical hardware to the host,
         # so its dual.conf names the same devices; forward them under
         # the WMP_ prefix the child processes read. Absent == single
         # rail, which is the pre-multi-rail behaviour.
-        for src, dst in (("DUAL_RDMA_DEVS", "WMP_RDMA_DEVS"),
-                          ("DUAL_RDMA_GIDS", "WMP_RDMA_GIDS")):
+        for src, dst in (("CLUSTER_RDMA_DEVS", "WMP_RDMA_DEVS"),
+                          ("CLUSTER_RDMA_GIDS", "WMP_RDMA_GIDS")):
             v = os.environ.get(src, "")
             if v:
                 cfg[dst] = v
@@ -2094,18 +2386,19 @@ def run_worker_3proc_pipeline(*, H, W, scale, sub_w, sub_h, n_slots,
                                 interp_mult: int = 2,
                                 no_sr: int = 0,
                                 mid_delivery: int = 1,
+                                local_cache_slots: int = 0,
                                 wmp_out: dict | None = None):
     # Override env so compute_proc / buffer_mgr_proc / rdma_proc (which
-    # all read DUAL_INTERP_MULT + DUAL_NO_SR via env) see the session's
+    # all read CLUSTER_INTERP_MULT + CLUSTER_NO_SR via env) see the session's
     # handshake-derived values instead of whatever the systemd unit set.
     # This lets F8/F9 cycle on the host trigger a fresh handshake on each
     # vf reload and have the worker pick up the new values WITHOUT needing
     # a daemon restart (the persistent worker.py loop just re-handshakes).
     if interp_mult not in (1, 2, 3, 4):
         interp_mult = 2
-    os.environ["DUAL_INTERP_MULT"] = str(interp_mult)
-    os.environ["DUAL_NO_SR"] = "1" if no_sr else "0"
-    os.environ["DUAL_MID_DELIVERY"] = "1" if mid_delivery else "0"
+    os.environ["CLUSTER_INTERP_MULT"] = str(interp_mult)
+    os.environ["CLUSTER_NO_SR"] = "1" if no_sr else "0"
+    os.environ["CLUSTER_MID_DELIVERY"] = "1" if mid_delivery else "0"
     """Spawns rdma_proc + buffer_mgr_proc + compute_proc, waits for
     compute to pre-warm, then calls signal_ready_cb (which sends the
     NCCL 'ready' signal to the host). Finally blocks on .join() until
@@ -2121,6 +2414,7 @@ def run_worker_3proc_pipeline(*, H, W, scale, sub_w, sub_h, n_slots,
     wmp = WorkerMP(
         layout=layout, shm_name=shm_name,
         rdma_dev=rdma_dev, rdma_port=rdma_port, rdma_gid=rdma_gid,
+        local_cache_slots=local_cache_slots,
         log=log,
         variant=variant, rife_model=rife_model,
         matrix_s=matrix_s, color_range=color_range,

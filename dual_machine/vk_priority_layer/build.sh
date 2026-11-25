@@ -22,8 +22,8 @@
 # itself entirely.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MPV_BIN="${MPV_BIN:-/home/user/miniforge3/envs/vsmpv/bin/mpv}"
-VK_INC="${VK_INC:-/home/user/miniforge3/envs/vsmpv/include}"
+MPV_BIN="${MPV_BIN:-$HOME/miniforge3/envs/vsmpv/bin/mpv}"
+VK_INC="${VK_INC:-$HOME/miniforge3/envs/vsmpv/include}"
 
 USER_LIB_OUT="$HOME/.local/lib/vulkan/libVkLayer_priority_boost.so"
 SYS_LIB="/usr/local/lib/libVkLayer_priority_boost.so"

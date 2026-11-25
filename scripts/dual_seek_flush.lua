@@ -9,7 +9,15 @@
 -- filter API doesn't surface them) or mpv exits (the embedded
 -- Python interp's atexit doesn't fire when mpv tears down).
 --
--- DUAL_SEEK_FLUSH_DISABLE=1 → no-op.
+-- CLUSTER_SEEK_FLUSH_DISABLE=1 → no-op.
+
+local function cluster_getenv(name)
+    local value = os.getenv(name)
+    if value == nil and name:sub(1, 8) == "CLUSTER_" then
+        return os.getenv("DUAL_" .. name:sub(9))
+    end
+    return value
+end
 
 local mp  = require "mp"
 local msg = require "mp.msg"
@@ -44,7 +52,7 @@ local function bump_epoch()
 end
 
 local function on_seek_signal()
-    if os.getenv("DUAL_SEEK_FLUSH_DISABLE") == "1" then return end
+    if cluster_getenv("CLUSTER_SEEK_FLUSH_DISABLE") == "1" then return end
     bump_epoch()
 end
 

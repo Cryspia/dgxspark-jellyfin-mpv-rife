@@ -325,17 +325,17 @@ class QueueManager:
         # real cc_cache slot ids (small integers).
         self._synthetic_slot_id = itertools.count(1_000_000)
 
-        # DUAL_INTERP_MULT snapshot. The env var is written by
+        # CLUSTER_INTERP_MULT snapshot. The env var is written by
         # native_dispatcher before this manager is constructed and is
         # fixed for the manager's lifetime (an F9 mult change resets the
         # dispatcher singleton and builds a fresh QueueManager), so the
         # submit/pop hot paths read this once instead of os.environ per
         # call. Clamping to a valid set stays at the use sites because
         # different paths accept different ranges (1 vs 2 minimum).
-        self._interp_mult_env = int(os.environ.get("DUAL_INTERP_MULT", "2"))
+        self._interp_mult_env = int(os.environ.get("CLUSTER_INTERP_MULT", "2"))
         # Same launch-time snapshot for the refcount debug switch —
         # it gated an os.environ read on every state transition.
-        self._refcount_dbg = os.environ.get("DUAL_REFCOUNT_DBG", "0") == "1"
+        self._refcount_dbg = os.environ.get("CLUSTER_REFCOUNT_DBG", "0") == "1"
 
         # Lifecycle.
         self._closed = False
@@ -361,7 +361,7 @@ class QueueManager:
         # if it had to wait, (2) the queue depths at the time of pop,
         # (3) how long the caller blocked. Reported in summary log via
         # _profile_pop_report().
-        self._profile = os.environ.get("DUAL_PROFILE", "0") == "1"
+        self._profile = os.environ.get("CLUSTER_PROFILE", "0") == "1"
         self._pop_log: dict[str, dict] = {
             "host": {"cc": 0, "sr": 0, "interp": 0, "empty_waits": 0,
                      "wait_ms_total": 0.0, "n": 0,
@@ -374,7 +374,7 @@ class QueueManager:
         self._pop_log_lock = threading.Lock()
         self._pop_last_report = _time.perf_counter()
         self._pop_report_every = float(os.environ.get(
-            "DUAL_PROFILE_INTERVAL_S", "2.0"))
+            "CLUSTER_PROFILE_INTERVAL_S", "2.0"))
         # PROFILE: lock-hold instrumentation. For each entry point we
         # measure (wall_inside_lock_ms_total, n_calls) so the report
         # surfaces "submit_frame held _cv for X ms over the last Ys" —
@@ -499,7 +499,9 @@ class QueueManager:
             t_created=_time.perf_counter(),
         )
         self._dag[tid] = node
-        for pid in parents_set:
+        # node.parents aliases parents_set; an already-fired stage removes
+        # that edge while the remaining parents still need inspection.
+        for pid in tuple(parents_set):
             parent = self._dag.get(pid)
             if parent is None:
                 # Parent has been garbage collected — count as done.
@@ -540,15 +542,12 @@ class QueueManager:
             # (via dma_proc) and writes mpv VA dst_a (4K SR). Both gates
             # must be set before publish.
             #
-            # Requiring both introduces a cross-K dependency that
-            # deadlocks at low CF: mpv with CF=2 requests frame 0 +
-            # frame 1 in parallel; frame_done(0) needs INTERP(0) which
-            # needs CCSR(1); CCSR(1) has src_y (from K=0's sb side) but
-            # not dst_a_y (K=1's set_phase_dst can't fire until a
-            # frame_thread is free). PSNR tests therefore use CF >= 4
-            # (≥ 2 pairs in flight); fps bench runs at CF=24.
+            # A stalled predecessor may instead provide an owned source
+            # and output buffer for speculative processing of this frame.
             if not node.payload.get("src_y"):
                 return False
+            if node.payload.get("_speculative_output") is not None:
+                return True
             va = self._frame_va.get(node.frame_idx)
             if va is None or va.dst_a_y == 0:
                 return False
@@ -631,7 +630,9 @@ class QueueManager:
         non-SR_INTERP types unambiguously."""
         for node in self._dag.values():
             if (node.type == t and node.frame_idx == frame_idx
-                    and node.output_phase == output_phase):
+                    and node.output_phase == output_phase
+                    and node.payload.get("_dispatch_epoch", self._seek_epoch)
+                    == self._seek_epoch):
                 return node
         return None
 
@@ -645,11 +646,9 @@ class QueueManager:
         create one. Caller MUST hold _lock.
 
         Payload merge policy: for CC nodes' mpv-VA fields
-        (src_y/src_u/src_v + strides), LAST writer wins — pair K's
-        sa-side VA and pair K-1's sb-side VA may differ if mpv hands
-        a fresh buffer per compute() call. Stale cached VAs caused
-        EFAULTs (addr=0x0) when dma_proc read the old address after
-        mpv freed it. cc_cache slot ids (dst_cc_slot, src_cc_slot_*)
+        (src_y/src_u/src_v + strides), the latest owner callback wins.
+        Its phase cannot finish before CCSR finishes reading the source.
+        cc_cache slot ids (dst_cc_slot, src_cc_slot_*)
         keep first-writer-wins — those are queue_mgr-internal and
         must not be re-allocated mid-flight."""
         existing = self._dag_find_locked(t, frame_idx, output_phase)
@@ -659,9 +658,14 @@ class QueueManager:
                     "src_y", "src_u", "src_v",
                     "src_y_stride", "src_uv_stride",
                 }
-                _dbg_va = os.environ.get("DUAL_VA_DBG", "0") == "1"
+                _dbg_va = os.environ.get("CLUSTER_VA_DBG", "0") == "1"
                 for k, v in payload.items():
                     if k in _VA_KEYS:
+                        if existing.payload.get("_retry_source_backing") is not None:
+                            # A disconnected worker's packed source is
+                            # owned until this task completes; don't
+                            # replace it with another short-lived mpv VA.
+                            continue
                         # last-writer-wins for mpv-VA fields, but only
                         # if the new value is non-zero (don't let a
                         # later submit_frame with no va overwrite a
@@ -707,28 +711,16 @@ class QueueManager:
         "next" frame (e.g. CC(K+1) created by submit_frame(K) is
         observed and shared by the later submit_frame(K+1)).
         """
-        # CC payload ownership (last-writer-wins / VA staleness):
-        # Each CC_M is "owned" by the EARLIEST pair that needs it. Pair
-        # K's submit_frame holds VAs for frame K (sa) and frame K+1 (sb).
-        # CC_K is depended on by INTERP_{K-1} and INTERP_K (pair K-1 is
-        # earlier, so CC_K is owned by pair K-1, written via its sb).
-        # CC_{K+1} is depended on by INTERP_K and INTERP_{K+1} (pair K
-        # earlier), so CC_{K+1} is owned by pair K, written via its sb.
-        # Exception: pair 0 has no predecessor — it bootstraps CC_0 from
-        # its own sa side.
+        # CCSR(K) reads only the source held by pair K's own callback.
+        # Pair K-1 can return after its phase-0 output and release its sb
+        # frame while CCSR(K) is still waiting to read it.
         cc_k_payload = None
         cc_kp1_payload = None
         if va is not None:
-            if K == 0:
-                # Bootstrap CC_0 — no pair (-1) exists to write it.
-                cc_k_payload = {
-                    "src_y": va.sa_y, "src_u": va.sa_u, "src_v": va.sa_v,
-                    "src_y_stride": va.sa_y_stride,
-                    "src_uv_stride": va.sa_uv_stride,
-                }
-            # CC_{K+1} is always owned by pair K's submit (sb side).
-            cc_kp1_payload = {
-                "src_y": va.sb_y, "src_u": va.sb_u, "src_v": va.sb_v,
+            # A session can begin at any frame after seek or failover.
+            # The current pair is also a valid source for CCSR(K).
+            cc_k_payload = {
+                "src_y": va.sa_y, "src_u": va.sa_u, "src_v": va.sa_v,
                 "src_y_stride": va.sa_y_stride,
                 "src_uv_stride": va.sa_uv_stride,
             }
@@ -908,42 +900,82 @@ class QueueManager:
                 self._try_make_ready_locked(sr_node)
             self._cv.notify_all()
 
+    def current_seek_epoch(self) -> int:
+        with self._lock:
+            return self._seek_epoch
+
+    def needs_speculative_neighbor(self, K: int, epoch: int) -> bool:
+        """Check whether pair K is waiting for an unrequested CCSR(K+1)."""
+        with self._lock:
+            if self._closed or epoch != self._seek_epoch:
+                return False
+            node = self._dag_find_locked(TaskType.CCSR, K + 1)
+            va = self._frame_va.get(K + 1)
+            return (node is not None and node.state == TaskState.PENDING
+                    and node.payload.get("_speculative_output") is None
+                    and node.payload.get("_retry_source_backing") is None
+                    and (va is None or not va.dst_a_y))
+
+    def install_speculative_neighbor(self, K: int, epoch: int, *,
+                                     source: dict, output) -> bool:
+        """Publish a privately backed next-frame CCSR if still needed."""
+        with self._cv:
+            if not self.needs_speculative_neighbor(K, epoch):
+                return False
+            node = self._dag_find_locked(TaskType.CCSR, K + 1)
+            node.payload.update(source)
+            node.payload["_speculative_output"] = output
+            self._try_make_ready_locked(node)
+            self._cv.notify_all()
+            return True
+
+    def speculative_output(self, K: int):
+        with self._lock:
+            node = self._dag_find_locked(TaskType.CCSR, K)
+            return None if node is None else node.payload.get("_speculative_output")
+
+    def consume_speculative_output(self, K: int, output) -> None:
+        with self._cv:
+            node = self._dag_find_locked(TaskType.CCSR, K)
+            if node is not None and node.payload.get("_speculative_output") is output:
+                node.payload.pop("_speculative_output", None)
+                self._maybe_signal_frame_done_locked(K)
+                self._cv.notify_all()
+
     def submit_with_phase_dst(self, K: int, phase: int, *,
                                 sa_y: int, sa_u: int, sa_v: int,
                                 sb_y: int, sb_u: int, sb_v: int,
                                 sa_y_stride: int, sa_uv_stride: int,
                                 dst_y: int, dst_u: int, dst_v: int,
-                                dst_y_stride: int, dst_uv_stride: int
-                                ) -> None:
+                                dst_y_stride: int, dst_uv_stride: int,
+                                expected_epoch: int | None = None
+                                ) -> bool:
         """Fused entry: set_phase_dst + submit_frame under ONE lock
         acquisition + ONE notify_all (instead of 2 of each). Same
         semantics as calling set_phase_dst(K, phase, ...) followed by
         submit_frame(K, va=FrameVA(...)) — but without the FrameVA
         dataclass construction in Python and without the extra lock
         cycle. Called from mpv-side compute_callable hot path."""
-        # K==0 bootstrap (otherwise CC_0's src_y is never set).
-        cc_k_payload = None
-        if K == 0:
-            cc_k_payload = {
-                "src_y": sa_y, "src_u": sa_u, "src_v": sa_v,
-                "src_y_stride": sa_y_stride,
-                "src_uv_stride": sa_uv_stride,
-            }
-        cc_kp1_payload = {
-            "src_y": sb_y, "src_u": sb_u, "src_v": sb_v,
+        # A session can start at an arbitrary frame after seek/failover.
+        cc_k_payload = {
+            "src_y": sa_y, "src_u": sa_u, "src_v": sa_v,
             "src_y_stride": sa_y_stride,
             "src_uv_stride": sa_uv_stride,
         }
+        # The next CCSR obtains its source from its own callback, whose
+        # lifetime is tied to completion of that CCSR task.
+        cc_kp1_payload = None
         _t_enter = _time.perf_counter() if self._profile else 0.0
         with self._lock:
             _t_inside = _time.perf_counter() if self._profile else 0.0
-            if self._closed:
-                return
+            if self._closed or (expected_epoch is not None
+                                and expected_epoch != self._seek_epoch):
+                return False
             if K > self._max_submit_K:
                 self._max_submit_K = K
             # Same defensive guard as submit_frame.
             if K in self._signaled_K_set:
-                return
+                return True
             # 1) Update FrameVA in place (set_phase_dst's body).
             va = self._frame_va.get(K)
             if va is None:
@@ -1025,6 +1057,7 @@ class QueueManager:
                     rec["max_ms"] = dt
                 if len(self._dag) > self._dag_size_peak:
                     self._dag_size_peak = len(self._dag)
+            return True
 
     def get_frame_va(self, K: int) -> Optional[FrameVA]:
         with self._lock:
@@ -1140,6 +1173,8 @@ class QueueManager:
                            f"{node.state.name} (type={node.type.name})")
                 return
             node.state = TaskState.DONE if ok else TaskState.FAILED
+            stale_epoch = (node.payload.get("_dispatch_epoch", self._seek_epoch)
+                           != self._seek_epoch)
             node.result = result
             node.error = error
             node.t_done = _time.perf_counter()
@@ -1152,6 +1187,8 @@ class QueueManager:
                 if not node.payload.get("refcounts_init"):
                     self._initialise_refcounts_locked(node)
                     node.payload["refcounts_init"] = True
+                if node.type == TaskType.CCSR and stale_epoch:
+                    self._retire_stale_ccsr_locked(node)
                 self._consume_inputs_locked(node)
                 # Publish children whose remaining parents are now all
                 # done. Edges marked gates_on_mid are satisfied by the
@@ -1174,11 +1211,14 @@ class QueueManager:
                 # 1..mult-1) must be done —
                 # _maybe_signal_frame_done_locked checks them all.
                 if node.type in (TaskType.SR_INTERP, TaskType.CCSR):
-                    self._maybe_signal_frame_done_locked(node.frame_idx)
+                    if not stale_epoch:
+                        self._maybe_signal_frame_done_locked(node.frame_idx)
                     # wait_phase_done waiters poll node.state on _cv
                     # wakeups. Notify so they can re-check immediately
                     # instead of waiting up to 100ms.
                     self._cv.notify_all()
+            elif node.type == TaskType.CCSR and stale_epoch:
+                self._retire_stale_ccsr_locked(node)
             # No outer notify_all here. _make_ready_locked already
             # notifies for any child that just became READY (the only
             # state-change a cv-waiting dispatcher cares about). A
@@ -1195,6 +1235,24 @@ class QueueManager:
     def _dbg(self, msg: str) -> None:
         if self._refcount_dbg:
             self._log(f"[ref] {msg}")
+
+    def _retire_stale_ccsr_locked(self, node: TaskNode) -> None:
+        """Release abandoned output after its producer has drained."""
+        slot = node.payload.get("dst_cc_slot", -1)
+        if slot in self._cc:
+            live = sum(
+                1 for child in self._dag.values()
+                if child.state == TaskState.RUNNING
+                and child.type == TaskType.INTERP
+                and slot in (child.payload.get("src_cc_slot_a", -1),
+                             child.payload.get("src_cc_slot_b", -1)))
+            if live:
+                self._cc_set_producer_locked(slot, rgb_padded_consumers=live,
+                                             rife_features_consumers=live)
+            else:
+                self._cc_free_slot_locked(slot)
+        node.payload.pop("_speculative_output", None)
+        node.payload.pop("_retry_source_backing", None)
 
     def _initialise_refcounts_locked(self, node: TaskNode) -> None:
         """Producer-side: when CC/INTERP just finished, set up refcounts
@@ -1244,25 +1302,18 @@ class QueueManager:
                            f"slot={slot} mult=1 → free immediately")
                 self._cc_free_slot_locked(slot)
                 return
-            # Count actual live (non-DONE/FAILED) INTERP children
-            # — this handles three cases the old hardcoded 2 leaked on:
-            #   - K=0       : INTERP(-1, 0) doesn't exist → 1 consumer.
-            #   - last K    : INTERP(K, K+1) never created → 1 consumer.
-            #   - post-seek : flush_seek deleted the INTERPs → 0 consumers,
-            #                 slot is freed immediately.
-            # CF=24 means by the time CCSR(K).task_done runs, both
-            # surrounding submit_frame calls have happened (if they were
-            # going to), so the count is accurate at this moment.
-            n_consumers = 0
-            for cid in node.children:
-                child = self._dag.get(cid)
-                if child is None:
-                    continue
-                if child.type != TaskType.INTERP:
-                    continue
-                if child.state in (TaskState.DONE, TaskState.FAILED):
-                    continue
-                n_consumers += 1
+            # A neighboring interval can be submitted after this early
+            # stage fires. Reserve both possible uses until they consume
+            # the source; frame zero has no predecessor. A producer from
+            # before a seek cannot acquire new children in this epoch.
+            if node.payload.get("_dispatch_epoch", self._seek_epoch) == self._seek_epoch:
+                n_consumers = 1 if node.frame_idx == 0 else 2
+            else:
+                n_consumers = sum(
+                    1 for cid in node.children
+                    if (child := self._dag.get(cid)) is not None
+                    and child.type == TaskType.INTERP
+                    and child.state not in (TaskState.DONE, TaskState.FAILED))
             if n_consumers == 0:
                 # No live INTERP consumers (post-seek flush, or first/
                 # last frame). Free the slot directly so it returns to
@@ -1347,6 +1398,10 @@ class QueueManager:
             for p in (1, 2, 3)]
         if phase0 is None and all(n is None for n in sr_nodes):
             return
+        if phase0 is not None and phase0.payload.get("_speculative_output") is not None:
+            va = self._frame_va.get(K)
+            if va is None or not va.dst_a_y:
+                return
         ok = (phase0 is None or phase0.state == TaskState.DONE)
         for n in sr_nodes:
             if not ok:
@@ -1368,7 +1423,7 @@ class QueueManager:
         """Delete PENDING/READY/DONE nodes, clear `_signaled_K_set`,
         bump `_seek_epoch`, pop per-K Events. CLAIMED stays — the
         worker finishes naturally; its task_done frees its cc_cache
-        slot via the dynamic-child-count path in
+        slot via the old-epoch consumer-count path in
         `_initialise_refcounts_locked`."""
         flushed_K: set[int] = set()
         to_delete: list[int] = []
@@ -1408,7 +1463,7 @@ class QueueManager:
         # progress-bar drags drained the whole 32-slot pool and hung
         # dispatch. Sweep the table: a slot stays only while a RUNNING
         # node still references it (a RUNNING producer frees via the
-        # dynamic-consumer-count path in _initialise_refcounts_locked;
+        # old-epoch consumer-count path in _initialise_refcounts_locked;
         # a RUNNING consumer frees via _consume_inputs_locked at its
         # task_done). FAILED nodes never decrement (task_done(ok=False)
         # skips _consume_inputs), so they don't keep slots alive
@@ -1452,6 +1507,28 @@ class QueueManager:
             if node.state != TaskState.RUNNING:
                 return
             self._make_ready_locked(node)
+
+    def retry_task(self, task_id: int, source_backup: dict | None = None) -> bool:
+        """Requeue a disconnected worker's task after its QPs are closed.
+
+        Previously published stages remain valid and must not be written
+        again: consumers may already be reading them or their cache slots
+        may have been recycled. The retry executor skips those stages.
+        """
+        with self._cv:
+            node = self._dag.get(task_id)
+            if (self._closed or node is None or node.state != TaskState.RUNNING
+                    or node.payload.get("_dispatch_epoch") != self._seek_epoch):
+                return False
+            if source_backup:
+                node.payload.update(source_backup)
+            node.payload["retry_skipped_stages"] = frozenset(
+                node.payload.get("stages_fired", ()))
+            self._log(f"[queue_mgr] retry task={task_id} "
+                      f"published_stages={sorted(node.payload['retry_skipped_stages'])}")
+            node.state = TaskState.PENDING
+            self._try_make_ready_locked(node)
+            return True
 
     # ── worker-side fetch ──────────────────────────────────────
 
@@ -1634,7 +1711,7 @@ class QueueManager:
                 self._cv.wait(timeout=remaining)
 
     def _maybe_report_pop_locked(self) -> None:
-        """Caller holds _cv. Emit a summary every DUAL_PROFILE_INTERVAL_S
+        """Caller holds _cv. Emit a summary every CLUSTER_PROFILE_INTERVAL_S
         seconds. Resets counters after each report."""
         now = _time.perf_counter()
         if (now - self._pop_last_report) < self._pop_report_every:
@@ -1745,12 +1822,16 @@ class QueueManager:
         t = node.type
         if t == TaskType.INTERP:
             # INTERP reads two CCSR producers' rgb_padded + features.
-            parent_cc_ids = sorted(
-                pid for pid in node.original_parents
-                if self._dag.get(pid)
-                and self._dag.get(pid).type == TaskType.CCSR)
-            for idx, pid in enumerate(parent_cc_ids):
-                parent = self._dag[pid]
+            # Task ids reflect callback arrival order, not frame order.
+            parents = sorted(
+                (parent for pid in node.original_parents
+                 if (parent := self._dag.get(pid)) is not None
+                 and parent.type == TaskType.CCSR),
+                key=lambda parent: parent.frame_idx)
+            if [parent.frame_idx for parent in parents] != [node.frame_idx,
+                                                            node.frame_idx + 1]:
+                raise RuntimeError(f"INTERP frame {node.frame_idx} has invalid source parents")
+            for idx, parent in enumerate(parents):
                 pslot = parent.payload.get("dst_cc_slot", -1)
                 key = "src_cc_slot_a" if idx == 0 else "src_cc_slot_b"
                 node.payload[key] = pslot
@@ -1820,6 +1901,7 @@ class QueueManager:
                 if node is None:
                     continue
                 node.state = TaskState.RUNNING
+                node.payload["_dispatch_epoch"] = self._seek_epoch
                 node.t_dispatched = _time.perf_counter()
                 self._stats[f"{which}_pops"] += 1
                 return node
@@ -1883,7 +1965,8 @@ class QueueManager:
     WAIT_ABANDONED = "abandoned"
 
     def wait_phase_done(self, K: int, phase: int, *,
-                         timeout: Optional[float] = None):
+                         timeout: Optional[float] = None,
+                         expected_epoch: int | None = None):
         """Block until (K, phase) is published or the wait is abandoned.
 
         phase 0 → CCSR(K); phase p ≥ 1 → SR_INTERP(K, output_phase=p).
@@ -1902,7 +1985,7 @@ class QueueManager:
             t, output_phase = TaskType.SR_INTERP, phase
         deadline = (_time.perf_counter() + timeout) if timeout else None
         with self._cv:
-            entry_epoch = self._seek_epoch
+            entry_epoch = self._seek_epoch if expected_epoch is None else expected_epoch
             while True:
                 # Seek-flush check: the compute() that issued this
                 # wait was abandoned by mpv's seek. Surface that to
@@ -1971,6 +2054,13 @@ class QueueManager:
                 continue
             if node.frame_idx >= cutoff:
                 continue
+            if node.type == TaskType.CCSR:
+                if node.payload.get("_speculative_output") is not None:
+                    continue
+                rec = self._cc.get(node.payload.get("dst_cc_slot", -1))
+                if rec is not None and (rec.rgb_padded_refs or rec.rife_features_refs):
+                    # A later interval may still need this producer.
+                    continue
             ok = True
             for cid in node.children:
                 child = self._dag.get(cid)
@@ -1991,8 +2081,10 @@ class QueueManager:
             # remains. SR_SRC and SR_INTERP can sweep in different
             # passes — keep FrameVA alive until the survivor finishes.
             still_has = any(
-                n.frame_idx == K
-                and n.type == TaskType.SR_INTERP
+                n.frame_idx == K and (
+                    n.type == TaskType.SR_INTERP or
+                    (n.type == TaskType.CCSR and n.state not in
+                     (TaskState.DONE, TaskState.FAILED)))
                 for n in self._dag.values())
             if not still_has:
                 self._frame_va.pop(K, None)

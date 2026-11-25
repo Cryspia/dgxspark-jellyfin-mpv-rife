@@ -19,34 +19,40 @@ VPY="${VPY:-$MPV_CFG/rife.vpy}"
 if [[ -z "${REPO_ROOT:-}" ]]; then
   REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
-DUAL_DIR="${DUAL_DIR:-$REPO_ROOT/dual_machine}"
+CLUSTER_DIR="${CLUSTER_DIR:-$REPO_ROOT/dual_machine}"
 
 # ─── dual networking ─────────────────────────────────────────────────
-# Source the installed dual config (DUAL_HOST_IP / DUAL_WORKER_HOST /
-# DUAL_RDMA_DEV / DUAL_RDMA_PORT). Each can still be overridden via
+# Source the installed dual config (CLUSTER_HOST_IP / CLUSTER_WORKER_HOST /
+# CLUSTER_RDMA_DEV / CLUSTER_RDMA_PORT). Each can still be overridden via
 # the env vars below.
-DUAL_CFG_FILE="${DUAL_CFG_FILE:-$HOME/.config/dgxspark-mpv/dual.conf}"
-if [[ -r "$DUAL_CFG_FILE" ]]; then
+source "$REPO_ROOT/scripts/cluster_env.sh"
+cluster_normalize_env
+CLUSTER_CFG_FILE="${CLUSTER_CFG_FILE:-$HOME/.config/dgxspark-mpv/cluster.conf}"
+if [[ ! -r "$CLUSTER_CFG_FILE" && -r "$HOME/.config/dgxspark-mpv/dual.conf" ]]; then
+  CLUSTER_CFG_FILE="$HOME/.config/dgxspark-mpv/dual.conf"
+fi
+if [[ -r "$CLUSTER_CFG_FILE" ]]; then
   # shellcheck disable=SC1090
-  source "$DUAL_CFG_FILE"
+  source "$CLUSTER_CFG_FILE"
+  cluster_normalize_env
 fi
 
-HOST_IP="${HOST_IP:-${DUAL_HOST_IP:-}}"
-WORKER_IP="${WORKER_IP:-${DUAL_WORKER_HOST:-}}"
-WORKER_USER="${WORKER_USER:-${DUAL_WORKER_USER:-ubuntu}}"
+HOST_IP="${HOST_IP:-${CLUSTER_HOST_IP:-}}"
+WORKER_IP="${WORKER_IP:-${CLUSTER_WORKER_HOST:-}}"
+WORKER_USER="${WORKER_USER:-${CLUSTER_WORKER_USER:-${USER:-$(id -un)}}}"
 # Relative path — ssh's login shell resolves it under the remote
 # user's home, so we don't have to know /home/$WORKER_USER vs
 # /Users/$WORKER_USER vs anything else.
-WORKER_DIR="${WORKER_DIR:-${DUAL_WORKER_DIR:-.local/share/dgxspark-mpv/worker}}"
-RDMA_DEV="${RDMA_DEV:-${DUAL_RDMA_DEV:-rocep1s0f0}}"
+WORKER_DIR="${WORKER_DIR:-${CLUSTER_WORKER_DIR:-.local/share/dgxspark-mpv/worker}}"
+RDMA_DEV="${RDMA_DEV:-${CLUSTER_RDMA_DEV:-rocep1s0f0}}"
 # RoCEv2 GID index for the rail's IPv4. install.sh pins it in dual.conf;
 # 3 is only the right fallback while the rail carries no extra addresses.
-RDMA_GID="${RDMA_GID:-${DUAL_RDMA_GID:-3}}"
+RDMA_GID="${RDMA_GID:-${CLUSTER_RDMA_GID:-3}}"
 # Rail list for the multi-rail transport (one QP per entry, every
 # transfer striped across them). Empty == single rail on $RDMA_DEV.
-RDMA_DEVS="${RDMA_DEVS:-${DUAL_RDMA_DEVS:-}}"
-RDMA_GIDS="${RDMA_GIDS:-${DUAL_RDMA_GIDS:-}}"
-RDMA_PORT="${RDMA_PORT:-${DUAL_RDMA_PORT:-29900}}"
+RDMA_DEVS="${RDMA_DEVS:-${CLUSTER_RDMA_DEVS:-}}"
+RDMA_GIDS="${RDMA_GIDS:-${CLUSTER_RDMA_GIDS:-}}"
+RDMA_PORT="${RDMA_PORT:-${CLUSTER_RDMA_PORT:-29900}}"
 
 # ─── default clips (override via env) ────────────────────────────────
 CLIP_24="${CLIP_24:-$REPO_ROOT/bench/clips/sample-1080p-24.mp4}"
@@ -145,11 +151,11 @@ start_worker() {
     local _wm _mods=()
     while IFS= read -r _wm; do
       [[ -z "$_wm" || "$_wm" == \#* ]] && continue
-      _mods+=("$DUAL_DIR/$_wm")
-    done < "$DUAL_DIR/WORKER_MODULES"
+      _mods+=("$CLUSTER_DIR/$_wm")
+    done < "$CLUSTER_DIR/WORKER_MODULES"
     rsync -azq \
       "${_mods[@]}" \
-      "$DUAL_DIR/../vs_gpu_helpers.py" \
+      "$CLUSTER_DIR/../vs_gpu_helpers.py" \
       "$WORKER_USER@$WORKER_IP:$WORKER_DIR/"
     ssh -n "$WORKER_USER@$WORKER_IP" "mkdir -p ~/.config/mpv/fsrcnnx-cudnn"
     rsync -azq --delete --exclude='__pycache__' \
@@ -159,10 +165,10 @@ start_worker() {
   ssh -n "$WORKER_USER@$WORKER_IP" "
     cd $WORKER_DIR && \
     ( nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-        DUAL_WORKER_HOST=$HOST_IP \
-        DUAL_RDMA_DEV=$RDMA_DEV DUAL_RDMA_PORT=$RDMA_PORT \
-        DUAL_RDMA_GID=$RDMA_GID \
-        DUAL_RDMA_DEVS=$RDMA_DEVS DUAL_RDMA_GIDS=$RDMA_GIDS \
+        CLUSTER_WORKER_HOST=$HOST_IP \
+        CLUSTER_RDMA_DEV=$RDMA_DEV CLUSTER_RDMA_PORT=$RDMA_PORT \
+        CLUSTER_RDMA_GID=$RDMA_GID \
+        CLUSTER_RDMA_DEVS=$RDMA_DEVS CLUSTER_RDMA_GIDS=$RDMA_GIDS \
         ${WORKER_EXTRA_ENV:-} \
         PYTHONPATH=/usr/lib/python3/dist-packages \
         $PY -B worker.py </dev/null >/tmp/dual_worker.log 2>&1 & )
@@ -201,12 +207,12 @@ run_mpv() {
   else
     local mult=2
     [[ $mode = dual_no_interp ]] && mult=1
-    env DUAL_WORKER_HOST="$WORKER_IP" \
-        DUAL_RDMA_DEV="$RDMA_DEV" DUAL_RDMA_PORT="$RDMA_PORT" \
-        DUAL_RDMA_GID="$RDMA_GID" \
-        DUAL_RDMA_DEVS="$RDMA_DEVS" DUAL_RDMA_GIDS="$RDMA_GIDS" \
-        DUAL_INTERP_MULT=$mult \
-        DUAL_REPORT_FPS=30 \
+    env CLUSTER_WORKER_HOST="$WORKER_IP" \
+        CLUSTER_RDMA_DEV="$RDMA_DEV" CLUSTER_RDMA_PORT="$RDMA_PORT" \
+        CLUSTER_RDMA_GID="$RDMA_GID" \
+        CLUSTER_RDMA_DEVS="$RDMA_DEVS" CLUSTER_RDMA_GIDS="$RDMA_GIDS" \
+        CLUSTER_INTERP_MULT=$mult \
+        CLUSTER_REPORT_FPS=30 \
         WARMUP_DISABLE=1 \
         $extra \
         PYTHONPATH=/usr/lib/python3/dist-packages \

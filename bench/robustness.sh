@@ -48,12 +48,12 @@ trap 'cleanup_all; flags_restore "$TMPDIR/saved_flags"; \
 
 _worker_systemctl() {
   ssh -o ConnectTimeout=3 -n "$WORKER_USER@$WORKER_IP" \
-    "systemctl --user $1 dgxspark-dual-worker.service" 2>&1
+    "systemctl --user $1 dgxspark-cluster-worker.service" 2>&1
 }
 _worker_active() {
   local s
   s=$(ssh -o ConnectTimeout=3 -n "$WORKER_USER@$WORKER_IP" \
-        'systemctl --user is-active dgxspark-dual-worker.service' 2>/dev/null)
+        'systemctl --user is-active dgxspark-cluster-worker.service' 2>/dev/null)
   [[ $s = active ]]
 }
 
@@ -129,7 +129,7 @@ else:
     has_end   = ('dual-machine active' in txt or
                  'dual-machine setup failed' in txt)
     if not has_start:
-        # never tried dual (e.g. DUAL_WORKER_HOST unset) — recovery=0.
+        # never tried dual (e.g. CLUSTER_WORKER_HOST unset) — recovery=0.
         print("0.00")
     elif has_end:
         print("0.50")   # marker present but no time → at most one log second
@@ -368,73 +368,7 @@ else
 fi
 
 echo
-echo "--- 8: trt_cache_miss (rename 1920x1088 engine on both sides → re-compile) ---"
-# Deletes (well, renames) the 1080p RIFE TRT engine cache on host AND
-# worker. Next mpv must trigger a fresh TRT compile, which takes
-# minutes. Bench's only assertion here is "does it eventually reach
-# dual mode without crashing" — slow OK.
-rm -f /tmp/dual_machine_disabled /tmp/dual_machine_worker_dead 2>/dev/null
-# Resolve the vsrife models dir through whatever pythonX.Y the env was
-# built with (glob, not a hardcoded python3.12) so a conda python bump
-# doesn't silently skip the cache rename. Both boxes share the env
-# layout, so the locally-resolved path applies to the remote too.
-VSRIFE_DIR="$(ls -d "$HOME"/miniforge3/envs/vsmpv/lib/python*/site-packages/vsrife/models 2>/dev/null | head -1)"
-: "${VSRIFE_DIR:=$HOME/miniforge3/envs/vsmpv/lib/python3.12/site-packages/vsrife/models}"
-CACHE_NAME="flownet_v4.26.pkl_1920x1088_fp16_scale-1.0_ensemble-False_NVIDIA GB10_trt-10.16.1.11.ts"
-host_cache_path="$VSRIFE_DIR/$CACHE_NAME"
-host_cache_backup="$host_cache_path.bench_backup"
-remote_cache_path="$VSRIFE_DIR/$CACHE_NAME"
-remote_cache_backup="$remote_cache_path.bench_backup"
-host_renamed=0
-remote_renamed=0
-if [[ -f $host_cache_path ]]; then
-  mv "$host_cache_path" "$host_cache_backup" && host_renamed=1
-fi
-# Quoting: path contains spaces ("NVIDIA GB10…"). SSH strips one
-# layer of quoting; we use single quotes around the path inside the
-# double-quoted command so the remote shell sees the path as a single
-# argument even after the strip.
-ssh -o ConnectTimeout=3 -n "$WORKER_USER@$WORKER_IP" \
-  "[[ -f '$remote_cache_path' ]] && mv '$remote_cache_path' '$remote_cache_backup'" \
-  2>/dev/null && remote_renamed=1
-# Restart worker so it doesn't hold an open file handle on the old cache.
-_worker_systemctl restart >/dev/null 2>&1
-sleep 3
-# Big timeout — TRT compile from scratch is several minutes.
-trt_log="$TMPDIR/trt_cache_miss_mpv.log"
-trt_out="$TMPDIR/trt_cache_miss.mkv"
-t0=$EPOCHREALTIME
-TRT_TIMEOUT="${TRT_BENCH_TIMEOUT:-300}"
-( timeout "$TRT_TIMEOUT" stdbuf -oL -eL "$HOME/.local/bin/mpv-conda" --no-config \
-    --vf=vapoursynth="$VPY":buffered-frames=2:concurrent-frames=12 \
-    --untimed --hwdec=no --no-audio --frames="$N" \
-    --ovc=ffv1 --of=matroska -o "$trt_out" \
-    "$CLIP" 2> "$trt_log" >/dev/null ) || true
-t1=$EPOCHREALTIME
-wall_s=$(awk "BEGIN{printf \"%.1f\", $t1 - $t0}")
-mode=?
-grep -q 'dual-machine active' "$trt_log" 2>/dev/null && mode=dual
-grep -q 'falling back to single-machine' "$trt_log" 2>/dev/null && mode=single-fallback
-frames_out=0
-[[ -f $trt_out ]] && frames_out=$(ffprobe -v error -count_frames -select_streams v:0 \
-  -show_entries stream=nb_read_frames -of csv=p=0 "$trt_out" 2>/dev/null || echo 0)
-pass=PASS
-[[ $mode != dual ]] && pass="FAIL (mode=$mode; cold-compile didn't reach dual)"
-[[ $frames_out -lt $((N / 2)) ]] && pass="FAIL (only $frames_out/$N frames rendered)"
-printf "  %-22s wall=%5.1fs  mode=%-15s frames=%d/%d  %s\n" \
-  "trt_cache_miss" "$wall_s" "$mode" "$frames_out" "$N" "$pass"
-# Restore caches.
-if [[ $host_renamed -eq 1 ]]; then
-  mv "$host_cache_backup" "$host_cache_path" 2>/dev/null || true
-fi
-if [[ $remote_renamed -eq 1 ]]; then
-  ssh -o ConnectTimeout=3 -n "$WORKER_USER@$WORKER_IP" \
-    "mv '$remote_cache_backup' '$remote_cache_path'" 2>/dev/null || true
-fi
-_worker_systemctl restart >/dev/null 2>&1
-
-echo
-echo "--- 9: seek_storm (rapid IPC seeks → mpv should recover within SLA) ---"
+echo "--- 8: seek_storm (rapid IPC seeks → mpv should recover within SLA) ---"
 # Clean state for the seek-flush epoch counter (scripts/dual_seek_flush.lua
 # bumps this on every seek; the dispatcher's watcher thread polls and
 # calls queue_mgr.flush_seek). Reset between scenarios so the previous
@@ -497,7 +431,7 @@ else
   #    /vsrife engine reload + TRT cache replay ≈ 8-12 s of the wall).
   #    Without scripts/dual_seek_flush.lua bumping the seek-epoch file,
   #    pre-seek compute() threads sit on a never-publishable CCSR(K+1)
-  #    until DUAL_PHASE_TIMEOUT (30 s), and the rebuild path itself
+  #    until CLUSTER_PHASE_TIMEOUT (30 s), and the rebuild path itself
   #    takes ~30+ s on top.
   SEEK_REBUILD_SLA=${SEEK_REBUILD_SLA:-20}
   seek_landed=0

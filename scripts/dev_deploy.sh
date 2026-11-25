@@ -6,10 +6,11 @@
 #
 # Usage: scripts/dev_deploy.sh            # host-side only
 #        scripts/dev_deploy.sh --worker   # also rsync worker modules to
-#                                         # the secondary box (reads
-#                                         # ~/.config/dgxspark-mpv/dual.conf)
+#                                         # configured secondary boxes
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/scripts/cluster_env.sh"
+cluster_normalize_env
 MPV_CFG="${MPV_CFG:-$HOME/.config/mpv}"
 
 cp -f "$ROOT/vs_gpu_helpers.py"      "$MPV_CFG/vs_gpu_helpers.py"
@@ -35,14 +36,43 @@ echo "host deploy → $MPV_CFG done"
 
 if [[ "${1:-}" == "--worker" ]]; then
   # shellcheck disable=SC1090
-  source "$HOME/.config/dgxspark-mpv/dual.conf"
-  WORKER="${DUAL_WORKER_USER:-spark}@${DUAL_WORKER_HOST:?}"
-  WORKER_DIR="${DUAL_WORKER_DIR:-.local/share/dgxspark-mpv/worker}"
+  config="${CLUSTER_CFG:-$HOME/.config/dgxspark-mpv/cluster.conf}"
+  if [[ ! -f "$config" && -z "${CLUSTER_CFG:-}" ]]; then
+    config="$HOME/.config/dgxspark-mpv/dual.conf"
+  fi
+  source "$config"
+  cluster_normalize_env
+  worker_list="${CLUSTER_WORKER_HOSTS:-${CLUSTER_WORKER_HOST:-}}"
+  [[ -n "$worker_list" ]] || { echo "no workers configured" >&2; exit 1; }
+  IFS=, read -r -a rdma_hosts <<< "$worker_list"
+  ssh_list="${CLUSTER_WORKER_SSH_HOSTS:-$worker_list}"
+  IFS=, read -r -a worker_hosts <<< "$ssh_list"
+  if (( ${#worker_hosts[@]} != ${#rdma_hosts[@]} )); then
+    echo "CLUSTER_WORKER_SSH_HOSTS must have one address per worker" >&2
+    exit 1
+  fi
+  declare -A seen_workers=()
+  workers=()
+  for host in "${worker_hosts[@]}"; do
+    host="${host#"${host%%[![:space:]]*}"}"
+    host="${host%"${host##*[![:space:]]}"}"
+    if [[ ! "$host" =~ ^[a-zA-Z0-9._-]+$ || -n "${seen_workers[$host]:-}" ]]; then
+      echo "invalid or duplicate worker in configuration: $host" >&2
+      exit 1
+    fi
+    seen_workers[$host]=1
+    workers+=("$host")
+  done
+  WORKER_DIR="${CLUSTER_WORKER_DIR:-.local/share/dgxspark-mpv/worker}"
   mods=()
   while IFS= read -r m; do
     [[ -z "$m" || "$m" == \#* ]] && continue
     mods+=("$ROOT/dual_machine/$m")
   done < "$ROOT/dual_machine/WORKER_MODULES"
-  rsync -azq "${mods[@]}" "$ROOT/vs_gpu_helpers.py" "$WORKER:$WORKER_DIR/"
-  echo "worker deploy → $WORKER:$WORKER_DIR done"
+  for host in "${workers[@]}"; do
+    worker="${CLUSTER_WORKER_USER:-${USER:-$(id -un)}}@$host"
+    rsync -azq "${mods[@]}" "$ROOT/vs_gpu_helpers.py" "$worker:$WORKER_DIR/"
+    echo "worker deploy → $worker:$WORKER_DIR done"
+  done
+  echo "restart dgxspark-cluster-worker.service on each worker to load the new code"
 fi

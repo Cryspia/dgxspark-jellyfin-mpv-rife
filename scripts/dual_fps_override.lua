@@ -14,13 +14,53 @@
 -- http(s) URLs alike, so this also covers Jellyfin streams (the primary
 -- use case — every Jellyfin source is an https stream URL).
 --
--- DUAL_FPS_OVERRIDE_DISABLE=1 → no-op.
+-- CLUSTER_FPS_OVERRIDE_DISABLE=1 → no-op.
+
+local function cluster_getenv(name)
+    local value = os.getenv(name)
+    if value == nil and name:sub(1, 8) == "CLUSTER_" then
+        return os.getenv("DUAL_" .. name:sub(9))
+    end
+    return value
+end
 
 local mp  = require "mp"
 local msg = require "mp.msg"
+local utils = require "mp.utils"
+local PINNED_MULT = cluster_getenv("CLUSTER_INTERP_MULT")
+local pid = tostring(mp.get_property_native("pid") or "")
+local SOURCE_FPS_FILE = pid:match("^%d+$") and ("/tmp/dual_machine_source_fps_" .. pid) or nil
 
-local DUAL_OFF_FLAG      = "/tmp/dual_machine_disabled"
-local DUAL_MULT_OVERRIDE = "/tmp/dual_machine_mult_override"
+local function load_policy()
+    local path = mp.command_native({"expand-path", "~~/dual_machine/four_machine_policy.json"})
+    local file = path and io.open(path, "r")
+    if not file then return nil end
+    local content = file:read("*a")
+    file:close()
+    local policy = utils.parse_json(content)
+    local fields = {"max_source_fps", "native_4k_max_source_fps", "x4_1080_max_source_fps",
+                    "x3_max_source_fps", "lowres_max_height", "lowres_max_width", "fourk_min_height", "fourk_min_width"}
+    if type(policy) ~= "table" then return nil end
+    for _, field in ipairs(fields) do
+        if type(policy[field]) ~= "number" or policy[field] <= 0 then return nil end
+    end
+    return policy
+end
+
+local function is_four_machine_tictac()
+    local setting = cluster_getenv("CLUSTER_TICTAC")
+    if setting and setting ~= "" and setting ~= "1" then return false end
+    local hosts = cluster_getenv("CLUSTER_WORKER_HOSTS") or ""
+    if hosts:match("^%s*$") then hosts = cluster_getenv("CLUSTER_WORKER_HOST") or "" end
+    local count = 0
+    for host in hosts:gmatch("[^,]+") do
+        if not host:match("^%s*$") then count = count + 1 end
+    end
+    return count >= 3
+end
+
+local CLUSTER_OFF_FLAG      = "/tmp/dual_machine_disabled"
+local CLUSTER_MULT_OVERRIDE = "/tmp/dual_machine_mult_override"
 
 local function file_exists(p)
     local f = io.open(p, "r")
@@ -38,49 +78,39 @@ local function read_int_file(path)
 end
 
 local function ffprobe_video(path)
-    -- Returns (fps_num, fps_den, height) or nils on failure. Probe
-    -- fields one at a time because ffprobe's csv emits fields in the
-    -- container's declaration order, not in the order requested.
-    local function one(field)
-        -- `timeout` caps the probe: ffprobe over an http(s) Jellyfin
-        -- stream URL fetches the container header over the network, so
-        -- a slow/unreachable server must not hang the on_load hook
-        -- (which blocks mpv's file load until it returns).
-        local cmd = string.format(
-            "timeout 8 ffprobe -v error -select_streams v:0 "
-            .. "-show_entries stream=%s -of csv=p=0 %q "
-            .. "2>/dev/null < /dev/null",
-            field, path)
-        local f = io.popen(cmd, "r")
-        if not f then return nil end
-        local line = f:read("*l")
-        f:close()
-        return line
-    end
-    local fr = one("r_frame_rate")
-    local hs = one("height")
-    if not fr or not hs then return nil end
-    local num, den = fr:match("^(%d+)/(%d+)$")
-    local h = tonumber(hs)
-    if not num then return nil end
-    return tonumber(num), tonumber(den), h
+    -- One probe returns all fields without repeatedly fetching remote headers.
+    local result = mp.command_native({
+        name = "subprocess", playback_only = false,
+        args = {"timeout", "8", "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate,height,width", "-of", "json", path},
+        capture_stdout = true, capture_stderr = true,
+    })
+    if not result or result.status ~= 0 then return nil end
+    local data = utils.parse_json(result.stdout or "")
+    local video = data and data.streams and data.streams[1]
+    if not video or type(video.r_frame_rate) ~= "string" then return nil end
+    local num, den = video.r_frame_rate:match("^(%d+)/(%d+)$")
+    local height, width = tonumber(video.height), tonumber(video.width)
+    if not num or not height or height <= 0 or not width or width <= 0 then return nil end
+    return tonumber(num), tonumber(den), height, width
 end
 
--- Per-file auto-pick. Does NOT honor the DUAL_MULT_OVERRIDE file
--- (F9 mid-playback toggle in sr_keys.lua); each new file starts
--- from the resolution/fps auto-default. Env var pin still wins
--- (bench scripts).
---
---   > 30 fps           → mult=1  (no temporal upscale)
---   ≤ 720p   + ≤ 25    → mult=4
---   ≤ 720p   + 26-30   → mult=3
---   1080p/4K + ≤ 25    → mult=3
---   1080p/4K + 26-30   → mult=2
-local function pick_dual_mult(src_fps, src_h)
-    local env = os.getenv("DUAL_INTERP_MULT")
-    if env then
-        local n = tonumber(env)
+local function pick_dual_mult(src_fps, src_h, src_w)
+    if PINNED_MULT then
+        local n = tonumber(PINNED_MULT)
         if n and n >= 1 and n <= 4 then return n end
+    end
+    local policy = load_policy()
+    if policy and is_four_machine_tictac() then
+        if src_fps > policy.max_source_fps then return 1 end
+        local fourk = src_h >= policy.fourk_min_height or src_w >= policy.fourk_min_width
+        if fourk and src_fps <= policy.native_4k_max_source_fps
+                and cluster_getenv("CLUSTER_TICTAC_4K_NATIVE") ~= "0" then return 2 end
+        if src_fps > policy.x3_max_source_fps then return 2 end
+        if not fourk and src_h <= policy.lowres_max_height
+                and src_w <= policy.lowres_max_width then return 4 end
+        if not fourk and src_fps <= policy.x4_1080_max_source_fps then return 4 end
+        return 3
     end
     if src_fps > 30.0 then return 1 end
     local max_mult = (src_h <= 720) and 4 or 3
@@ -89,9 +119,12 @@ local function pick_dual_mult(src_fps, src_h)
 end
 
 local function on_load()
-    if os.getenv("DUAL_FPS_OVERRIDE_DISABLE") == "1" then return end
-    if not os.getenv("DUAL_WORKER_HOST") then return end
-    if file_exists(DUAL_OFF_FLAG) then return end
+    if SOURCE_FPS_FILE then os.remove(SOURCE_FPS_FILE) end
+    if cluster_getenv("CLUSTER_FPS_OVERRIDE_DISABLE") == "1" then return end
+    local hosts = cluster_getenv("CLUSTER_WORKER_HOSTS") or ""
+    if hosts:match("^%s*$") then hosts = cluster_getenv("CLUSTER_WORKER_HOST") or "" end
+    if hosts:match("^%s*$") then return end
+    if file_exists(CLUSTER_OFF_FLAG) then return end
     local path = mp.get_property("path")
     if not path then return end
     -- ffprobe handles both local file paths and http(s) URLs. Jellyfin
@@ -99,16 +132,28 @@ local function on_load()
     -- skip network URLs — the stream URL carries its own auth token and
     -- ffprobe reads the container header directly. The `timeout` in
     -- ffprobe_video bounds the network probe.
-    local num, den, h = ffprobe_video(path)
-    if not num or not den or den == 0 then return end
+    local num, den, h, w = ffprobe_video(path)
+    if not num or not den or den == 0 or num <= 0 then
+        local f = io.open(CLUSTER_MULT_OVERRIDE, "w")
+        local pinned = tonumber(PINNED_MULT or "")
+        if f then f:write(tostring(pinned and pinned >= 1 and pinned <= 4 and pinned or 2)); f:close() end
+        msg.warn("dual mult sidecar: source rate unavailable; using conservative multiplier")
+        return
+    end
     local src_fps = num / den
-    if src_fps <= 0 then return end
-    local mult = pick_dual_mult(src_fps, h or 0)
-    local f = io.open(DUAL_MULT_OVERRIDE, "w")
+    if SOURCE_FPS_FILE then
+        local rate_file = io.open(SOURCE_FPS_FILE, "w")
+        if rate_file then rate_file:write(string.format("%.12f", src_fps)); rate_file:close() end
+    end
+    local mult = pick_dual_mult(src_fps, h or 0, w or 0)
+    local f = io.open(CLUSTER_MULT_OVERRIDE, "w")
     if f then f:write(tostring(mult)); f:close() end
     msg.info(string.format(
         "dual mult sidecar: src=%.3f h=%d → mult=%d (wrote %s)",
-        src_fps, h or 0, mult, DUAL_MULT_OVERRIDE))
+        src_fps, h or 0, mult, CLUSTER_MULT_OVERRIDE))
 end
 
 mp.add_hook("on_load", 50, on_load)
+mp.register_event("shutdown", function()
+    if SOURCE_FPS_FILE then os.remove(SOURCE_FPS_FILE) end
+end)

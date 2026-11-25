@@ -109,7 +109,7 @@ class RequestMeta(ctypes.Structure):
         ("dst_cc_field",  ctypes.c_int32),
 
         # INTERP timestep — unused now that worker reads
-        # DUAL_INTERP_MULT env and runs dual flownet inside one task.
+        # CLUSTER_INTERP_MULT env and runs dual flownet inside one task.
         # Kept for binary compat; worker ignores when mult>2.
         ("interp_timestep_num",   ctypes.c_uint32),
         ("interp_timestep_denom", ctypes.c_uint32),
@@ -356,7 +356,7 @@ def dma_proc_main():
     stopping = threading.Event()
     counts = {"readv": 0, "writev": 0}
     # Per-task wall-time accounting (only enabled when
-    # DUAL_SPLIT_DEBUG=1). readv = bytes-into-shm cost; wait =
+    # CLUSTER_SPLIT_DEBUG=1). readv = bytes-into-shm cost; wait =
     # time spent blocked on ef_request.wait() between consecutive
     # submits. Healthy wait_avg ≈ compute_proc's per-task kernel
     # time (saturated worker).
@@ -365,8 +365,8 @@ def dma_proc_main():
               "writev_sum_ms": 0.0, "writev_n": 0,
               "writev_bytes": 0,
               "wait_sum_ms":  0.0, "wait_n":  0}
-    _dma_debug = os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1"
-    _io_prof = os.environ.get("DUAL_IO_PROF", "0") == "1"
+    _dma_debug = os.environ.get("CLUSTER_SPLIT_DEBUG", "0") == "1"
+    _io_prof = os.environ.get("CLUSTER_IO_PROF", "0") == "1"
 
     # Pre-build the descriptor table so each pair's readv/writev loop
     # just iterates a flat list — keeps the hot path tight.
@@ -513,7 +513,7 @@ def dma_proc_main():
         # 4K to mpv VA). For CCSR we take this early return because the
         # memmove writeback to mpv VA happens mpv-side in _hmp_watcher
         # (same path as SR_* memmove mode).
-        if dst_cc_slot >= 0 and dst_cc_field == -2:
+        if dst_cc_slot >= 0 and dst_cc_field <= -2:
             del req
             with state_lock:
                 meta = shm.slot_state(i)
@@ -522,7 +522,7 @@ def dma_proc_main():
                 del meta
             ef_done.notify()
             counts["writev"] += 1
-            if os.environ.get("DUAL_SPLIT_DEBUG", "0") == "1":
+            if os.environ.get("CLUSTER_SPLIT_DEBUG", "0") == "1":
                 log(f"writeback slot={i} sentinel → SEND_PENDING")
             return
         if dst_cc_slot >= 0 and dst_cc_field >= 0:

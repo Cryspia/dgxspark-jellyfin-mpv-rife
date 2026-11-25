@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dual-machine secondary box system tray app.
+"""Cluster worker system tray app.
 
 Tiny GTK + AppIndicator app that shows up in the GNOME menu bar with
 the mpv icon. The user sees that the worker is running and gets a
@@ -9,7 +9,7 @@ right-click menu with two items:
   - "Quit"  (stops the systemd unit and exits the tray)
 
 That's all — the tray exists so a normal desktop user has a visible
-sign that the box is acting as a dual-mode worker and a way to stop
+sign that the box is acting as a cluster worker and a way to stop
 it without opening a terminal.
 """
 from __future__ import annotations
@@ -23,9 +23,9 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator
 
-SERVICE_NAME = "dgxspark-dual-worker.service"
-APP_ID       = "dgxspark-dual-secondary"
-ICON_NAME    = "mpv"      # fall through to system mpv icon
+SERVICE_NAME = "dgxspark-cluster-worker.service"
+APP_ID       = "dgxspark-cluster-worker"
+ICON_NAME    = "dgxspark-cluster-worker"
 
 
 def _systemctl(*args: str) -> tuple[int, str]:

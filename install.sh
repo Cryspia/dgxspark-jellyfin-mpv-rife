@@ -33,55 +33,40 @@ set -euo pipefail
 # Constants & paths
 # ============================================================================
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$PROJECT_DIR/scripts/cluster_env.sh"
+cluster_normalize_env
 ENV_NAME="vsmpv"
 FORGE_DIR="$HOME/miniforge3"
 ENV_PREFIX="$FORGE_DIR/envs/$ENV_NAME"
 MPV_SRC_DIR="$HOME/src/mpv"
-MPV_VERSION="v0.41.0"
+MPV_VERSION="v0.42.0"
 
 # Python stack pins. Bumping any of these is a deliberate act: re-run
 # install, re-check that apply_patches() still reports "patched … for
 # TRT mixed-precision" (it hard-fails if the patch context vanished),
 # and re-run bench/fps.sh + bench/color.sh.
 #
-# Coupling that caps how far these go (verified 2026-09):
-#   • torch_tensorrt moves torch and tensorrt as a set. 2.12.1 wants
-#     torch<2.13.0 + tensorrt<10.17.0; 2.13.0 wants torch 2.13.x +
-#     tensorrt 11.0.x. Never bump one of the three alone — a torch with
-#     no matching torch_tensorrt kills the RIFE TRT-compile path.
-#   • The 2.13 / TRT 11 set is DELIBERATELY NOT TAKEN. It installs and
-#     runs clean, but the RIFE engine it builds is slower on GB10:
-#     INTERP kernel 17.6 -> 20.86 ms (+18.5%), dispatcher fps dual
-#     105.6 -> 96.5 and dual_no_sr 155.5 -> 137.0, while the non-TRT
-#     paths (FSRCNNX cuDNN, CCSR) were unchanged or slightly faster.
-#     Measured 2026-09-19 on this fabric, reproduced across two runs.
-#     Neither knob recovers it: builder optimization_level=5 buys 1.8%
-#     (and 10.5 s of build time), and dropping the mixed-precision
-#     patch below changes nothing (16.34 vs 16.39 ms/frame), so the
-#     patch is not implicated. Re-test when torch_tensorrt ships a
-#     newer TRT 11 pairing; until then 2.12.1 / 10.16.1.11 is faster.
-#   • TENSORRT 10.16.1.11 is the newest 10.16.x.
-#   • vsrife only asks for torch>=2.10.0 — it does not constrain this.
-#   • CUDNN_FE / vsrife / shim tracked to latest at bump time.
-TORCH_VERSION="2.12.1"
+# torch_tensorrt 2.15 requires torch 2.15.x and TensorRT 11.4.x.
+# Change these as a set and keep the CUDA wheel index aligned.
+TORCH_VERSION="2.15.0"
 VSRIFE_VERSION="5.7.0"
-TENSORRT_VERSION="10.16.1.11"
-TORCH_TRT_VERSION="2.12.1"
-SHIM_VERSION="3.0.0"
-CUDNN_FE_VERSION="1.29.0"
+TENSORRT_VERSION="11.4.0.106"
+TORCH_TRT_VERSION="2.15.0"
+SHIM_VERSION="3.3.0"
+CUDNN_FE_VERSION="1.33.0"
 
 # Miniforge installer pin + checksum (aarch64). `releases/latest` made
 # every fresh install a moving target. Find sha256 values in the
 # release's *.sha256 assets when bumping.
-MINIFORGE_VERSION="26.7.2-0"
-MINIFORGE_SHA256="89b786c8d2c8b0fda7553914c1314ae4ddaa094503802f279377b19ac4463cb2"
+MINIFORGE_VERSION="26.9.4-2"
+MINIFORGE_SHA256="1adf18b530e4ffb00886ce6d5bd2eb1fa6311d2f14709b13bd154d8cd98d94c8"
 
 # Danmaku plugin — fetched from a sibling project, installed via its own
 # install.py. Pinned to a commit for reproducibility (an upstream push
 # used to change what a re-install produced); bump after testing.
 DANMAKU_REPO_URL="https://github.com/Cryspia/mpv-dandanplay-danmaku.git"
 DANMAKU_SRC_DIR="$HOME/src/mpv-dandanplay-danmaku"
-DANMAKU_REF="9968911091b1715e28ced983431b3ce88e04a676"
+DANMAKU_REF="44035585fcbc35939b880a2a8b38b51bba62cb81"
 
 # User-visible install locations
 MPV_CFG_DIR="$HOME/.config/mpv"
@@ -98,6 +83,9 @@ AUTOSTART_DIR="$HOME/.config/autostart"
 USE_MIRRORS=1
 INSTALL_DANMAKU=1
 REBUILD_TRT=0
+SKIP_GPU_WARMUP=0
+UPGRADE_CONDA=0
+REUSE_CLUSTER_CONFIG=0
 SET_DEFAULT_VIDEO=0
 
 # Common video MIME types we promote mpv-conda to default for, when
@@ -132,29 +120,31 @@ FSRCNNX_CUDNN_VERSION="v0.2.2"
 # sha256 of the release asset above — recompute when bumping the tag.
 FSRCNNX_CUDNN_SHA256="b32bd5c7ec668f31e27d3daa7091f3596706078d6ecad135bd3773ca64b2708a"
 
-# Dual-machine layout. The host's mpv reads DUAL_* from this file (via
+# Dual-machine layout. The host's mpv reads CLUSTER_* from this file (via
 # the mpv-conda wrapper); the secondary box's systemd worker service
 # reads it via EnvironmentFile.
-DUAL_CFG_DIR="$HOME/.config/dgxspark-mpv"
-DUAL_CFG_FILE="$DUAL_CFG_DIR/dual.conf"
-DUAL_WORKER_DIR="$HOME/.local/share/dgxspark-mpv/worker"
+CLUSTER_CFG_DIR="$HOME/.config/dgxspark-mpv"
+CLUSTER_CFG_FILE="$CLUSTER_CFG_DIR/cluster.conf"
+CLUSTER_LEGACY_CFG_FILE="$CLUSTER_CFG_DIR/dual.conf"
+CLUSTER_WORKER_DIR="$HOME/.local/share/dgxspark-mpv/worker"
 # Old install location, retained for migration / uninstall cleanup
 # of installs predating the move to ~/.local/share/.
-DUAL_WORKER_DIR_LEGACY="$HOME/dual_machine"
-DUAL_WORKER_SERVICE="dgxspark-dual-worker.service"
-DUAL_TRAY_DESKTOP="dgxspark-dual-secondary.desktop"
-DUAL_TRAY_AUTOSTART="$HOME/.config/autostart/$DUAL_TRAY_DESKTOP"
+CLUSTER_WORKER_DIR_LEGACY="$HOME/dual_machine"
+CLUSTER_WORKER_SERVICE="dgxspark-cluster-worker.service"
+CLUSTER_LEGACY_WORKER_SERVICE="dgxspark-dual-worker.service"
+CLUSTER_TRAY_DESKTOP="dgxspark-cluster-worker.desktop"
+CLUSTER_TRAY_AUTOSTART="$HOME/.config/autostart/$CLUSTER_TRAY_DESKTOP"
 
 # Default cluster config — used as fallback when neither env nor
 # interactive input provides a value. Override per-install via
-# DUAL_HOST_IP / DUAL_WORKER_IP / DUAL_RDMA_DEV / etc env vars.
-DUAL_DEFAULT_RDMA_PORT=29900
-DUAL_DEFAULT_LIVENESS_PORT=29905
+# CLUSTER_HOST_IP / CLUSTER_WORKER_IP / CLUSTER_RDMA_DEV / etc env vars.
+CLUSTER_DEFAULT_RDMA_PORT=29900
+CLUSTER_DEFAULT_LIVENESS_PORT=29905
 
 # Install-mode flags (set by cmd_install argv parsing). At most one of
 # the two dual flags can be set at a time.
-INSTALL_DUAL_HOST=0
-INSTALL_DUAL_SECONDARY=0
+INSTALL_CLUSTER_HOST=0
+INSTALL_CLUSTER_SECONDARY=0
 
 # Mirrors (USTC for China)
 USTC_CONDA_FORGE="https://mirrors.ustc.edu.cn/anaconda/cloud"
@@ -162,8 +152,7 @@ USTC_PYPI="https://pypi.mirrors.ustc.edu.cn/simple/"
 USTC_PYPI_HOST="pypi.mirrors.ustc.edu.cn"
 
 # PyTorch CUDA 13 wheel index (NOT mirrored on USTC)
-PYTORCH_INDEX="https://download.pytorch.org/whl/cu130"
-PYTORCH_NIGHTLY_INDEX="https://download.pytorch.org/whl/nightly/cu130"
+PYTORCH_INDEX="https://download.pytorch.org/whl/cu134"
 
 # ============================================================================
 # Logging helpers
@@ -262,8 +251,16 @@ install_miniforge() {
     local want_conda="${MINIFORGE_VERSION%-*}"
     local have_conda
     have_conda=$("$FORGE_DIR/bin/conda" --version 2>/dev/null | awk '{print $2}')
-    if [[ "$have_conda" == "$want_conda" ]]; then
-      log "miniforge present at $FORGE_DIR (conda $have_conda, matches pin)"
+    if "$FORGE_DIR/bin/python" - "$have_conda" "$want_conda" <<'PY'
+from packaging.version import Version
+import sys
+try:
+    sys.exit(0 if Version(sys.argv[1]) >= Version(sys.argv[2]) else 1)
+except ValueError:
+    sys.exit(1)
+PY
+    then
+      log "miniforge present at $FORGE_DIR (conda $have_conda meets minimum $want_conda)"
     else
       log "miniforge present at $FORGE_DIR — updating base conda ${have_conda:-unknown} → $want_conda"
       # Not fatal: an out-of-date base still builds a working env, and
@@ -315,7 +312,27 @@ create_conda_env() {
   source "$FORGE_DIR/etc/profile.d/conda.sh"
 
   if mamba env list 2>/dev/null | awk '{print $1}' | grep -qx "$ENV_NAME"; then
-    log "env '$ENV_NAME' already exists"
+    # mpv 0.42 and FFmpeg 9 require a matching libplacebo ABI. Existing
+    # installs from earlier revisions need this transaction even without
+    # the opt-in full dependency refresh.
+    local needs_media_upgrade=0
+    if ! "$ENV_PREFIX/bin/ffmpeg" -version 2>/dev/null | head -1 | grep -q '^ffmpeg version 9\.1'; then
+      needs_media_upgrade=1
+    fi
+    if ! PKG_CONFIG_PATH="$ENV_PREFIX/lib/pkgconfig" "$ENV_PREFIX/bin/pkg-config" --atleast-version=7.387 libplacebo; then
+      needs_media_upgrade=1
+    fi
+    if (( UPGRADE_CONDA || needs_media_upgrade )); then
+      local channel="conda-forge"
+      if (( USE_MIRRORS )); then
+        channel="https://mirrors.ustc.edu.cn/anaconda/cloud/conda-forge"
+      fi
+      log "upgrading conda packages in '$ENV_NAME' while preserving ABI pins"
+      conda update -n "$ENV_NAME" --all -y --override-channels -c "$channel" \
+        'python=3.12' 'vapoursynth=72' 'ffmpeg=9.1' 'lua=5.1' 'libplacebo>=7.387'
+    else
+      log "env '$ENV_NAME' already exists"
+    fi
     return
   fi
 
@@ -342,14 +359,14 @@ create_conda_env() {
     python=3.12 \
     `# media + filter chain (pinned: the vapoursynth C ABI + ffmpeg` \
     `#  major drive the whole vf chain; bump deliberately + re-bench)` \
-    'vapoursynth=72' 'ffmpeg=8.1' \
+    'vapoursynth=72' 'ffmpeg=9.1' \
     `# GTK stack for shim's tray icon (PyGObject loads system AppIndicator typelib at runtime)` \
     pygobject gtk3 librsvg gobject-introspection pillow \
     `# mpv from-source build deps` \
     meson ninja cython pkg-config \
-    wayland-protocols libvulkan-headers \
+    wayland-protocols libvulkan-headers 'libplacebo>=7.387' \
     freetype expat \
-    'lua=5.1'  # mpv 0.41 requires lua 5.1/5.2; rejects 5.4
+    'lua=5.1'  # mpv requires a compatible Lua version.
 }
 
 # ============================================================================
@@ -442,13 +459,13 @@ install_pip_packages() {
   # import-only check silently kept an old torch when TORCH_VERSION was
   # bumped, leaving torch_tensorrt (which is version-locked to torch) on
   # a mismatched pair. Compare the base version (strip the +cuXXX local
-  # tag) so "2.12.1" matches "2.12.1+cu130".
+  # tag) so "2.15.0" matches "2.15.0+cu134".
   local cur_torch
   cur_torch=$(python -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null || true)
   if [[ "$cur_torch" != "$TORCH_VERSION" ]]; then
     log "installing torch $TORCH_VERSION (CUDA 13 wheel from pytorch.org; was: ${cur_torch:-none})"
-    pip install "torch==$TORCH_VERSION" --index-url "$PYTORCH_INDEX" || \
-      pip install --pre torch --index-url "$PYTORCH_NIGHTLY_INDEX"
+    pip install --no-deps "torch==$TORCH_VERSION" --index-url "$PYTORCH_INDEX" || \
+      fatal "could not install the pinned PyTorch CUDA wheel"
   else
     log "torch already at pinned $TORCH_VERSION"
   fi
@@ -475,6 +492,7 @@ PY
     log "python stack already at pinned versions — skipping pip"
   else
     pip install \
+      "torch==$TORCH_VERSION" \
       "vsrife==$VSRIFE_VERSION" \
       "jellyfin-mpv-shim[gui]==$SHIM_VERSION" \
       "tensorrt==$TENSORRT_VERSION" \
@@ -536,18 +554,22 @@ apply_patches() {
     if [[ -f "$f" ]]; then
       if grep -q 'use_explicit_typing=True,' "$f"; then
         cp -n "$f" "${f}.bak"
-        sed -i 's|use_explicit_typing=True,|use_explicit_typing=False, enabled_precisions={torch.float16, torch.float32},|g' "$f"
+        sed -i 's|use_explicit_typing=True,|use_explicit_typing=False, enabled_precisions={torch.float16, torch.float32} if fp16 else {torch.float32}, disable_tf32=not fp16,|g' "$f"
         log "patched $f for TRT mixed-precision"
       fi
+      sed -i 's|enabled_precisions={torch.float16, torch.float32},|enabled_precisions={torch.float16, torch.float32} if fp16 else {torch.float32}, disable_tf32=not fp16,|g' "$f"
       # Verify the patch actually landed. The old "already patched (or
       # different version)" message conflated success with a vsrife
       # release where the sed context no longer matches — and a missing
       # patch means fp16 flow-vector overflow flicker at playback time
       # with nothing pointing back here. Fail loudly instead.
-      grep -q 'enabled_precisions={torch.float16, torch.float32}' "$f" \
+      grep -q 'enabled_precisions={torch.float16, torch.float32} if fp16 else {torch.float32}, disable_tf32=not fp16' "$f" \
         || fatal "vsrife mixed-precision patch did NOT apply to $f — \
 vsrife $VSRIFE_VERSION layout changed; update apply_patches()"
       log "vsrife mixed-precision patch verified in $f"
+      python3 "$PROJECT_DIR/scripts/patch_vsrife_warp.py" "$pydir/site-packages/vsrife" \
+        || fatal "vsrife warp optimization did not match $VSRIFE_VERSION"
+      log "vsrife warp optimization and engine cache tag verified"
     fi
   done
 }
@@ -572,7 +594,7 @@ gpu-api=vulkan
 hidpi-window-scale=yes
 # Native Wayland: ~1ms less frame-presentation latency than Xwayland on
 # NVIDIA, fewer vsync misses under heavy RIFE load. GNOME mutter doesn't
-# do SSD and mpv 0.41 has no libdecor → window has no title bar / min /
+# do SSD and mpv has no libdecor → window has no title bar / min /
 # close. Switch to `x11vk` if you want GNOME-drawn decorations back.
 gpu-context=waylandvk
 # auto-copy-safe (not auto-safe): the [rife] profile keeps a vapoursynth
@@ -684,7 +706,7 @@ EOF
 #                  the whole dual chain and drops to single SR-only.
 #   Shift+F8:  toggle KrigBilateral chroma GLSL (display-stage chroma
 #              upsample). Persists across files. Instant — no vf reload.
-#   Shift+F9:  toggle dual-machine offload (no-op when DUAL_WORKER_HOST
+#   Shift+F9:  toggle dual-machine offload (no-op when CLUSTER_WORKER_HOST
 #              isn't configured). Persists across files.
 #
 # F8 / F9 / Shift+F9 force a vapoursynth filter reload (~1–3 s freeze)
@@ -708,7 +730,7 @@ EOF
   # mpv seek so the dual-machine dispatcher's epoch watcher can flush
   # stale in-flight queue_mgr state. Without this, any seek freezes
   # dual-mode mpv for 30-40 s while wait_phase_done sits on an mpv VA
-  # gate that the seek made unreachable. DUAL_SEEK_FLUSH_DISABLE=1 to
+  # gate that the seek made unreachable. CLUSTER_SEEK_FLUSH_DISABLE=1 to
   # opt out.
   cp -f "$PROJECT_DIR/scripts/dual_seek_flush.lua" \
         "$MPV_CFG_DIR/scripts/dual_seek_flush.lua"
@@ -719,7 +741,7 @@ EOF
   # Works around mpv's vsapi rate-propagation bug where some MKV/MP4
   # containers hand fps_num=0/fps_den=0 to vapoursynth, forcing
   # rife.vpy's in-vpy heuristic into the conservative mult=2 branch.
-  # DUAL_FPS_OVERRIDE_DISABLE=1 to opt out.
+  # CLUSTER_FPS_OVERRIDE_DISABLE=1 to opt out.
   cp -f "$PROJECT_DIR/scripts/dual_fps_override.lua" \
         "$MPV_CFG_DIR/scripts/dual_fps_override.lua"
   log "copied scripts/dual_fps_override.lua to $MPV_CFG_DIR/scripts/"
@@ -753,7 +775,7 @@ EOF
   # holds a vapoursynth C++ plugin (libdgxspark_split_dual.so) that
   # rife.vpy LoadPlugin()s when dual mode is active. The secondary
   # box doesn't run mpv → skip the whole block there.
-  if (( INSTALL_DUAL_SECONDARY == 0 )); then
+  if (( INSTALL_CLUSTER_SECONDARY == 0 )); then
     local native_so="$PROJECT_DIR/dual_machine/native_filter/build/libdgxspark_split_dual.so"
     if [[ ! -f "$native_so" ]]; then
       section "step 7b/10: cmake build native_filter"
@@ -1042,6 +1064,9 @@ install_danmaku() {
   # know urllib/json/hmac are present even on stock systems with a
   # stripped-down system Python).
   in_env python3 "$DANMAKU_SRC_DIR/install.py"
+  in_env python3 "$PROJECT_DIR/scripts/shim_modal_bridge.py" \
+    "$ENV_PREFIX/lib/python3.12/site-packages/jellyfin_mpv_shim/mpvtk/renderer.lua" \
+    "$MPV_CFG_DIR/scripts/dandanplay/main.lua"
 }
 
 # ============================================================================
@@ -1163,6 +1188,8 @@ PY
 install_launchers() {
   section "step 10/10: wrappers + .desktop + autostart + icons"
   mkdir -p "$WRAPPER_DIR" "$APPS_DIR" "$AUTOSTART_DIR"
+  mkdir -p "$CLUSTER_CFG_DIR"
+  install -m 0644 "$PROJECT_DIR/scripts/cluster_env.sh" "$CLUSTER_CFG_DIR/cluster_env.sh"
 
   # ---------- mpv-conda wrapper ----------
   # PYTHONHOME so mpv's embedded Python (used by vapoursynth/RIFE) can
@@ -1173,7 +1200,7 @@ install_launchers() {
 # Wrapper: sets PYTHONHOME so mpv's embedded Python (vapoursynth/RIFE)
 # finds its stdlib when launched without conda activation. Also
 # sources the dual-machine cluster config if --dual-host was installed,
-# so DUAL_WORKER_HOST + DUAL_RDMA_* are visible to rife.vpy at
+# so CLUSTER_WORKER_HOST + CLUSTER_RDMA_* are visible to rife.vpy at
 # playback time without any per-user env setup.
 export PYTHONHOME="$ENV_PREFIX"
 # Put the env's bin first on PATH so torch's cpp_extension JIT finds
@@ -1182,9 +1209,13 @@ export PYTHONHOME="$ENV_PREFIX"
 # required" and krig falls back to a slow per-frame path. nvcc comes
 # from the system CUDA toolkit already on PATH.
 export PATH="$ENV_PREFIX/bin:\$PATH"
-if [[ -f "$DUAL_CFG_FILE" ]]; then
-  set -a; . "$DUAL_CFG_FILE"; set +a
+if [[ -f "$CLUSTER_CFG_FILE" ]]; then
+  set -a; . "$CLUSTER_CFG_FILE"; set +a
+elif [[ -f "$CLUSTER_LEGACY_CFG_FILE" ]]; then
+  set -a; . "$CLUSTER_LEGACY_CFG_FILE"; set +a
 fi
+source "$CLUSTER_CFG_DIR/cluster_env.sh"
+cluster_normalize_env
 # VK_LAYER_PRIORITY_BOOST opt-in (installed system-wide by --dual-host).
 # Requests VK_QUEUE_GLOBAL_PRIORITY_HIGH on mpv's Vulkan present queue
 # so it preempts CUDA on the shared GB10. No-op when the layer or the
@@ -1212,12 +1243,16 @@ export PYTHONHOME="$ENV_PREFIX"
 # mpv-conda wrapper); also makes the shim's ffprobe sidecar use the
 # env's ffmpeg.
 export PATH="$ENV_PREFIX/bin:\$PATH"
-# Source the dual-machine cluster config so DUAL_WORKER_HOST + DUAL_RDMA_*
+# Source the dual-machine cluster config so CLUSTER_WORKER_HOST + CLUSTER_RDMA_*
 # are visible to rife.vpy when the shim spawns mpv; without these in env,
 # rife.vpy short-circuits to single-machine mode (see rife.vpy:155).
-if [[ -f "$DUAL_CFG_FILE" ]]; then
-  set -a; . "$DUAL_CFG_FILE"; set +a
+if [[ -f "$CLUSTER_CFG_FILE" ]]; then
+  set -a; . "$CLUSTER_CFG_FILE"; set +a
+elif [[ -f "$CLUSTER_LEGACY_CFG_FILE" ]]; then
+  set -a; . "$CLUSTER_LEGACY_CFG_FILE"; set +a
 fi
+source "$CLUSTER_CFG_DIR/cluster_env.sh"
+cluster_normalize_env
 # Match mpv-conda: opt into VK_LAYER_PRIORITY_BOOST=high so the mpv
 # subprocess the shim launches gets HIGH-priority Vulkan present.
 export VK_PRIORITY_BOOST_LEVEL=high
@@ -1246,6 +1281,19 @@ EOF
     mkdir -p "$ICON_ROOT/scalable/apps"
     cp -f "$PROJECT_DIR/icons/mpv/scalable.svg" "$ICON_ROOT/scalable/apps/mpv-conda.svg"
   fi
+  local shim_icon="jellyfin-mpv-shim" mpv_icon="mpv-conda"
+  if (( INSTALL_CLUSTER_HOST )) || [[ -f "$CLUSTER_CFG_FILE" || -f "$CLUSTER_LEGACY_CFG_FILE" ]]; then
+    shim_icon="dgxspark-cluster-leader"
+    mpv_icon="$shim_icon"
+    for size in 16 24 32 48 64 128 256; do
+      dst_dir="$ICON_ROOT/${size}x${size}/apps"
+      mkdir -p "$dst_dir"
+      install -m 0644 "$PROJECT_DIR/icons/cluster-leader/$size.png" "$dst_dir/$shim_icon.png"
+    done
+    # Shim's tray loads this package resource directly, not the theme icon.
+    install -m 0644 "$PROJECT_DIR/icons/cluster-leader/64.png" \
+      "$ENV_PREFIX/lib/python3.12/site-packages/jellyfin_mpv_shim/systray.png"
+  fi
   log "icons installed under $ICON_ROOT"
 
   # ---------- .desktop entries ----------
@@ -1259,7 +1307,7 @@ Name=mpv
 GenericName=Media Player
 Comment=Play movies and songs
 Exec=$WRAPPER_DIR/mpv-conda --player-operation-mode=pseudo-gui -- %U
-Icon=mpv-conda
+Icon=$mpv_icon
 Type=Application
 Categories=AudioVideo;Audio;Video;Player;TV;
 MimeType=application/mxf;application/ram;application/sdp;application/vnd.apple.mpegurl;application/vnd.ms-asf;application/vnd.ms-wpl;application/vnd.rn-realmedia;application/vnd.rn-realmedia-vbr;application/x-extension-m4a;application/x-extension-mp4;application/x-flash-video;application/x-matroska;application/x-mpegURL;application/x-netshow-channel;application/x-quicktimeplayer;application/x-shorten;application/smil;application/smil+xml;application/x-quicktime-media-link;application/x-smil;image/vnd.rn-realpix;image/x-pict;misc/ultravox;text/google-video-pointer;text/x-google-video-pointer;video/3gp;video/3gpp;video/3gpp2;video/dv;video/divx;video/fli;video/flv;video/mp2t;video/mp4;video/mp4v-es;video/mpeg;video/mpeg-system;video/msvideo;video/ogg;video/quicktime;video/vivo;video/vnd.divx;video/vnd.mpegurl;video/vnd.rn-realvideo;video/vnd.vivo;video/webm;video/x-anim;video/x-avi;video/x-flc;video/x-fli;video/x-flic;video/x-flv;video/x-m4v;video/x-matroska;video/x-mjpeg;video/x-mpeg;video/x-mpeg2;video/x-ms-asf;video/x-ms-asf-plugin;video/x-ms-asx;video/x-msvideo;video/x-ms-wm;video/x-ms-wmv;video/x-ms-wmx;video/x-ms-wvx;video/x-nsv;video/x-ogm+ogg;video/x-theora;video/x-theora+ogg;x-content/video-dvd;x-scheme-handler/pnm;x-scheme-handler/mms;x-scheme-handler/net;x-scheme-handler/rtp;x-scheme-handler/rtmp;x-scheme-handler/rtsp;x-scheme-handler/mmsh;x-scheme-handler/uvox;x-scheme-handler/icy;x-scheme-handler/icyx;
@@ -1271,12 +1319,18 @@ EOF
 Name=Jellyfin MPV Shim
 Comment=Cast Jellyfin media to mpv (with RIFE + FSRCNNX)
 Exec=$WRAPPER_DIR/jellyfin-mpv-shim
-Icon=jellyfin-mpv-shim
+Icon=$shim_icon
 Type=Application
 Categories=AudioVideo;Player;
 Terminal=false
 StartupWMClass=jellyfin-mpv-shim
 EOF
+  # Shim 3 uses this Wayland app-id for its mpv window. Keep the
+  # matching desktop ID hidden while retaining the visible launcher.
+  cp "$APPS_DIR/jellyfin-mpv-shim.desktop" \
+     "$APPS_DIR/com.github.iwalton3.jellyfin-mpv-shim.desktop"
+  printf '%s\n' 'NoDisplay=true' >> \
+     "$APPS_DIR/com.github.iwalton3.jellyfin-mpv-shim.desktop"
   log "wrote .desktop entries to $APPS_DIR"
 
   # ---------- autostart shim on login ----------
@@ -1294,7 +1348,7 @@ EOF
 Name=Jellyfin MPV Shim
 Comment=Cast Jellyfin media to mpv (with RIFE + FSRCNNX)
 Exec=sh -c 'nm-online -q -t 30 2>/dev/null; sleep 3; exec $WRAPPER_DIR/jellyfin-mpv-shim'
-Icon=jellyfin-mpv-shim
+Icon=$shim_icon
 Type=Application
 Categories=AudioVideo;Player;
 Terminal=false
@@ -1379,38 +1433,44 @@ cmd_install() {
       --no-mirrors|--no-mirror|--no-ustc) USE_MIRRORS=0; shift ;;
       --no-danmaku|--skip-danmaku)        INSTALL_DANMAKU=0; shift ;;
       --rebuild-trt)                      REBUILD_TRT=1; shift ;;
+      --skip-gpu-warmup)                  SKIP_GPU_WARMUP=1; shift ;;
+      --upgrade-conda)                    UPGRADE_CONDA=1; shift ;;
+      --reuse-cluster-config|--reuse-dual-config) REUSE_CLUSTER_CONFIG=1; shift ;;
       --set-default-video|--default-video) SET_DEFAULT_VIDEO=1; shift ;;
-      --dual-host)                        INSTALL_DUAL_HOST=1; shift ;;
-      --dual-secondary)                   INSTALL_DUAL_SECONDARY=1; shift ;;
+      --cluster-host|--dual-host)         INSTALL_CLUSTER_HOST=1; shift ;;
+      --cluster-worker|--dual-secondary)  INSTALL_CLUSTER_SECONDARY=1; shift ;;
       -h|--help)
         cat <<EOF
-Usage: $0 install [--no-mirrors] [--no-danmaku] [--rebuild-trt]
+Usage: $0 install [--no-mirrors] [--no-danmaku] [--rebuild-trt] [--skip-gpu-warmup] [--upgrade-conda] [--reuse-cluster-config]
                   [--set-default-video]
-                  [--dual-host | --dual-secondary]
+                  [--cluster-host | --cluster-worker]
 
   --no-mirrors    Don't write USTC mirrors into ~/.condarc and
                   ~/.config/pip/pip.conf. Use this outside China
                   where the USTC endpoints are slow / unreachable.
   --no-danmaku    Skip the danmaku (bullet-chat) plugin step.
   --rebuild-trt   Wipe the TRT engine cache before re-warming.
+  --skip-gpu-warmup  Skip TensorRT engine warming and CUDA extension precompilation.
+  --upgrade-conda Update the existing project conda environment within its ABI pins.
+  --reuse-cluster-config  Preserve an existing cluster configuration.
   --set-default-video
                   Promote mpv-conda to the GNOME default video player.
 
-  --dual-host     Run the regular (single-machine) install AND set up
-                  this box as the primary side of a dual-machine
-                  cluster. Writes $DUAL_CFG_FILE with the cluster
-                  config (interactive; or set DUAL_RDMA_DEV /
-                  DUAL_HOST_IP / DUAL_PEER_IP env vars to skip prompts).
+  --cluster-host  Install the player and configure this box as leader.
+                  Writes $CLUSTER_CFG_FILE. For non-interactive setup,
+                  set CLUSTER_SELF_IP and CLUSTER_WORKER_HOSTS; optionally
+                  set CLUSTER_WORKER_SSH_HOSTS and CLUSTER_WORKER_USER.
                   Pre-compiles the chroma_krig CUDA kernel.
 
-  --dual-secondary
+  --cluster-worker
                   Worker-only install for the OTHER box of the cluster.
                   Skips the mpv build, jellyfin-mpv-shim, danmaku and
                   default-video registration. Installs the conda env +
                   vsrife + fsrcnnx-cudnn + worker.py code, registers a
                   systemd --user service (started + enabled), and a
                   GNOME autostart entry for a tray app that exposes a
-                  Quit menu. Writes the same $DUAL_CFG_FILE.
+                  Quit menu. Set CLUSTER_SELF_IP and CLUSTER_PEER_IP for
+                  non-interactive setup. Writes $CLUSTER_CFG_FILE.
 EOF
         return 0
         ;;
@@ -1418,13 +1478,22 @@ EOF
     esac
   done
 
-  if (( INSTALL_DUAL_HOST && INSTALL_DUAL_SECONDARY )); then
-    fatal "--dual-host and --dual-secondary are mutually exclusive"
+  if (( INSTALL_CLUSTER_HOST && INSTALL_CLUSTER_SECONDARY )); then
+    fatal "--cluster-host and --cluster-worker are mutually exclusive"
+  fi
+  if (( REBUILD_TRT && SKIP_GPU_WARMUP )); then
+    fatal "--rebuild-trt and --skip-gpu-warmup cannot be combined"
+  fi
+
+  # Preserve legacy settings while moving their public names to CLUSTER_.
+  if [[ ! -e "$CLUSTER_CFG_FILE" && -f "$CLUSTER_LEGACY_CFG_FILE" ]]; then
+    mkdir -p "$CLUSTER_CFG_DIR"
+    (umask 077; sed 's/^DUAL_/CLUSTER_/' "$CLUSTER_LEGACY_CFG_FILE" > "$CLUSTER_CFG_FILE")
   fi
 
   local mode="single"
-  (( INSTALL_DUAL_HOST ))      && mode="dual-host"
-  (( INSTALL_DUAL_SECONDARY )) && mode="dual-secondary"
+  (( INSTALL_CLUSTER_HOST ))      && mode="cluster-host"
+  (( INSTALL_CLUSTER_SECONDARY )) && mode="cluster-worker"
   log "install mode: $mode  flags: mirrors=$USE_MIRRORS danmaku=$INSTALL_DANMAKU rebuild-trt=$REBUILD_TRT default-video=$SET_DEFAULT_VIDEO"
 
   detect_environment
@@ -1434,20 +1503,20 @@ EOF
   install_pip_packages
   apply_patches
 
-  if (( INSTALL_DUAL_SECONDARY )); then
+  if (( INSTALL_CLUSTER_SECONDARY )); then
     # Worker-only path. Skip mpv build / shim / danmaku / launchers /
     # set-default-video — none of these are useful on a box that only
     # serves RDMA from worker.py. Configs + warm_trt are still wanted
     # since the worker needs vsrife engines and the fsrcnnx-cudnn
     # bundle (chroma_krig CUDA kernel).
     install_configs
-    warm_trt_cache
+    if (( ! SKIP_GPU_WARMUP )); then warm_trt_cache; fi
     dual_install_secondary_pieces
   else
     # Single-machine OR dual-host: full stack.
     build_mpv
     install_configs
-    warm_trt_cache
+    if (( ! SKIP_GPU_WARMUP )); then warm_trt_cache; fi
     if (( INSTALL_DANMAKU )); then
       install_danmaku
     else
@@ -1455,7 +1524,7 @@ EOF
     fi
     install_shim_config
     install_launchers
-    if (( INSTALL_DUAL_HOST )); then
+    if (( INSTALL_CLUSTER_HOST )); then
       dual_install_host_pieces
     fi
   fi
@@ -1483,20 +1552,20 @@ cmd_status() {
     fi
   done
 
-  section "dual-machine"
-  if [[ -f $DUAL_CFG_FILE ]]; then
-    echo "  config:  $DUAL_CFG_FILE"
-    sed 's/^/    /' "$DUAL_CFG_FILE" | head -16
+  section "cluster"
+  if [[ -f $CLUSTER_CFG_FILE ]]; then
+    echo "  config:  $CLUSTER_CFG_FILE"
+    sed 's/^/    /' "$CLUSTER_CFG_FILE" | head -16
     if systemctl --user list-unit-files 2>/dev/null \
-        | grep -q "$DUAL_WORKER_SERVICE"; then
+        | grep -q "$CLUSTER_WORKER_SERVICE"; then
       local st
-      st=$(systemctl --user is-active "$DUAL_WORKER_SERVICE" 2>/dev/null || true)
-      echo "  worker service: $DUAL_WORKER_SERVICE  ($st)"
+      st=$(systemctl --user is-active "$CLUSTER_WORKER_SERVICE" 2>/dev/null || true)
+      echo "  worker service: $CLUSTER_WORKER_SERVICE  ($st)"
     fi
-    [[ -e $DUAL_TRAY_AUTOSTART ]] && echo "  tray autostart: $DUAL_TRAY_AUTOSTART"
-    [[ -d $DUAL_WORKER_DIR ]] && echo "  worker dir: $DUAL_WORKER_DIR"
+    [[ -e $CLUSTER_TRAY_AUTOSTART ]] && echo "  tray autostart: $CLUSTER_TRAY_AUTOSTART"
+    [[ -d $CLUSTER_WORKER_DIR ]] && echo "  worker dir: $CLUSTER_WORKER_DIR"
   else
-    echo "  (not configured — run install with --dual-host or --dual-secondary)"
+    echo "  (not configured — run install with --cluster-host or --cluster-worker)"
   fi
 
   section "miniforge + conda env"
@@ -1548,14 +1617,12 @@ PY
   for pydir in "$ENV_PREFIX"/lib/python*; do
     [[ -L "$pydir" ]] && continue
     [[ -d "$pydir" ]] || continue
-    local f="$pydir/site-packages/jellyfin_mpv_shim/player.py"
+    local f="$pydir/site-packages/jellyfin_mpv_shim/mpvtk/renderer.lua"
     if [[ -f "$f" ]]; then
-      if grep -q 'osc-visibility=" + (' "$f" 2>/dev/null; then
-        echo "  shim/player.py : osc-removal patch applied (honors settings.enable_osc)"
-      elif grep -q 'osc-visibility=never' "$f" 2>/dev/null; then
-        echo "  shim/player.py : older osc-removal patch (always-off — re-run install to upgrade)"
+      if grep -q 'mpvtk-external-modal' "$f" 2>/dev/null; then
+        echo "  shim renderer : external modal bridge applied"
       else
-        echo "  shim/player.py : NOT patched (would break mpv 0.41 playback)"
+        echo "  shim renderer : external modal bridge not installed"
       fi
     fi
     f="$pydir/site-packages/vsrife/__init__.py"
@@ -1725,14 +1792,17 @@ cmd_uninstall() {
   fi
 
   log "removing .desktop entries + autostart"
-  rm -f "$APPS_DIR/mpv-conda.desktop" "$APPS_DIR/jellyfin-mpv-shim.desktop"
+  rm -f "$APPS_DIR/mpv-conda.desktop" "$APPS_DIR/jellyfin-mpv-shim.desktop" \
+        "$APPS_DIR/com.github.iwalton3.jellyfin-mpv-shim.desktop"
   rm -f "$AUTOSTART_DIR/jellyfin-mpv-shim.desktop"
 
   log "removing icons we installed"
   local size
-  for size in 16x16 32x32 48x48 64x64 128x128 256x256; do
+  for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256; do
     rm -f "$ICON_ROOT/$size/apps/jellyfin-mpv-shim.png"
     rm -f "$ICON_ROOT/$size/apps/mpv-conda.png"
+    rm -f "$ICON_ROOT/$size/apps/dgxspark-cluster-leader.png" \
+          "$ICON_ROOT/$size/apps/dgxspark-cluster-worker.png"
   done
   rm -f "$ICON_ROOT/scalable/apps/mpv-conda.svg"
 
@@ -1807,13 +1877,9 @@ EOF
 # What is never possible is 200 Gb/s through a single netdev, a single
 # PCIe path, or a single QP.
 #
-# This fabric (see the spark-roce repo) takes the second option because
-# the switch ports and DACs are QSFP28 100G: it addresses one netdev
-# per port, deliberately on different PCIe paths, in two disjoint /24s.
-# The other two netdevs are left without an IP — their port's wire is
-# already saturated by the path that owns it. Pairing enp1s0f0np0 with
-# enp1s0f1np1 instead would put both rails on path A and cap the node
-# near 100 Gb/s.
+# With two 100G cables, a valid arrangement uses one netdev per port on
+# different PCIe paths. Selecting both rails on the same PCIe path limits
+# the aggregate bandwidth of that path.
 #
 # An LACP bond does not help either. mlx5 hardware RoCE LAG only forms
 # between PFs of the SAME PCI device, i.e. two netdevs behind ONE PCIe
@@ -1914,28 +1980,30 @@ _dual_prompt() {
   fi
 }
 
-# Gather DUAL_* values from env / interactive / defaults, write to
-# $DUAL_CFG_FILE in /etc/environment-style key=value form so it works
+# Gather CLUSTER_* values from env / interactive / defaults, write to
+# $CLUSTER_CFG_FILE in /etc/environment-style key=value form so it works
 # both as systemd EnvironmentFile and as `set -a; source ...; set +a`
 # for the mpv-conda wrapper.
 dual_configure() {
   local role=$1   # "host" or "secondary"
-  section "step D1: dual-machine config (role=$role)"
+  local CLUSTER_WORKER_HOSTS="${CLUSTER_WORKER_HOSTS:-}"
+  local CLUSTER_WORKER_SSH_HOSTS="${CLUSTER_WORKER_SSH_HOSTS:-}"
+  section "step D1: cluster config (role=$role)"
 
   cat <<EOF
-A dual-machine install needs a RoCE link between this box and the
-other Spark, with static IPs (not DHCP) on the high-speed interface.
+A cluster install needs RoCE links between the leader and workers,
+with static IPs (not DHCP) on the high-speed interfaces.
 
 The CX7 reaches 200 Gb/s only by driving two PCIe paths at once, so
 the fabric addresses two rails on separate paths, each in its own /24.
 The transport opens one QP per rail and stripes every transfer across
-them; the rails are detected below and written as DUAL_RDMA_DEVS.
-DUAL_RDMA_DEV / the prompts below name rail 0, which also carries the
+them; the rails are detected below and written as CLUSTER_RDMA_DEVS.
+CLUSTER_RDMA_DEV / the prompts below name rail 0, which also carries the
 handshake.
 
 Press <Enter> to accept any default, or set the corresponding env
-before re-running to skip prompts (DUAL_RDMA_DEV / DUAL_HOST_IP /
-DUAL_WORKER_IP / etc).
+before re-running to skip prompts (CLUSTER_RDMA_DEV / CLUSTER_HOST_IP /
+CLUSTER_WORKER_IP / etc).
 
 EOF
 
@@ -1947,26 +2015,46 @@ EOF
 
   # No baked-in address defaults. SELF_IP comes off the live interface;
   # PEER_IP is unknowable here, so the operator supplies it (or presets
-  # DUAL_PEER_IP). Guessing would write a plausible-looking wrong value
+  # CLUSTER_PEER_IP). Guessing would write a plausible-looking wrong value
   # into dual.conf and fail later at QP handshake instead of here.
   local self_ip_default; self_ip_default=$(dual_detect_local_ip "$iface_default")
   local peer_ip_default=""
+  if [[ $role == host && -n $CLUSTER_WORKER_HOSTS ]]; then
+    peer_ip_default=${CLUSTER_WORKER_HOSTS%%,*}
+  fi
 
   local IFACE     RDMA_DEV  SELF_IP   PEER_IP   RDMA_PORT  WORKER_USER
-  IFACE=$(_dual_prompt DUAL_IFACE       "high-speed interface"      "$iface_default")
-  RDMA_DEV=$(_dual_prompt DUAL_RDMA_DEV "RDMA device"               "$rdma_dev_default")
-  SELF_IP=$(_dual_prompt DUAL_SELF_IP   "this box's IP on the link" "$self_ip_default")
-  PEER_IP=$(_dual_prompt DUAL_PEER_IP   "peer's IP on the link"     "$peer_ip_default")
-  RDMA_PORT=$(_dual_prompt DUAL_RDMA_PORT "RDMA port"               "$DUAL_DEFAULT_RDMA_PORT")
-  [[ -n $SELF_IP ]] || fatal "no IPv4 on $IFACE — configure the RoCE rail first, or set DUAL_SELF_IP"
-  [[ -n $PEER_IP ]] || fatal "peer IP required — re-run interactively or set DUAL_PEER_IP"
+  IFACE=$(_dual_prompt CLUSTER_IFACE       "high-speed interface"      "$iface_default")
+  RDMA_DEV=$(_dual_prompt CLUSTER_RDMA_DEV "RDMA device"               "$rdma_dev_default")
+  SELF_IP=$(_dual_prompt CLUSTER_SELF_IP   "this box's IP on the link" "$self_ip_default")
+  PEER_IP=$(_dual_prompt CLUSTER_PEER_IP   "peer's IP on the link"     "$peer_ip_default")
+  RDMA_PORT=$(_dual_prompt CLUSTER_RDMA_PORT "RDMA port"               "$CLUSTER_DEFAULT_RDMA_PORT")
+  [[ -n $SELF_IP ]] || fatal "no IPv4 on $IFACE — configure the RoCE rail first, or set CLUSTER_SELF_IP"
+  [[ -n $PEER_IP ]] || fatal "peer IP required — re-run interactively or set CLUSTER_PEER_IP"
+  [[ $SELF_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fatal "CLUSTER_SELF_IP must be an IPv4 address"
+  local _octet
+  local -a _octets
+  IFS=. read -r -a _octets <<< "$SELF_IP"
+  for _octet in "${_octets[@]}"; do
+    (( ${#_octet} <= 3 && 10#$_octet <= 255 )) || fatal "invalid CLUSTER_SELF_IP"
+  done
+  [[ $PEER_IP =~ ^[a-zA-Z0-9._-]+$ ]] || fatal "CLUSTER_PEER_IP must be an address or hostname"
+  [[ $IFACE =~ ^[a-zA-Z0-9._-]+$ && $RDMA_DEV =~ ^[a-zA-Z0-9._-]+$ ]] \
+    || fatal "invalid interface or RDMA device name"
+  [[ $RDMA_PORT =~ ^[0-9]+$ ]] && (( 10#$RDMA_PORT > 0 && 10#$RDMA_PORT <= 65535 )) \
+    || fatal "CLUSTER_RDMA_PORT must be between 1 and 65535"
   if [[ $role == "host" ]]; then
-    WORKER_USER=$(_dual_prompt DUAL_WORKER_USER \
-                  "guest user (for ssh + rsync from bench)" "ubuntu")
+    WORKER_USER=$(_dual_prompt CLUSTER_WORKER_USER \
+                  "worker SSH user (for deployment and benchmarks)" "${USER:-$(id -un)}")
+    [[ $WORKER_USER =~ ^[a-zA-Z0-9_][a-zA-Z0-9._-]*[$]?$ ]] || fatal "invalid CLUSTER_WORKER_USER"
+    CLUSTER_WORKER_HOSTS=$(_dual_prompt CLUSTER_WORKER_HOSTS \
+                  "worker rail-0 addresses, comma-separated" "$PEER_IP")
+    CLUSTER_WORKER_SSH_HOSTS=$(_dual_prompt CLUSTER_WORKER_SSH_HOSTS \
+                  "worker SSH addresses in the same order (optional)" "")
   fi
 
   # Pin the RoCEv2 GID index for SELF_IP. guest_mp / worker_3proc read
-  # DUAL_RDMA_GID and fall back to a hard-coded 3, which is only right
+  # CLUSTER_RDMA_GID and fall back to a hard-coded 3, which is only right
   # while the rail carries exactly one IPv4 and no extra IPv6 — not the
   # case when the fabric ports are bridged into a LAN that sends RAs.
   local RDMA_GID; RDMA_GID=$(dual_detect_gid_index "$RDMA_DEV" "$SELF_IP")
@@ -1979,18 +2067,29 @@ EOF
   # one context + one QP per entry and stripe every transfer across
   # them; that is the only way to reach the fabric's 200 Gb/s, since a
   # single PCIe5 x4 path tops out near 128 Gb/s. Rail r handshakes on
-  # DUAL_RDMA_PORT + r.
+  # CLUSTER_RDMA_PORT + r.
   #
-  # Leave DUAL_RDMA_DEVS unset (or set it to one device) to fall back to
+  # Leave CLUSTER_RDMA_DEVS unset (or set it to one device) to fall back to
   # the single-rail transport — same bytes on the wire as before
   # multi-rail existed, and the escape hatch if a rail misbehaves.
   local RDMA_DEVS RDMA_GIDS _rails
   _rails=$(dual_detect_rails)
   RDMA_DEVS=$(printf '%s\n' "$_rails" | awk '{printf "%s%s", sep, $2; sep=","}')
   RDMA_GIDS=$(printf '%s\n' "$_rails" | awk '{printf "%s%s", sep, $3; sep=","}')
-  if [[ -n ${DUAL_RDMA_DEVS:-} ]]; then
-    RDMA_DEVS=$DUAL_RDMA_DEVS
-    RDMA_GIDS=${DUAL_RDMA_GIDS:-$RDMA_GIDS}
+  if [[ -n ${CLUSTER_RDMA_DEVS:-} ]]; then
+    RDMA_DEVS=$CLUSTER_RDMA_DEVS
+    RDMA_GIDS=${CLUSTER_RDMA_GIDS:-$RDMA_GIDS}
+  fi
+  [[ -z $RDMA_DEVS || $RDMA_DEVS =~ ^[a-zA-Z0-9._-]+(,[a-zA-Z0-9._-]+)*$ ]] \
+    || fatal "CLUSTER_RDMA_DEVS must be a comma-separated list of device names"
+  [[ -z $RDMA_GIDS || $RDMA_GIDS =~ ^[0-9]+(,[0-9]+)*$ ]] \
+    || fatal "CLUSTER_RDMA_GIDS must be a comma-separated list of indices"
+  if [[ -n $RDMA_DEVS && -n $RDMA_GIDS ]]; then
+    local -a _rdma_devices _rdma_indices
+    IFS=, read -r -a _rdma_devices <<< "$RDMA_DEVS"
+    IFS=, read -r -a _rdma_indices <<< "$RDMA_GIDS"
+    (( ${#_rdma_devices[@]} == ${#_rdma_indices[@]} )) \
+      || fatal "CLUSTER_RDMA_GIDS must have one index per RDMA device"
   fi
   local _n_rails=0
   [[ -n $RDMA_DEVS ]] && _n_rails=$(awk -F, '{print NF}' <<<"$RDMA_DEVS")
@@ -2004,16 +2103,16 @@ EOF
 
   # MASTER_PORT / NCCL_IB_HCA / NCCL_SOCKET_IFNAME used to be written
   # here for torch.distributed rendezvous. Since the drop-NCCL refactor
-  # (control plane is now a single TCP socket on DUAL_LIVENESS_PORT),
+  # (control plane is now a single TCP socket on CLUSTER_LIVENESS_PORT),
   # none of those are read by anything.
   #
-  # DUAL_RDMA_DEV / DUAL_RDMA_GID still name rail 0 — the rail that
+  # CLUSTER_RDMA_DEV / CLUSTER_RDMA_GID still name rail 0 — the rail that
   # carries the handshake and the one a single-rail fallback uses.
-  # DUAL_RDMA_DEVS / DUAL_RDMA_GIDS below list every rail.
+  # CLUSTER_RDMA_DEVS / CLUSTER_RDMA_GIDS below list every rail.
 
   # Role-specific host/worker IP mapping. From the HOST's perspective
-  # DUAL_WORKER_HOST is the peer. From the SECONDARY's perspective
-  # DUAL_HOST_IP is the peer.
+  # CLUSTER_WORKER_HOST is the peer. From the SECONDARY's perspective
+  # CLUSTER_HOST_IP is the peer.
   local HOST_IP WORKER_HOST
   if [[ $role == "host" ]]; then
     HOST_IP="$SELF_IP"
@@ -2023,74 +2122,135 @@ EOF
     WORKER_HOST="$SELF_IP"
   fi
 
-  mkdir -p "$DUAL_CFG_DIR"
-  cat > "$DUAL_CFG_FILE" <<EOF
-# dgxspark-jellyfin-mpv-rife — dual-machine cluster config.
+  # Keep the first worker as the single-worker compatibility setting.
+  if [[ -n ${CLUSTER_WORKER_HOSTS:-} && ! ${CLUSTER_WORKER_HOSTS} =~ ^[a-zA-Z0-9._-]+(,[a-zA-Z0-9._-]+)*$ ]]; then
+    fatal "CLUSTER_WORKER_HOSTS must be a comma-separated list of IPv4 addresses or hostnames"
+  fi
+  if [[ -n ${CLUSTER_WORKER_SSH_HOSTS:-} && ! ${CLUSTER_WORKER_SSH_HOSTS} =~ ^[a-zA-Z0-9._-]+(,[a-zA-Z0-9._-]+)*$ ]]; then
+    fatal "CLUSTER_WORKER_SSH_HOSTS must be a comma-separated list of IPv4 addresses or hostnames"
+  fi
+  if [[ -n ${CLUSTER_WORKER_SSH_HOSTS:-} ]]; then
+    local -a _worker_list _ssh_list
+    local -A _seen_ssh=()
+    local _ssh_host
+    IFS=, read -r -a _worker_list <<< "${CLUSTER_WORKER_HOSTS:-$WORKER_HOST}"
+    IFS=, read -r -a _ssh_list <<< "$CLUSTER_WORKER_SSH_HOSTS"
+    (( ${#_worker_list[@]} == ${#_ssh_list[@]} )) \
+      || fatal "CLUSTER_WORKER_SSH_HOSTS must have one address per worker"
+    for _ssh_host in "${_ssh_list[@]}"; do
+      [[ -z ${_seen_ssh[$_ssh_host]:-} ]] || fatal "duplicate worker address in CLUSTER_WORKER_SSH_HOSTS"
+      _seen_ssh[$_ssh_host]=1
+    done
+  fi
+  if [[ $role == host && -n $CLUSTER_WORKER_HOSTS ]]; then
+    local -a _configured_workers
+    local _worker
+    local -A _seen_workers=()
+    IFS=, read -r -a _configured_workers <<< "$CLUSTER_WORKER_HOSTS"
+    for _worker in "${_configured_workers[@]}"; do
+      [[ -z ${_seen_workers[$_worker]:-} ]] || fatal "duplicate worker address in CLUSTER_WORKER_HOSTS"
+      _seen_workers[$_worker]=1
+    done
+    WORKER_HOST=${_configured_workers[0]}
+  fi
+  [[ -z ${CLUSTER_TICTAC:-} || ${CLUSTER_TICTAC} == 0 || ${CLUSTER_TICTAC} == 1 ]] \
+    || fatal "CLUSTER_TICTAC must be 0 or 1"
+  [[ -z ${CLUSTER_TICTAC_PULL:-} || ${CLUSTER_TICTAC_PULL} == 0 || ${CLUSTER_TICTAC_PULL} == 1 ]] \
+    || fatal "CLUSTER_TICTAC_PULL must be 0 or 1"
+  [[ -z ${CLUSTER_TICTAC_4K_NATIVE:-} || ${CLUSTER_TICTAC_4K_NATIVE} == 0 || ${CLUSTER_TICTAC_4K_NATIVE} == 1 ]] \
+    || fatal "CLUSTER_TICTAC_4K_NATIVE must be 0 or 1"
+
+  mkdir -p "$CLUSTER_CFG_DIR"
+  cat > "$CLUSTER_CFG_FILE" <<EOF
+# dgxspark-jellyfin-mpv-rife — cluster config.
 # Source of truth for both the mpv-conda launcher (host) and the
 # systemd worker unit (secondary). Regenerate by re-running
-# install.sh with --dual-host or --dual-secondary.
+# install.sh with --cluster-host or --cluster-worker.
 
-DUAL_ROLE=$role
-DUAL_IFACE=$IFACE
-DUAL_RDMA_DEV=$RDMA_DEV
-DUAL_RDMA_GID=$RDMA_GID
-DUAL_RDMA_DEVS=$RDMA_DEVS
-DUAL_RDMA_GIDS=$RDMA_GIDS
-DUAL_RDMA_PORT=$RDMA_PORT
-DUAL_HOST_IP=$HOST_IP
-DUAL_WORKER_HOST=$WORKER_HOST
-DUAL_WORKER_DIR=$DUAL_WORKER_DIR
-${WORKER_USER:+DUAL_WORKER_USER=$WORKER_USER}
+CLUSTER_ROLE=$role
+CLUSTER_IFACE=$IFACE
+CLUSTER_RDMA_DEV=$RDMA_DEV
+CLUSTER_RDMA_GID=$RDMA_GID
+CLUSTER_RDMA_DEVS=$RDMA_DEVS
+CLUSTER_RDMA_GIDS=$RDMA_GIDS
+CLUSTER_RDMA_PORT=$RDMA_PORT
+CLUSTER_HOST_IP=$HOST_IP
+CLUSTER_WORKER_HOST=$WORKER_HOST
+${CLUSTER_WORKER_HOSTS:+CLUSTER_WORKER_HOSTS=$CLUSTER_WORKER_HOSTS}
+${CLUSTER_WORKER_SSH_HOSTS:+CLUSTER_WORKER_SSH_HOSTS=$CLUSTER_WORKER_SSH_HOSTS}
+${CLUSTER_TICTAC:+CLUSTER_TICTAC=$CLUSTER_TICTAC}
+${CLUSTER_TICTAC_PULL:+CLUSTER_TICTAC_PULL=$CLUSTER_TICTAC_PULL}
+${CLUSTER_TICTAC_4K_NATIVE:+CLUSTER_TICTAC_4K_NATIVE=$CLUSTER_TICTAC_4K_NATIVE}
+CLUSTER_WORKER_DIR="$CLUSTER_WORKER_DIR"
+${WORKER_USER:+CLUSTER_WORKER_USER=$WORKER_USER}
 EOF
-  log "wrote $DUAL_CFG_FILE:"
-  sed 's/^/    /' "$DUAL_CFG_FILE"
+  chmod 0600 "$CLUSTER_CFG_FILE"
+  log "wrote $CLUSTER_CFG_FILE:"
+  sed 's/^/    /' "$CLUSTER_CFG_FILE"
 }
 
-# Copy worker.py + supporting modules to $DUAL_WORKER_DIR so the
+# Copy worker.py + supporting modules to $CLUSTER_WORKER_DIR so the
 # systemd unit has a stable path (independent of where the repo lives).
 dual_install_worker_files() {
-  section "step D2: install worker code → $DUAL_WORKER_DIR"
+  section "step D2: install worker code → $CLUSTER_WORKER_DIR"
   # Migrate from the pre-2026-05 install layout: drop the orphaned
   # $HOME/dual_machine tree once the new path is populated. Skip the
   # rm if it's somehow the same directory (defensive — should never
-  # happen since DUAL_WORKER_DIR moved under .local).
-  if [[ -d "$DUAL_WORKER_DIR_LEGACY" \
-        && "$DUAL_WORKER_DIR_LEGACY" != "$DUAL_WORKER_DIR" ]]; then
-    log "migrating: removing legacy $DUAL_WORKER_DIR_LEGACY"
-    rm -rf "$DUAL_WORKER_DIR_LEGACY"
+  # happen since CLUSTER_WORKER_DIR moved under .local).
+  if [[ -d "$CLUSTER_WORKER_DIR_LEGACY" \
+        && "$CLUSTER_WORKER_DIR_LEGACY" != "$CLUSTER_WORKER_DIR" ]]; then
+    log "migrating: removing legacy $CLUSTER_WORKER_DIR_LEGACY"
+    rm -rf "$CLUSTER_WORKER_DIR_LEGACY"
   fi
-  mkdir -p "$DUAL_WORKER_DIR"
+  mkdir -p "$CLUSTER_WORKER_DIR"
   # Module list shared with bench/_common.sh — edit
   # dual_machine/WORKER_MODULES, not this loop.
   local _wm
   while IFS= read -r _wm; do
     [[ -z "$_wm" || "$_wm" == \#* ]] && continue
-    install -m 0644 "$PROJECT_DIR/dual_machine/$_wm" "$DUAL_WORKER_DIR/"
+    install -m 0644 "$PROJECT_DIR/dual_machine/$_wm" "$CLUSTER_WORKER_DIR/"
   done < "$PROJECT_DIR/dual_machine/WORKER_MODULES"
-  install -m 0644 "$PROJECT_DIR/vs_gpu_helpers.py"               "$DUAL_WORKER_DIR/"
-  log "installed worker files: $(ls $DUAL_WORKER_DIR/*.py | wc -l) modules"
+  install -m 0644 "$PROJECT_DIR/vs_gpu_helpers.py"               "$CLUSTER_WORKER_DIR/"
+  log "installed worker files: $(ls $CLUSTER_WORKER_DIR/*.py | wc -l) modules"
 }
 
 # Render worker.service.in → systemd-user unit dir.
 dual_install_secondary_service() {
-  section "step D3: install $DUAL_WORKER_SERVICE (systemd --user)"
+  section "step D3: install $CLUSTER_WORKER_SERVICE (systemd --user)"
   local unit_dir="$HOME/.config/systemd/user"
+  local old_backup="" rendered
   mkdir -p "$unit_dir"
-  sed -e "s|@DUAL_CONFIG_FILE@|$DUAL_CFG_FILE|g" \
+  rendered="$(mktemp "$unit_dir/.cluster-worker.XXXXXX")"
+  sed -e "s|@CLUSTER_CONFIG_FILE@|$CLUSTER_CFG_FILE|g" \
       -e "s|@PYTHON_BIN@|$ENV_PREFIX/bin/python|g" \
-      -e "s|@WORKER_PY@|$DUAL_WORKER_DIR/worker.py|g" \
-      "$PROJECT_DIR/dual_machine/worker.service.in" \
-    > "$unit_dir/$DUAL_WORKER_SERVICE"
+      -e "s|@WORKER_PY@|$CLUSTER_WORKER_DIR/worker.py|g" \
+      "$PROJECT_DIR/dual_machine/worker.service.in" > "$rendered"
+  chmod 0644 "$rendered"
+  if [[ -f "$unit_dir/$CLUSTER_LEGACY_WORKER_SERVICE" && ! -L "$unit_dir/$CLUSTER_LEGACY_WORKER_SERVICE" ]]; then
+    old_backup="$(mktemp "$unit_dir/.legacy-worker.XXXXXX")"
+    cp -p "$unit_dir/$CLUSTER_LEGACY_WORKER_SERVICE" "$old_backup"
+    systemctl --user disable --now "$CLUSTER_LEGACY_WORKER_SERVICE"
+    rm -f "$unit_dir/$CLUSTER_LEGACY_WORKER_SERVICE"
+  fi
+  mv "$rendered" "$unit_dir/$CLUSTER_WORKER_SERVICE"
   systemctl --user daemon-reload
-  systemctl --user enable "$DUAL_WORKER_SERVICE" 2>&1 \
-    | grep -v 'Created symlink' || true
   # `restart` (not `start`) so re-running install on an upgraded
   # codebase actually picks up the new worker.py — `start` is a no-op
   # if the unit is already active and the user would be silently left
   # on the old binary.
-  systemctl --user restart "$DUAL_WORKER_SERVICE" || \
-    warn "systemctl --user restart failed — start it manually after login"
-  log "installed + (re)started $unit_dir/$DUAL_WORKER_SERVICE"
+  if ! systemctl --user enable "$CLUSTER_WORKER_SERVICE" ||
+     ! systemctl --user restart "$CLUSTER_WORKER_SERVICE"; then
+    if [[ -n "$old_backup" ]]; then
+      systemctl --user disable --now "$CLUSTER_WORKER_SERVICE" || true
+      rm -f "$unit_dir/$CLUSTER_WORKER_SERVICE" "$unit_dir/$CLUSTER_LEGACY_WORKER_SERVICE"
+      mv "$old_backup" "$unit_dir/$CLUSTER_LEGACY_WORKER_SERVICE"
+      systemctl --user daemon-reload
+      systemctl --user enable --now "$CLUSTER_LEGACY_WORKER_SERVICE" || true
+    fi
+    fatal "failed to start $CLUSTER_WORKER_SERVICE"
+  fi
+  [[ -z "$old_backup" ]] || rm -f "$old_backup"
+  log "installed + (re)started $unit_dir/$CLUSTER_WORKER_SERVICE"
 }
 
 # Tray app (PyGObject + AppIndicator). Drops the script next to the
@@ -2101,47 +2261,41 @@ dual_install_secondary_tray() {
     warn "secondary_tray.py missing in project — skipping tray install"
     return 0
   fi
+  rm -f "$HOME/.config/autostart/dgxspark-dual-secondary.desktop" \
+        "$APPS_DIR/dgxspark-dual-secondary.desktop"
   install -m 0755 "$PROJECT_DIR/dual_machine/secondary_tray.py" \
-                  "$DUAL_WORKER_DIR/secondary_tray.py"
+                  "$CLUSTER_WORKER_DIR/secondary_tray.py"
 
-  # Install the mpv icon on this box too (the single-machine flow
-  # does it in install_launchers, which --dual-secondary skips). The
-  # tray uses `Icon=mpv-conda`, the same name single-machine apps use.
-  for size in 16 32 64 128; do
-    local src="$PROJECT_DIR/icons/mpv/$size.png"
+  for size in 16 24 32 48 64 128 256; do
+    local src="$PROJECT_DIR/icons/cluster-worker/$size.png"
     [[ -f $src ]] || continue
     local dst_dir="$ICON_ROOT/${size}x${size}/apps"
     mkdir -p "$dst_dir"
-    cp -f "$src" "$dst_dir/mpv-conda.png"
+    cp -f "$src" "$dst_dir/dgxspark-cluster-worker.png"
   done
-  if [[ -f "$PROJECT_DIR/icons/mpv/scalable.svg" ]]; then
-    mkdir -p "$ICON_ROOT/scalable/apps"
-    cp -f "$PROJECT_DIR/icons/mpv/scalable.svg" \
-          "$ICON_ROOT/scalable/apps/mpv-conda.svg"
-  fi
   gtk-update-icon-cache -f -t "$ICON_ROOT" 2>/dev/null || true
 
   # Wrapper sets GI_TYPELIB_PATH so the conda Python can find the
   # system's AyatanaAppIndicator3 typelib (conda-forge has none on
   # aarch64) — same trick the jellyfin-mpv-shim wrapper uses.
   mkdir -p "$WRAPPER_DIR"
-  cat > "$WRAPPER_DIR/dgxspark-dual-tray" <<EOF
+  cat > "$WRAPPER_DIR/dgxspark-cluster-tray" <<EOF
 #!/usr/bin/env bash
 SYS_GIR="/usr/lib/aarch64-linux-gnu/girepository-1.0"
 export GI_TYPELIB_PATH="\${GI_TYPELIB_PATH:+\$GI_TYPELIB_PATH:}\$SYS_GIR"
 export PYTHONHOME="$ENV_PREFIX"
-exec "$ENV_PREFIX/bin/python" "$DUAL_WORKER_DIR/secondary_tray.py" "\$@"
+exec "$ENV_PREFIX/bin/python" "$CLUSTER_WORKER_DIR/secondary_tray.py" "\$@"
 EOF
-  chmod +x "$WRAPPER_DIR/dgxspark-dual-tray"
+  chmod +x "$WRAPPER_DIR/dgxspark-cluster-tray"
 
   local desktop_body
   desktop_body="[Desktop Entry]
 Type=Application
-Name=DGX Spark Dual Worker
-GenericName=Dual-machine worker tray
-Comment=Status + Quit menu for the dual-machine worker service
-Icon=mpv-conda
-Exec=$WRAPPER_DIR/dgxspark-dual-tray
+Name=DGX Spark Cluster Worker
+GenericName=Cluster worker tray
+Comment=Status + Quit menu for the cluster worker service
+Icon=dgxspark-cluster-worker
+Exec=$WRAPPER_DIR/dgxspark-cluster-tray
 Terminal=false
 Categories=AudioVideo;Player;
 StartupNotify=false"
@@ -2150,15 +2304,15 @@ StartupNotify=false"
   # Alt-F2. Without this only the autostart entry below exists, and
   # the user has no way to start the tray after manually quitting it.
   mkdir -p "$APPS_DIR"
-  printf '%s\n' "$desktop_body" > "$APPS_DIR/$DUAL_TRAY_DESKTOP"
+  printf '%s\n' "$desktop_body" > "$APPS_DIR/$CLUSTER_TRAY_DESKTOP"
   update-desktop-database "$APPS_DIR" 2>/dev/null || true
-  log "launcher at $APPS_DIR/$DUAL_TRAY_DESKTOP"
+  log "launcher at $APPS_DIR/$CLUSTER_TRAY_DESKTOP"
 
   # Autostart on login — the launcher is just for manual restart.
-  mkdir -p "$(dirname "$DUAL_TRAY_AUTOSTART")"
+  mkdir -p "$(dirname "$CLUSTER_TRAY_AUTOSTART")"
   printf '%s\nX-GNOME-Autostart-enabled=true\n' \
-    "$desktop_body" > "$DUAL_TRAY_AUTOSTART"
-  log "tray autostart at $DUAL_TRAY_AUTOSTART"
+    "$desktop_body" > "$CLUSTER_TRAY_AUTOSTART"
+  log "tray autostart at $CLUSTER_TRAY_AUTOSTART"
 
   # Linger keeps the user session alive at boot (before any GUI login),
   # so the worker.service starts when the box powers on instead of
@@ -2179,6 +2333,10 @@ StartupNotify=false"
 # playback doesn't pay the ~30 s JIT cost. Imports fsrcnnx_cudnn.chroma_krig
 # inside conda env; load_inline + ninja compiles to ~/.cache/torch_extensions.
 dual_precompile_krig() {
+  if (( SKIP_GPU_WARMUP )); then
+    log "skipping chroma_krig precompilation (--skip-gpu-warmup)"
+    return
+  fi
   section "step D5: pre-compile chroma_krig CUDA kernel"
   if ! "$ENV_PREFIX/bin/python" -c \
        "import sys; sys.path.insert(0, '$MPV_CFG_DIR/fsrcnnx-cudnn'); \
@@ -2190,39 +2348,49 @@ dual_precompile_krig() {
 }
 
 dual_install_host_pieces() {
-  dual_configure "host"
+  if (( REUSE_CLUSTER_CONFIG )); then
+    [[ -r "$CLUSTER_CFG_FILE" ]] || fatal "dual config not found: $CLUSTER_CFG_FILE"
+  else
+    dual_configure "host"
+  fi
   dual_precompile_krig
   log "host-side dual install done. To enable dual mode in mpv, your"
-  log "playback session must source $DUAL_CFG_FILE before launching mpv-conda."
+  log "playback session must source $CLUSTER_CFG_FILE before launching mpv-conda."
   log "(The default mpv-conda wrapper already does this when the file exists.)"
 }
 
 dual_install_secondary_pieces() {
-  dual_configure "secondary"
+  if (( REUSE_CLUSTER_CONFIG )); then
+    [[ -r "$CLUSTER_CFG_FILE" ]] || fatal "dual config not found: $CLUSTER_CFG_FILE"
+  else
+    dual_configure "secondary"
+  fi
   dual_install_worker_files
   dual_install_secondary_service
   dual_install_secondary_tray
   dual_precompile_krig
   log "secondary-side dual install done."
-  log "  service: systemctl --user status $DUAL_WORKER_SERVICE"
-  log "  log:     $HOME/.cache/dgxspark-dual-worker.log (or journalctl --user -u $DUAL_WORKER_SERVICE)"
+  log "  service: systemctl --user status $CLUSTER_WORKER_SERVICE"
+  log "  log:     $HOME/.cache/dgxspark-cluster-worker.log (or journalctl --user -u $CLUSTER_WORKER_SERVICE)"
 }
 
 dual_uninstall_pieces() {
   section "step D-X: uninstall dual-machine pieces"
-  if systemctl --user list-unit-files 2>/dev/null | grep -q "$DUAL_WORKER_SERVICE"; then
-    systemctl --user disable --now "$DUAL_WORKER_SERVICE" 2>/dev/null || true
-    rm -f "$HOME/.config/systemd/user/$DUAL_WORKER_SERVICE"
-    systemctl --user daemon-reload
-  fi
-  rm -f "$DUAL_TRAY_AUTOSTART"
-  rm -f "$DUAL_CFG_FILE"
-  [[ -d $DUAL_CFG_DIR && -z "$(ls -A "$DUAL_CFG_DIR" 2>/dev/null)" ]] && rmdir "$DUAL_CFG_DIR"
-  rm -rf "$DUAL_WORKER_DIR" "$DUAL_WORKER_DIR_LEGACY"
-  # If $DUAL_WORKER_DIR was the only thing under
+  systemctl --user disable --now "$CLUSTER_WORKER_SERVICE" 2>/dev/null || true
+  systemctl --user disable --now "$CLUSTER_LEGACY_WORKER_SERVICE" 2>/dev/null || true
+  rm -f "$HOME/.config/systemd/user/$CLUSTER_WORKER_SERVICE" \
+        "$HOME/.config/systemd/user/$CLUSTER_LEGACY_WORKER_SERVICE"
+  systemctl --user daemon-reload 2>/dev/null || true
+  rm -f "$CLUSTER_TRAY_AUTOSTART" "$HOME/.config/autostart/dgxspark-dual-secondary.desktop" \
+        "$APPS_DIR/$CLUSTER_TRAY_DESKTOP" "$APPS_DIR/dgxspark-dual-secondary.desktop" \
+        "$WRAPPER_DIR/dgxspark-cluster-tray" "$WRAPPER_DIR/dgxspark-dual-tray"
+  rm -f "$CLUSTER_CFG_FILE" "$CLUSTER_LEGACY_CFG_FILE" "$CLUSTER_CFG_DIR/cluster_env.sh"
+  [[ -d $CLUSTER_CFG_DIR && -z "$(ls -A "$CLUSTER_CFG_DIR" 2>/dev/null)" ]] && rmdir "$CLUSTER_CFG_DIR"
+  rm -rf "$CLUSTER_WORKER_DIR" "$CLUSTER_WORKER_DIR_LEGACY"
+  # If $CLUSTER_WORKER_DIR was the only thing under
   # ~/.local/share/dgxspark-mpv/, prune the empty parent so an
   # uninstall doesn't leave breadcrumbs behind.
-  local dual_share_parent; dual_share_parent="$(dirname "$DUAL_WORKER_DIR")"
+  local dual_share_parent; dual_share_parent="$(dirname "$CLUSTER_WORKER_DIR")"
   [[ -d $dual_share_parent && -z "$(ls -A "$dual_share_parent" 2>/dev/null)" ]] && rmdir "$dual_share_parent"
 
   # Mirror of step 7c: drop the cap from mpv + remove the system layer
@@ -2250,8 +2418,8 @@ case "${1:-}" in
 $(basename "$0") — dgxspark-jellyfin-mpv-rife
 
 Usage:
-  $0 install [flags]   install (single-machine by default; --dual-host /
-                       --dual-secondary for the two roles of a dual cluster)
+  $0 install [flags]   install (single-machine by default; --cluster-host /
+                       --cluster-worker for the two cluster roles)
   $0 status            show what's currently installed and where
   $0 uninstall         remove everything we installed except apt + miniforge
 

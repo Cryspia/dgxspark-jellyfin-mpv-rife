@@ -1,9 +1,8 @@
 # bench/
 
-Color / fps / per-task timing benches for the `dgxspark-jellyfin-mpv-rife`
-single and dual paths. All scripts share `_common.sh` and pull paths
-+ IPs from environment variables (defaults assume a fresh
-`install.sh install --dual-host` on this box).
+Benchmarks for the installed single-machine and cluster pipelines. Results
+depend on the clip and workload; null-video-output throughput is not a
+guarantee of real-time playback.
 
 [简体中文](./README.zh-CN.md)
 
@@ -13,7 +12,7 @@ baseline.
 
 ## Prerequisites
 
-- `install.sh install` (or `--dual-host`) has been run; mpv + vapoursynth
+- `install.sh install` (or `--cluster-host`) has been run; mpv + vapoursynth
   + `rife.vpy` + `vs_gpu_helpers.py` + `fsrcnnx-cudnn` are all on disk.
 - For dual benches: a second DGX Spark reachable at `WORKER_IP` over a
   200G RoCE link, with the same conda env. The bench rsync's the worker
@@ -36,6 +35,24 @@ Writes two synthetic mandelbrot clips into `bench/clips/`:
 Override with `CLIP_24` / `CLIP_120` if you'd rather use real footage.
 
 ## Scripts
+
+### `bench/cluster_fps.sh` — installed multi-machine throughput
+
+```bash
+N=3000 MODE=auto MULT=2 bench/cluster_fps.sh
+N=3000 MODE=tictac MULT=4 bench/cluster_fps.sh
+```
+
+This uses the installed worker services and does not restart them or kill
+other processes. `MODE` is `auto`, `normal`, or `tictac`; `MULT` is 2, 3,
+or 4. `CLIP`, `CF` and `BF` override the source, concurrent frames and
+buffered frames. It verifies cluster processing is active and prints the
+dispatcher measurement and log path. The current F9 multiplier must match
+`MULT` when an override is present.
+
+The older `color.sh`, `fps.sh`, `timing.sh` and `robustness.sh` target the
+two-machine normal pipeline. They manipulate shared playback flags and worker
+processes; run them only when no other playback or worker session is active.
 
 ### `bench/color.sh` — single vs dual PSNR
 
@@ -68,7 +85,7 @@ bench/robustness.sh                # N=60 frames, RECOVERY_SLA=5 s
 RECOVERY_SLA=3 N=40 bench/robustness.sh
 ```
 
-Nine scenarios, each asserting the dual chain recovers (or cleanly
+Eight scenarios, each asserting the dual chain recovers (or cleanly
 falls back to single) within `RECOVERY_SLA` seconds:
 
 1. `worker_down`   — stop worker.service before mpv. Expect fast
@@ -92,12 +109,7 @@ falls back to single) within `RECOVERY_SLA` seconds:
    `vf set` to force a filter-graph rebuild → second dual handshake
    in the same mpv process. Asserts the chain survives the rebuild
    and ≥ 1 dual-active marker.
-8. `trt_cache_miss` — rename the 1080p RIFE TRT engine cache on
-   both host and worker, restart worker, launch mpv: TRT must
-   recompile from scratch (~30-60 s on this stack). Asserts dual
-   eventually reaches active + frames render. Caches restored on
-   exit. Tunable via `TRT_BENCH_TIMEOUT` (default 300 s).
-9. `seek_storm` — rapid IPC seeks against a live dual session; asserts
+8. `seek_storm` — rapid IPC seeks against a live dual session; asserts
    playback recovers within the SLA. Also exercises the seek-flush
    cc_cache slot reclamation (heavy seeking must not drain the pool).
 
@@ -113,8 +125,8 @@ MODE=dual_no_sr bench/timing.sh
 MODE=dual_no_interp N=800 bench/timing.sh
 ```
 
-Runs one dual mode with `DUAL_PROFILE=1` + `DUAL_RDMA_PROF=1` +
-`DUAL_GPU_IDLE_DBG=1` on the worker, then tail-parses the host +
+Runs one dual mode with `CLUSTER_PROFILE=1` + `CLUSTER_RDMA_PROF=1` +
+`CLUSTER_GPU_IDLE_DBG=1` on the worker, then tail-parses the host +
 worker logs into:
 
 - worker totals: `kernel_total` / `idle_total` / `GPU_util`
@@ -135,13 +147,13 @@ the bottleneck?).
 | `MPV` / `PY` | `$ENV_ROOT/bin/mpv` / `python` | binaries |
 | `MPV_CFG`    | `~/.config/mpv` | mpv config dir (has `rife.vpy`, `vs_gpu_helpers.py`, `fsrcnnx-cudnn/`) |
 | `VPY`        | `$MPV_CFG/rife.vpy` | vapoursynth entry |
-| `DUAL_CFG_FILE` | `~/.config/dgxspark-mpv/dual.conf` | sourced for `DUAL_HOST_IP`/`DUAL_WORKER_HOST`/`DUAL_WORKER_USER`/`DUAL_RDMA_*` defaults (written by `install.sh install --dual-host`) |
-| `HOST_IP`    | from `$DUAL_HOST_IP` | this box on the RoCE link |
-| `WORKER_IP`  | from `$DUAL_WORKER_HOST` | worker box on the RoCE link |
-| `WORKER_USER`| from `$DUAL_WORKER_USER`, else `ubuntu` | ssh user for worker |
-| `WORKER_DIR` | from `$DUAL_WORKER_DIR`, else `~/.local/share/dgxspark-mpv/worker` on the worker | rsync target on worker |
-| `RDMA_DEV`   | from `$DUAL_RDMA_DEV`, else `rocep1s0f0` | local RDMA device |
-| `RDMA_PORT`  | from `$DUAL_RDMA_PORT`, else `29900` | RDMA listen port (worker side) |
+| `CLUSTER_CFG_FILE` | `~/.config/dgxspark-mpv/cluster.conf` | sourced for `CLUSTER_HOST_IP`/`CLUSTER_WORKER_HOST`/`CLUSTER_WORKER_USER`/`CLUSTER_RDMA_*` defaults (written by `install.sh install --cluster-host`) |
+| `HOST_IP`    | from `$CLUSTER_HOST_IP` | this box on the RoCE link |
+| `WORKER_IP`  | from `$CLUSTER_WORKER_HOST` | worker box on the RoCE link |
+| `WORKER_USER`| from `$CLUSTER_WORKER_USER`, else `ubuntu` | ssh user for worker |
+| `WORKER_DIR` | from `$CLUSTER_WORKER_DIR`, else `~/.local/share/dgxspark-mpv/worker` on the worker | rsync target on worker |
+| `RDMA_DEV`   | from `$CLUSTER_RDMA_DEV`, else `rocep1s0f0` | local RDMA device |
+| `RDMA_PORT`  | from `$CLUSTER_RDMA_PORT`, else `29900` | RDMA listen port (worker side) |
 | `CLIP_24` / `CLIP_120` | `bench/clips/sample-1080p-{24,120}.mp4` | inputs |
 
 ## Modes (single + dual share the same key)
